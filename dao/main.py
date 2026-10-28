@@ -64,6 +64,16 @@ async def http_error(request: Request, exc: StarletteHTTPException):
     return render(request, "error.html", {"status": exc.status_code, "detail": exc.detail}, status_code=exc.status_code)
 
 
+@app.exception_handler(Exception)
+async def unhandled_error(request: Request, exc: Exception):
+    import logging
+    logging.getLogger("dao").exception("unhandled error on %s: %s", request.url.path, exc)
+    if request.url.path.startswith("/v1"):
+        return JSONResponse({"error": "internal_error", "detail": str(exc), "status": 500}, status_code=500)
+    from .ui import render
+    return render(request, "error.html", {"status": 500, "detail": "Internal Server Error"}, status_code=500)
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     resp = await call_next(request)

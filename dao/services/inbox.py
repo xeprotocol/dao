@@ -47,12 +47,13 @@ async def store_envelope(ctx: Context, db: AsyncSession, env: Envelope, channel:
     except ChatError as e:
         verified = False
         log.info("unverified envelope %s: %s", env.id[:12], e)
+    clean_message = (env.message or "").replace("\x00", "")
     m = InboxMessage(id=env.id, channel=channel, from_account=env.from_, to_account=env.to, pub_key=env.pub_key,
-                     body=env.message, timestamp=env.timestamp, signature=env.signature, pow_nonce=env.pow_nonce,
+                     body=clean_message, timestamp=env.timestamp, signature=env.signature, pow_nonce=env.pow_nonce,
                      verified=verified, status="new")
     db.add(m)
     ev = await ctx.events.append(db, "inbox.received", f"account:{env.from_}", {
-        "id": env.id, "channel": channel, "from": env.from_, "verified": verified, "body": env.message[:4000],
+        "id": env.id, "channel": channel, "from": env.from_, "verified": verified, "body": clean_message[:4000],
         "timestamp": env.timestamp,
     }, ref=f"inbox:{env.id}")
     if verified and channel == "chat" and not await pause.is_paused(db):
@@ -64,6 +65,10 @@ async def http_submit(ctx: Context, db: AsyncSession, v: Verified) -> InboxMessa
     body = (v.payload.get("message") or "").strip()
     if not body or len(body) > 8000:
         raise HTTPException(400, "message is required (max 8000 chars)")
+    if "\x00" in body:
+        raise HTTPException(400, "message contains disallowed NUL byte")
+    if any(ord(c) < 0x20 and c not in "\t\r\n" for c in body):
+        raise HTTPException(400, "message contains disallowed control characters")
     mid = secrets.token_hex(16)
     m = InboxMessage(id=mid, channel="http", from_account=v.account, to_account=dao_account(ctx), pub_key=v.pub_key,
                      body=body, timestamp=v.timestamp, signature=v.signature, pow_nonce=0, verified=True, status="new")

@@ -77,8 +77,12 @@ async def submit(ctx: Context, db: AsyncSession, v: Verified) -> Proposal:
     fee_block_hash = (p.get("fee_block_hash") or "").lower()
     if not title or len(title) > MAX_TITLE:
         raise HTTPException(400, f"title is required (max {MAX_TITLE} chars)")
+    if "\x00" in title:
+        raise HTTPException(400, "title contains disallowed NUL byte")
     if not body or len(body) > MAX_BODY:
         raise HTTPException(400, f"body is required (max {MAX_BODY} chars)")
+    if "\x00" in body:
+        raise HTTPException(400, "body contains disallowed NUL byte")
     if ops is not None:
         try:
             ops = sessions.normalise_ops(ops)
