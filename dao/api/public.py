@@ -129,8 +129,7 @@ async def proposal_votes(h: str, db: Db):
     votes = await portal.votes_for(db, pr.hash)
     return {"proposal": pr.hash, "tally": portal.tally(pr, votes),
             "votes": [{"account": v.account, "choice": v.choice, "weight": v.weight, "participating": v.participating,
-                       "is_agent": v.is_agent, "timestamp": v.timestamp, "reason": v.reason, "signature": v.signature,
-                       "pub_key": v.pub_key} for v in votes]}
+                       "is_agent": v.is_agent, "timestamp": v.timestamp, "reason": v.reason} for v in votes]}
 
 
 @router.post("/proposals/{h}/votes", status_code=201)

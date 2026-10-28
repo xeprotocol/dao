@@ -49,18 +49,29 @@ class Verified:
         return f"seat:{self.seat.id}" if self.seat else f"account:{self.account}"
 
 
+REPLAY_WINDOW_S: int = 2 * (MAX_SKEW_NS // 1_000_000_000)  # 1200s (20 minutes covers ±10m window)
+
+
 class _Seen:
-    """Bounded replay cache keyed by signature hex."""
-    def __init__(self, cap: int = 50_000):
-        self._d: OrderedDict[str, int] = OrderedDict()
+    """Bounded, time-window replay cache keyed by signature hex."""
+    def __init__(self, cap: int = 50_000, ttl_s: int = REPLAY_WINDOW_S):
+        self._d: dict[str, float] = {}
         self.cap = cap
+        self.ttl_s = ttl_s
+
+    def _prune(self, now: float) -> None:
+        expired = [sig for sig, exp in self._d.items() if exp <= now]
+        for sig in expired:
+            del self._d[sig]
 
     def check_and_add(self, sig: str) -> bool:
+        now = time.time()
+        self._prune(now)
         if sig in self._d:
             return False
-        self._d[sig] = int(time.time())
-        while len(self._d) > self.cap:
-            self._d.popitem(last=False)
+        if len(self._d) >= self.cap:
+            return False
+        self._d[sig] = now + self.ttl_s
         return True
 
 

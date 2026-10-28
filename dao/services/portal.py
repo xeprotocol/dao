@@ -149,6 +149,8 @@ async def vote(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Vot
     weight = 0 if excluded else int(snap["balance"])
     existing = (await db.execute(select(Vote).where(Vote.proposal_hash == pr.hash, Vote.account == v.account))).scalar_one_or_none()
     if existing:
+        if existing.signature == v.signature:
+            raise HTTPException(409, "this signature has already been cast")
         existing.choice, existing.reason, existing.timestamp, existing.signature = choice, v.payload.get("reason", "") or "", v.timestamp, v.signature
         existing.pub_key, existing.weight, existing.participating, existing.is_agent = v.pub_key, weight, participating, is_agent
         existing.eligibility = {"snapshot": snap, "not_participating_because": reasons}
