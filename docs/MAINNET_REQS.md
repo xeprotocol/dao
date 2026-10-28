@@ -16,7 +16,7 @@ cross-check against a second. For mainnet this should be a node we run or Adam r
 
 | Endpoint | Used for |
 |---|---|
-| `GET /`, `GET /node` | `network_id`, `pow_difficulty`, `chat_pow_difficulty`, node peer id. The testnet/mainnet badge is derived from `network_id` not starting with `testnet`. |
+| `GET /`, `GET /node` | `network_id`, `pow_difficulty`, `chat_pow_difficulty`, node peer id. The mainnet badge shows only when `network_id` is `mainnet` or `mainnet-<n>`; anything else shows testnet. |
 | `GET /health`, `GET /network/readiness` | worker health, `/v1/ready` |
 | `GET /accounts/{a}/balance`, `GET /accounts/{a}/chain` | voting weight at snapshot, treasury read, fee account frontier, agent account checks |
 | `GET /accounts/{a}/keyset` | treasury multisig read |
@@ -72,4 +72,5 @@ with human keys only; the harness only reads it.
   collapse signing sessions to one step (BRIEF §16.15).
 - A documented `finalized` guarantee on `GET /blocks/{hash}`: what final means and whether it can flip back, since fee
   verification is about to depend on it.
-- Stable `network_id` naming so the badge logic (`startswith("testnet")`) stays right.
+- Mainnet's `network_id` to be `mainnet` or `mainnet-<n>`; the harness only shows the mainnet badge on a positive
+  match, so any other name would show as testnet.

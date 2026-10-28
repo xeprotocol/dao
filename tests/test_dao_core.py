@@ -67,6 +67,14 @@ def test_signer_keyfile_roundtrip_and_scopes(tmp_path):
     assert Signer.load(p, "correct horse battery staple").has("agent:research")
 
 
+def test_mainnet_badge_needs_a_positive_match():
+    from dao.context import NodeIdentity
+    assert NodeIdentity(network_id="mainnet").badge == "mainnet"
+    assert NodeIdentity(network_id="mainnet-0001").badge == "mainnet"
+    for other in ("testnet-0005", "testnet", "devnet-0001", "mainnet2", "staging", ""):
+        assert NodeIdentity(network_id=other).badge == "testnet", other
+
+
 def test_event_hash_is_deterministic():
     a = event_hash(0, 1, "k", "harness", {"x": 1, "y": [1, 2]}, "0" * 64)
     b = event_hash(0, 1, "k", "harness", {"y": [1, 2], "x": 1}, "0" * 64)

@@ -26,7 +26,9 @@ class NodeIdentity:
 
     @property
     def is_mainnet(self) -> bool:
-        return bool(self.network_id) and not self.network_id.startswith("testnet")
+        """Positive match only: `mainnet` or `mainnet-<n>`. Anything else (testnet-0005, devnet, unknown, empty)
+        is shown as testnet, so a renamed or unexpected network can never be mistaken for the real one."""
+        return self.network_id.split("-", 1)[0] == "mainnet"
 
     @property
     def badge(self) -> str:
