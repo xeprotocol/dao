@@ -60,13 +60,13 @@ async def store_envelope(ctx: Context, db: AsyncSession, env: Envelope, channel:
     return m
 
 
-async def http_submit(ctx: Context, db: AsyncSession, v: Verified) -> InboxMessage:
+async def http_submit(ctx: Context, db: AsyncSession, v: Verified, pow_nonce: int = 0) -> InboxMessage:
     body = (v.payload.get("message") or "").strip()
     if not body or len(body) > 8000:
         raise HTTPException(400, "message is required (max 8000 chars)")
     mid = secrets.token_hex(16)
     m = InboxMessage(id=mid, channel="http", from_account=v.account, to_account=dao_account(ctx), pub_key=v.pub_key,
-                     body=body, timestamp=v.timestamp, signature=v.signature, pow_nonce=0, verified=True, status="new")
+                     body=body, timestamp=v.timestamp, signature=v.signature, pow_nonce=pow_nonce, verified=True, status="new")
     db.add(m)
     await ctx.events.append(db, "inbox.received", v.actor, {
         "id": mid, "channel": "http", "from": v.account, "verified": True, "body": body[:4000], "timestamp": v.timestamp,

@@ -15,6 +15,7 @@ from ..auth import SignedRequest, require_seat, verify_signed
 from ..canonical import DOMAIN_INBOX_HTTP, DOMAIN_MEMBER_ACTION, DOMAIN_PROPOSAL, DOMAIN_VOTE
 from ..db import session
 from ..log import EventLog, event_to_dict
+from ..ratelimit import inbox_account_limiter, inbox_ip_limiter
 from ..services import inbox as inbox_svc
 from ..services import pause as pause_svc
 from ..services import portal, records
@@ -188,9 +189,21 @@ async def inbox_info(ctx: Ctx, db: Db, limit: int = 50):
 
 
 @router.post("/inbox", status_code=201)
-async def inbox_post(req: SignedRequest, ctx: Ctx, db: Db):
+async def inbox_post(req: SignedRequest, ctx: Ctx, db: Db, request: Request):
+    client_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+    if not inbox_ip_limiter.allow(client_ip):
+        raise HTTPException(429, "rate limit exceeded: too many inbox submissions from this IP")
+
     v = verify_signed(req, DOMAIN_INBOX_HTTP)
-    m = await inbox_svc.http_submit(ctx, db, v)
+
+    if not inbox_account_limiter.allow(v.account):
+        raise HTTPException(429, "rate limit exceeded: too many inbox submissions for this account")
+
+    pow_nonce = int(req.payload.get("pow_nonce", 0) or 0)
+    m = await inbox_svc.http_submit(ctx, db, v, pow_nonce=pow_nonce)
     await db.commit()
     return inbox_svc.to_dict(m)
 
