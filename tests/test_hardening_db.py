@@ -230,6 +230,28 @@ async def test_http_inbox_refuses_control_characters_and_requires_pow(db):
     assert (await db.execute(select(InboxMessage))).scalar_one_or_none() is None
 
 
+async def test_http_inbox_stores_a_u64_nonce_and_accepts_real_pow(db):
+    from dao.auth import compute_http_pow
+    from dao.canonical import DOMAIN_INBOX_HTTP, digest
+    ctx = _ctx()
+    # upper half of u64: BIGINT would refuse this
+    big = _v(payload={"message": "big nonce"})
+    big.pow_nonce = 2**64 - 1
+    m = await inbox.http_submit(ctx, db, big)
+    await db.commit()
+    db.expire(m)
+    assert (await db.get(InboxMessage, m.id)).pow_nonce == 2**64 - 1
+    # a real proof of work over the real signing digest, at a difficulty that keeps the test quick
+    ctx.node.chat_pow_difficulty = 0xFF00000000000000
+    payload, ts = {"message": "real pow"}, time.time_ns()
+    v = _v(payload=payload, ts=ts)
+    v.digest = digest(DOMAIN_INBOX_HTTP, {"payload": payload, "timestamp": ts})
+    v.pow_nonce = compute_http_pow(v.digest, ctx.node.chat_pow_difficulty)
+    m2 = await inbox.http_submit(ctx, db, v)
+    await db.commit()
+    assert m2.pow_nonce == v.pow_nonce
+
+
 async def test_proposal_text_with_nul_is_a_400_not_a_500(db):
     ctx = _ctx()
     with pytest.raises(HTTPException) as e:

@@ -9,13 +9,28 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from decimal import Decimal
+
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func,
+    BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, TypeDecorator, UniqueConstraint,
+    func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
+
+
+class U64(TypeDecorator):
+    """An unsigned 64-bit integer (proof-of-work nonces). BIGINT is signed and rejects the upper half."""
+    impl = Numeric(20, 0)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return None if value is None else Decimal(int(value))
+
+    def process_result_value(self, value, dialect):
+        return None if value is None else int(value)
 
 
 class Event(Base):
@@ -170,7 +185,7 @@ class InboxMessage(Base):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
     signature: Mapped[str] = mapped_column(String(128), nullable=False, default="")
-    pow_nonce: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    pow_nonce: Mapped[int] = mapped_column(U64, nullable=False, default=0)
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="new")  # new | acknowledged | replied | ignored | escalated
     classification: Mapped[str] = mapped_column(String(32), nullable=False, default="")
