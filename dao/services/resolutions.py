@@ -19,6 +19,7 @@ from ..auth import Verified
 from ..canonical import DOMAIN_RESOLUTION, digest
 from ..context import Context
 from ..models import Resolution
+from ..text import clean_text
 from . import sessions
 
 RESERVED_MATTERS = {
@@ -47,17 +48,17 @@ async def _next_number(db: AsyncSession) -> int:
 
 async def propose(ctx: Context, db: AsyncSession, v: Verified) -> Resolution:
     p = v.payload
-    title, body, matter = (p.get("title") or "").strip(), (p.get("body") or "").strip(), (p.get("matter") or "other")
+    title = clean_text(p.get("title"), "title", max_len=160)
+    body = clean_text(p.get("body"), "body", max_len=50_000)
+    matter = p.get("matter") or "other"
     ops = p.get("ops")
-    if not title or not body:
-        raise HTTPException(400, "title and body are required")
     if matter not in RESERVED_MATTERS | ORDINARY_MATTERS:
         raise HTTPException(400, f"unknown matter {matter!r}")
     if ops is not None:
         ops = sessions.normalise_ops(ops)
     r = Resolution(id=secrets.token_hex(8), number=await _next_number(db), title=title, body=body, matter=matter,
                    ops=ops, proposed_by=v.seat.id, status="open", signatures=[],
-                   related_proposal=p.get("related_proposal", "") or "")
+                   related_proposal=clean_text(p.get("related_proposal"), "related_proposal", max_len=64, required=False))
     db.add(r)
     await ctx.events.append(db, "resolution.proposed", v.actor, {
         "resolution_id": r.id, "number": r.number, "title": title, "body": body, "matter": matter, "ops": ops,

@@ -146,10 +146,18 @@ class FeeLedger(Base):
     proposal_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     payer: Mapped[str] = mapped_column(String(64), nullable=False)
     amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    state: Mapped[str] = mapped_column(String(16), nullable=False, default="seen")  # seen | received | refunded | burned | failed
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="seen")  # seen | due_refund | due_burn | refunded | burned | unreceived
     tx_hashes: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     error: Mapped[str] = mapped_column(Text, nullable=False, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class SeenSignature(Base):
+    """A signed request we have accepted, so it cannot be accepted twice (XE-0033). Purged past the window."""
+    __tablename__ = "seen_signatures"
+    sig: Mapped[str] = mapped_column(String(128), primary_key=True)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)   # signer's ns timestamp
+    account: Mapped[str] = mapped_column(String(64), nullable=False, default="")
 
 
 class InboxMessage(Base):

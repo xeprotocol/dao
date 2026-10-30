@@ -26,7 +26,7 @@ def test_canonical_json_is_sorted_compact_ascii():
     assert canonical_json({"b": 1, "a": "é"}) == b'{"a":"\\u00e9","b":1}'
 
 
-def test_signed_request_verifies_and_rejects_replay():
+def test_signed_request_verifies_and_is_domain_bound():
     kp = KeyPair.generate()
     payload = {"proposal": "ab" * 32, "choice": "for", "reason": ""}
     ts = time.time_ns()
@@ -34,13 +34,61 @@ def test_signed_request_verifies_and_rejects_replay():
     req = SignedRequest(payload=payload, timestamp=ts, pub_key=kp.pub_key_hex, signature=sig)
     v = verify_signed(req, DOMAIN_VOTE)
     assert v.account == kp.address
-    with pytest.raises(HTTPException) as e:
-        verify_signed(req, DOMAIN_VOTE)
-    assert e.value.status_code == 409
+    assert v.digest == digest(DOMAIN_VOTE, {"payload": payload, "timestamp": ts})
+    # verification is pure: the replay claim lives in the database (test_log_db), so a second check passes here
+    assert verify_signed(req, DOMAIN_VOTE).signature == sig.lower()
     # wrong domain fails
     from dao.canonical import DOMAIN_PROPOSAL
     with pytest.raises(HTTPException):
         verify_signed(SignedRequest(payload=payload, timestamp=ts, pub_key=kp.pub_key_hex, signature=sig), DOMAIN_PROPOSAL)
+
+
+def test_http_pow_binds_to_digest_and_difficulty():
+    from dao.auth import Verified, compute_http_pow, require_pow, validate_http_pow
+    target = digest(DOMAIN_VOTE, {"payload": {"message": "hi"}, "timestamp": 1})
+    easy = 0x0100000000000000  # ~1 in 256
+    nonce = compute_http_pow(target, easy)
+    assert validate_http_pow(target, nonce, easy)
+    assert validate_http_pow(target, 0, 0)
+    assert require_pow(Verified("a", "p", {}, 1, "s", digest=target, pow_nonce=nonce), easy) is None
+    with pytest.raises(HTTPException) as e:
+        require_pow(Verified("a", "p", {}, 1, "s", digest=target, pow_nonce=None), easy)
+    assert e.value.status_code == 400 and "pow_nonce" in e.value.detail
+    # the work is bound to the digest: the same nonce over different bytes almost never passes a hard target
+    other = digest(DOMAIN_VOTE, {"payload": {"message": "ho"}, "timestamp": 1})
+    hard = 0xFFFFFFFF00000000
+    assert not validate_http_pow(other, nonce, hard) or not validate_http_pow(target, nonce + 1, hard)
+
+
+def test_clean_text_rejects_control_characters_everywhere():
+    from dao.text import clean_text, has_bad_control, scrub
+    assert clean_text("  hello\nworld\t! ", "message", max_len=100) == "hello\nworld\t!"
+    for bad in ("a\x00b", "a\x01b", "a\x1bb", "a\x7fb"):
+        with pytest.raises(HTTPException) as e:
+            clean_text(bad, "message", max_len=100)
+        assert e.value.status_code == 400 and "message" in e.value.detail
+        assert has_bad_control(bad)
+    with pytest.raises(HTTPException):
+        clean_text("", "title", max_len=10)
+    assert clean_text("", "title", max_len=10, required=False) == ""
+    with pytest.raises(HTTPException):
+        clean_text("x" * 11, "title", max_len=10)
+    with pytest.raises(HTTPException):
+        clean_text(123, "title", max_len=10)
+    assert scrub("a\x00b\nc") == "a\ufffdb\nc"
+
+
+def test_rate_limit_buckets_refill_and_forget():
+    from dao.ratelimit import Buckets, Limit
+    b = Buckets(sweep_every_s=10)
+    lim = Limit(per_minute=60, burst=2)
+    assert b.take("k", lim, now=0.0) == 0.0
+    assert b.take("k", lim, now=0.0) == 0.0
+    wait = b.take("k", lim, now=0.0)
+    assert 0 < wait <= 1.0
+    assert b.take("k", lim, now=1.0) == 0.0        # one token back after a second
+    assert b.take("other", lim, now=100.0) == 0.0  # sweep: the idle key is gone
+    assert "k" not in b._b
 
 
 def test_signed_request_rejects_stale_timestamp():

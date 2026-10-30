@@ -3,6 +3,8 @@
  * Keys never leave the browser. A 32-byte ed25519 seed (hex) is held in sessionStorage for the tab
  * and imported into WebCrypto as PKCS8. Everything the server accepts is
  *   signature = ed25519( sha256( domain || 0x00 || canonical_json({payload, timestamp}) ) )
+ * Routes that cost the sender something (the inbox) also want pow_nonce: a u64 such that
+ *   sha256( nonce_le8 || signing_digest )[0:8], read big-endian, >= difficulty (from GET /v1/inbox).
  * with canonical_json = sorted keys, no whitespace, ASCII-escaped, timestamp in nanoseconds.
  *
  * If this browser cannot do Ed25519 in WebCrypto, every form still shows the exact bytes to sign
@@ -93,20 +95,43 @@
       const sig = await this.signBytes(digest);
       return { ts, digest: bytesToHex(digest), signature: sig };
     },
-    /** Build the body for a SignedRequest, with the timestamp as exact digits. */
-    body(payload, ts, pub_key, signature) {
-      return '{"payload":' + JSON.stringify(payload) + ',"timestamp":' + ts + ',"pub_key":"' + pub_key + '","signature":"' + signature + '"}';
+    /** Proof of work over the signing digest; returns the nonce as decimal digits (u64, may exceed 2^53). */
+    async pow(digestHex, difficultyHex, onProgress) {
+      const diff = BigInt(difficultyHex);
+      if (diff === 0n) return "0";
+      const digest = hexToBytes(digestHex);
+      const buf = new Uint8Array(8 + digest.length); buf.set(digest, 8);
+      const view = new DataView(buf.buffer);
+      let nonce = crypto.getRandomValues(new BigUint64Array(1))[0];
+      for (let i = 0; ; i++) {
+        view.setBigUint64(0, nonce, true);
+        const h = await crypto.subtle.digest("SHA-256", buf);
+        if (new DataView(h).getBigUint64(0, false) >= diff) return nonce.toString();
+        nonce = (nonce + 1n) & 0xFFFFFFFFFFFFFFFFn;
+        if (onProgress && (i & 0x3fff) === 0) onProgress(i);
+      }
     },
-    async post(url, domain, payload, manual) {
-      let ts, pub, sig;
+    /** Build the body for a SignedRequest, with the timestamp (and nonce) as exact digits. */
+    body(payload, ts, pub_key, signature, pow_nonce) {
+      return '{"payload":' + JSON.stringify(payload) + ',"timestamp":' + ts + ',"pub_key":"' + pub_key + '","signature":"' + signature + '"'
+        + (pow_nonce != null ? ',"pow_nonce":' + pow_nonce : "") + '}';
+    },
+    /** opts.pow: difficulty hex (does proof of work over the digest); opts.onProgress(hashes). */
+    async post(url, domain, payload, manual, opts) {
+      let ts, pub, sig, digest, nonce = null;
       if (manual && manual.signature) {
-        ts = manual.ts; pub = manual.pub_key; sig = manual.signature;
+        ts = manual.ts; pub = manual.pub_key; sig = manual.signature; digest = manual.digest;
+        if (manual.pow_nonce != null) nonce = manual.pow_nonce;
       } else {
         if (!this.hasKey()) throw new Error("load a key first, or sign offline");
         const r = await this.signDigest(domain, payload);
-        ts = r.ts; pub = this.pub(); sig = r.signature;
+        ts = r.ts; pub = this.pub(); sig = r.signature; digest = r.digest;
       }
-      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: this.body(payload, ts, pub, sig) });
+      if (opts && opts.pow && nonce == null) {
+        if (!digest) digest = bytesToHex(await sha256(target(domain, payload, ts)));
+        nonce = await this.pow(digest, opts.pow, opts.onProgress);
+      }
+      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: this.body(payload, ts, pub, sig, nonce) });
       const text = await res.text();
       let data; try { data = JSON.parse(text); } catch (e) { data = { raw: text }; }
       if (!res.ok) throw new Error((data && (data.error || data.detail)) || ("HTTP " + res.status));

@@ -11,10 +11,11 @@ from fastapi.responses import RedirectResponse
 from sse_starlette.sse import EventSourceResponse
 
 from .. import __version__
-from ..auth import SignedRequest, require_seat, verify_signed
+from ..auth import SignedRequest, claim_signature, require_seat, verify_and_claim, verify_signed
 from ..canonical import DOMAIN_INBOX_HTTP, DOMAIN_MEMBER_ACTION, DOMAIN_PROPOSAL, DOMAIN_VOTE
 from ..db import session
 from ..log import EventLog, event_to_dict
+from ..ratelimit import INBOX, PROPOSAL, VOTE, enforce
 from ..services import inbox as inbox_svc
 from ..services import pause as pause_svc
 from ..services import portal, records
@@ -110,8 +111,11 @@ async def list_proposals(db: Db, status: str | None = None, offset: int = 0, lim
 
 
 @router.post("/proposals", status_code=201)
-async def submit_proposal(req: SignedRequest, ctx: Ctx, db: Db):
+async def submit_proposal(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
+    enforce(request, PROPOSAL)
     v = verify_signed(req, DOMAIN_PROPOSAL)
+    enforce(request, PROPOSAL, v.account)
+    await claim_signature(db, v)
     pr = await portal.submit(ctx, db, v)
     await db.commit()
     return portal.to_dict(pr)
@@ -134,8 +138,11 @@ async def proposal_votes(h: str, db: Db):
 
 
 @router.post("/proposals/{h}/votes", status_code=201)
-async def cast_vote(h: str, req: SignedRequest, ctx: Ctx, db: Db):
+async def cast_vote(request: Request, h: str, req: SignedRequest, ctx: Ctx, db: Db):
+    enforce(request, VOTE)
     v = verify_signed(req, DOMAIN_VOTE)
+    enforce(request, VOTE, v.account)
+    await claim_signature(db, v)
     pr = await portal.get(db, h)
     row = await portal.vote(ctx, db, pr, v)
     await db.commit()
@@ -144,9 +151,12 @@ async def cast_vote(h: str, req: SignedRequest, ctx: Ctx, db: Db):
 
 
 @router.post("/votes", status_code=201)
-async def cast_vote_flat(req: SignedRequest, ctx: Ctx, db: Db):
+async def cast_vote_flat(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
     """Same as POST /proposals/{hash}/votes; the proposal hash comes from the signed payload."""
+    enforce(request, VOTE)
     v = verify_signed(req, DOMAIN_VOTE)
+    enforce(request, VOTE, v.account)
+    await claim_signature(db, v)
     pr = await portal.get(db, v.payload.get("proposal", ""))
     row = await portal.vote(ctx, db, pr, v)
     await db.commit()
@@ -182,14 +192,25 @@ async def inbox_info(ctx: Ctx, db: Db, limit: int = 50):
     rows = await inbox_svc.list_messages(db, None, limit)
     return {
         "account": inbox_svc.dao_account(ctx),
-        "how": "send an XE chat envelope to the account above, or POST a signed message here",
+        "how": "send an XE chat envelope to the account above, or POST a signed message here with a proof of work",
+        "pow": {
+            "difficulty": f"0x{ctx.node.chat_pow_difficulty:016x}",
+            "rule": "pow_nonce (u64) such that sha256(nonce_le8 || signing_digest)[0:8] read big-endian >= difficulty; "
+                    "signing_digest = sha256(domain || 0x00 || canonical_json({payload, timestamp}))",
+            "domain": DOMAIN_INBOX_HTTP.rstrip(b"\x00").decode(),
+        },
+        "logging": "messages sent here are kept in the hash chain on receipt and appear on the public log once a member has read them",
         "recent": [inbox_svc.to_dict(m) for m in rows if m.status != "spam"],
     }
 
 
 @router.post("/inbox", status_code=201)
-async def inbox_post(req: SignedRequest, ctx: Ctx, db: Db):
+async def inbox_post(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
+    """Signed message plus a chat-level proof of work over the signing digest (see GET /v1/inbox for the rule)."""
+    enforce(request, INBOX)
     v = verify_signed(req, DOMAIN_INBOX_HTTP)
+    enforce(request, INBOX, v.account)
+    await claim_signature(db, v)
     m = await inbox_svc.http_submit(ctx, db, v)
     await db.commit()
     return inbox_svc.to_dict(m)
@@ -301,7 +322,7 @@ async def ready(ctx: Ctx, db: Db):
 
 @router.post("/proposals/{h}/analysis", status_code=201)
 async def proposal_analysis(h: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(verify_signed(req, DOMAIN_MEMBER_ACTION), ctx.config)
+    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
     pr = await portal.get(db, h)
     await portal.add_analysis(ctx, db, pr, v)
     await db.commit()
@@ -310,7 +331,7 @@ async def proposal_analysis(h: str, req: SignedRequest, ctx: Ctx, db: Db):
 
 @router.post("/proposals/{h}/decision", status_code=201)
 async def proposal_decision(h: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(verify_signed(req, DOMAIN_MEMBER_ACTION), ctx.config)
+    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
     if not (v.seat.is_member or v.seat.can("operational_review")):
         raise HTTPException(403, "decisions are recorded by members or an officer with operational_review")
     pr = await portal.get(db, h)

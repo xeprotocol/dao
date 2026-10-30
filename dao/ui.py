@@ -223,7 +223,8 @@ async def inbox_page(request: Request):
     async with session() as db:
         common = await _common(db)
         rows = [m for m in await inbox_svc.list_messages(db, None, 100) if m.status != "spam"]
-    return render(request, "inbox.html", {**common, "messages": rows, "dao_account": inbox_svc.dao_account(c)})
+    return render(request, "inbox.html", {**common, "messages": rows, "dao_account": inbox_svc.dao_account(c),
+                                          "pow_difficulty": f"0x{c.node.chat_pow_difficulty:016x}"})
 
 
 @router.get("/records", response_class=HTMLResponse)

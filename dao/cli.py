@@ -84,16 +84,21 @@ def sign(digest: str = typer.Option(..., help="32-byte hex digest shown by the w
 @app.command("sign-request")
 def sign_request(domain: str = typer.Argument(..., help="e.g. xe-dao/vote/v1"),
                  payload: str = typer.Argument(..., help="JSON payload"),
-                 seed: str = typer.Option(None, help="64-hex seed; or set XE_SEED")):
+                 seed: str = typer.Option(None, help="64-hex seed; or set XE_SEED"),
+                 pow_difficulty: str = typer.Option(None, "--pow", help="hex difficulty from GET /v1/inbox; adds pow_nonce")):
     """Produce a complete SignedRequest body for curl."""
     import time
+    from .auth import compute_http_pow
     from .canonical import digest as _digest
     s = seed or os.environ.get("XE_SEED") or getpass.getpass("seed hex: ")
     kp = KeyPair.from_seed_hex(s)
     p = json.loads(payload)
     ts = time.time_ns()
     d = _digest(domain.encode() + b"\x00", {"payload": p, "timestamp": ts})
-    typer.echo(json.dumps({"payload": p, "timestamp": ts, "pub_key": kp.pub_key_hex, "signature": kp.sign_hex(d)}))
+    out = {"payload": p, "timestamp": ts, "pub_key": kp.pub_key_hex, "signature": kp.sign_hex(d)}
+    if pow_difficulty:
+        out["pow_nonce"] = compute_http_pow(d, int(pow_difficulty, 16))
+    typer.echo(json.dumps(out))
 
 
 @app.command("address")

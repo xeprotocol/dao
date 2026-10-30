@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..auth import Verified
 from ..context import Context
 from ..models import PauseRecord
+from ..text import clean_text
 
 H = 3600 * 1_000_000_000
 D = 24 * H
@@ -42,7 +43,7 @@ async def is_paused(db: AsyncSession) -> bool:
 async def start(ctx: Context, db: AsyncSession, v: Verified) -> PauseRecord:
     cfg = ctx.config.pause
     ground = v.payload.get("ground", "")
-    text = (v.payload.get("determination") or "").strip()
+    text = clean_text(v.payload.get("determination"), "determination", max_len=20_000)
     if ground not in cfg.get("grounds", []):
         raise HTTPException(400, f"ground must be one of {cfg.get('grounds', [])}")
     if len(text) < 20:
@@ -81,7 +82,7 @@ async def extend(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) ->
     if any(s["seat"] == v.seat.id for s in sigs):
         raise HTTPException(409, "this member already signed this extension")
     sigs = [*sigs, {"seat": v.seat.id, "public_key": v.pub_key, "signature": v.signature, "timestamp": v.timestamp}]
-    entry = {"signatures": sigs, "applied": False, "reason": v.payload.get("reason", "")}
+    entry = {"signatures": sigs, "applied": False, "reason": clean_text(v.payload.get("reason"), "reason", max_len=2000, required=False)}
     if len(sigs) >= len(ctx.config.members):
         entry["applied"] = True
         base = max(r.expires_at, time.time_ns())
@@ -111,9 +112,7 @@ async def lift(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) -> P
 
 
 async def set_post(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) -> PauseRecord:
-    text = (v.payload.get("text") or "").strip()
-    if not text:
-        raise HTTPException(400, "text required")
+    text = clean_text(v.payload.get("text"), "text", max_len=20_000)
     r.post_text = text
     if r.posted_at:
         await ctx.events.append(db, "pause.post_updated", v.actor, {"pause_id": r.id, "text": text}, ref=f"pause:{r.id}")

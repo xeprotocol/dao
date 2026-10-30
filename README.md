@@ -38,7 +38,9 @@ Every write is a `SignedRequest`:
 {"payload": {...}, "timestamp": <unix ns>, "pub_key": "<hex>", "signature": "<hex>"}
 ```
 
-`signature = ed25519( sha256( domain || 0x00 || canonical_json({"payload": payload, "timestamp": timestamp}) ) )` with `canonical_json` = sorted keys, no whitespace, ASCII-escaped. Domains: `xe-dao/proposal/v1`, `xe-dao/vote/v1`, `xe-dao/inbox/v1`, `xe-dao/member-action/v1`, `xe-dao/resolution/v1`, `xe-dao/ops-approval/v1`. The account is derived from the key (`sha256("xe/account/v1" || pubkey)`). Timestamps must be within ±10 minutes; a signature is accepted once.
+`signature = ed25519( sha256( domain || 0x00 || canonical_json({"payload": payload, "timestamp": timestamp}) ) )` with `canonical_json` = sorted keys, no whitespace, ASCII-escaped. Domains: `xe-dao/proposal/v1`, `xe-dao/vote/v1`, `xe-dao/inbox/v1`, `xe-dao/member-action/v1`, `xe-dao/resolution/v1`, `xe-dao/ops-approval/v1`. The account is derived from the key (`sha256("xe/account/v1" || pubkey)`). Timestamps must be within ±10 minutes; a signature is accepted once (the claim is stored in the database in the same transaction as the write it authorised, so it survives restarts). A replacement vote must carry a later timestamp than the one on record. Free-text fields refuse control characters other than tab, newline and carriage return. Public write routes are rate-limited per IP and per account (429 with `Retry-After`).
+
+`POST /v1/inbox` additionally requires `"pow_nonce": <u64>` with `sha256(nonce_le8 || signing_digest)[0:8]`, read big-endian, `>=` the difficulty the node advertises for chat (`GET /v1/inbox` shows it). The receipt is kept in the hash chain but appears on the public log only once a member has read the message. Proposal fees must be `finalized` on the chain before they are accepted, and a fee that was never received into the fee account is parked as `unreceived` rather than refunded or burned.
 
 ```sh
 dao sign-request xe-dao/vote/v1 '{"proposal":"<hash>","choice":"for","reason":""}' --seed <hex> \

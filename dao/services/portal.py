@@ -8,6 +8,7 @@ quorum. Nothing here executes anything: a passed proposal becomes a decision ite
 
 from __future__ import annotations
 
+import re
 import time
 
 from fastapi import HTTPException
@@ -21,11 +22,13 @@ from ..canonical import DOMAIN_PROPOSAL, canonical_json, sha256_hex
 from ..chainops import account_snapshot
 from ..context import Context
 from ..models import FeeLedger, Proposal, Vote
+from ..text import clean_text
 from . import sessions
 
 D = 24 * 3600 * 1_000_000_000
 MAX_TITLE = 160
 MAX_BODY = 20_000
+HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
 def fee_account(ctx: Context) -> str:
@@ -66,19 +69,21 @@ async def _verify_fee(ctx: Context, db: AsyncSession, fee_block_hash: str, autho
         raise HTTPException(400, "fee must be sent from the proposing account")
     if int(b.get("amount", 0)) < fee:
         raise HTTPException(400, f"fee is {fee} µXE; block sends {b.get('amount')}")
+    if b.get("finalized") is not True:
+        # A seen-but-unfinalised send can still be dropped by the node (xeprotocol/xe#55, XE-0034).
+        # Accepting it would open a proposal whose fee may never arrive and later refund XE we never held.
+        raise HTTPException(400, "fee block is not yet finalised; retry in a few seconds")
     return b
 
 
 async def submit(ctx: Context, db: AsyncSession, v: Verified) -> Proposal:
     p = v.payload
-    title = (p.get("title") or "").strip()
-    body = (p.get("body") or "").strip()
+    title = clean_text(p.get("title"), "title", max_len=MAX_TITLE)
+    body = clean_text(p.get("body"), "body", max_len=MAX_BODY)
     ops = p.get("ops")
     fee_block_hash = (p.get("fee_block_hash") or "").lower()
-    if not title or len(title) > MAX_TITLE:
-        raise HTTPException(400, f"title is required (max {MAX_TITLE} chars)")
-    if not body or len(body) > MAX_BODY:
-        raise HTTPException(400, f"body is required (max {MAX_BODY} chars)")
+    if fee_block_hash and not HEX64.fullmatch(fee_block_hash):
+        raise HTTPException(400, "fee_block_hash must be 64 hex characters")
     if ops is not None:
         try:
             ops = sessions.normalise_ops(ops)
@@ -147,15 +152,20 @@ async def vote(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Vot
         reasons.append("agent accounts do not count toward quorum")
     participating = not reasons
     weight = 0 if excluded else int(snap["balance"])
+    reason = clean_text(v.payload.get("reason"), "reason", max_len=2000, required=False)
     existing = (await db.execute(select(Vote).where(Vote.proposal_hash == pr.hash, Vote.account == v.account))).scalar_one_or_none()
     if existing:
-        existing.choice, existing.reason, existing.timestamp, existing.signature = choice, v.payload.get("reason", "") or "", v.timestamp, v.signature
+        # Replacement is by signer time, not arrival: a vote signed earlier than the one on record is stale
+        # and cannot overwrite it, whoever replays it and whenever (XE-0033).
+        if v.timestamp <= existing.timestamp:
+            raise HTTPException(409, "a newer vote from this account is already recorded")
+        existing.choice, existing.reason, existing.timestamp, existing.signature = choice, reason, v.timestamp, v.signature
         existing.pub_key, existing.weight, existing.participating, existing.is_agent = v.pub_key, weight, participating, is_agent
         existing.eligibility = {"snapshot": snap, "not_participating_because": reasons}
         row = existing
     else:
         row = Vote(proposal_hash=pr.hash, account=v.account, pub_key=v.pub_key, choice=choice,
-                   reason=v.payload.get("reason", "") or "", timestamp=v.timestamp, signature=v.signature, weight=weight,
+                   reason=reason, timestamp=v.timestamp, signature=v.signature, weight=weight,
                    participating=participating, is_agent=is_agent, eligibility={"snapshot": snap, "not_participating_because": reasons})
         db.add(row)
     await ctx.events.append(db, "vote.cast", v.actor, {
@@ -223,20 +233,18 @@ async def decide(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> P
     decision = v.payload.get("decision")
     if decision not in ("adopt", "decline", "defer", "refer_to_resolution"):
         raise HTTPException(400, "decision must be adopt | decline | defer | refer_to_resolution")
-    reasons = (v.payload.get("reasons") or "").strip()
+    reasons = clean_text(v.payload.get("reasons"), "reasons", max_len=MAX_BODY)
     if len(reasons) < 10:
         raise HTTPException(400, "reasons are required")
     pr.decision = {"decision": decision, "reasons": reasons, "by": v.seat.id, "timestamp": v.timestamp,
-                   "resolution_id": v.payload.get("resolution_id", "")}
+                   "resolution_id": clean_text(v.payload.get("resolution_id"), "resolution_id", max_len=64, required=False)}
     pr.status = "decided"
     await ctx.events.append(db, "proposal.decided", v.actor, {"proposal": pr.hash, **pr.decision}, ref=f"proposal:{pr.hash}")
     return pr
 
 
 async def add_analysis(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Proposal:
-    text = (v.payload.get("text") or "").strip()
-    if not text:
-        raise HTTPException(400, "text required")
+    text = clean_text(v.payload.get("text"), "text", max_len=MAX_BODY)
     entry = {"by": v.seat.id if v.seat else v.account, "timestamp": v.timestamp, "text": text}
     pr.analysis = [*pr.analysis, entry]
     await ctx.events.append(db, "proposal.analysis", v.actor, {"proposal": pr.hash, **entry}, ref=f"proposal:{pr.hash}")

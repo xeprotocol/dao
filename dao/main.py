@@ -58,10 +58,23 @@ app.add_middleware(MarkdownMirror, base_url=lambda: get_context().settings.publi
 
 @app.exception_handler(StarletteHTTPException)
 async def http_error(request: Request, exc: StarletteHTTPException):
+    headers = dict(exc.headers or {})
     if request.url.path.startswith("/v1"):
-        return JSONResponse({"error": exc.detail, "status": exc.status_code}, status_code=exc.status_code)
+        return JSONResponse({"error": exc.detail, "status": exc.status_code}, status_code=exc.status_code, headers=headers)
     from .ui import render
-    return render(request, "error.html", {"status": exc.status_code, "detail": exc.detail}, status_code=exc.status_code)
+    resp = render(request, "error.html", {"status": exc.status_code, "detail": exc.detail}, status_code=exc.status_code)
+    resp.headers.update(headers)
+    return resp
+
+
+@app.exception_handler(Exception)
+async def unhandled_error(request: Request, exc: Exception):
+    """Anything we did not expect: log it in full here, say nothing specific to the client (XE-0080)."""
+    log.exception("unhandled error on %s %s", request.method, request.url.path)
+    if request.url.path.startswith("/v1"):
+        return JSONResponse({"error": "internal error", "status": 500}, status_code=500)
+    from .ui import render
+    return render(request, "error.html", {"status": 500, "detail": "internal error"}, status_code=500)
 
 
 @app.middleware("http")

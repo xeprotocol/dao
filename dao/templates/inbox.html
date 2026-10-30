@@ -2,7 +2,7 @@
 {% block title %}Inbox{% endblock %}
 {% block content %}
 <h1>Inbox</h1>
-<p class="sub">Talk to the DAO directly. Over XE chat: send to <code>{{ dao_account or "account not yet published" }}</code>. Or sign a message here. Messages and replies are public; replies come from the same account over chat.</p>
+<p class="sub">Talk to the DAO directly. Over XE chat: send to <code>{{ dao_account or "account not yet published" }}</code>. Or sign a message here; your browser does a few seconds of proof of work first, the same cost as a chat message. A message sent here enters the public log once a member has read it. Replies are public and come from the same account over chat.</p>
 
 {% include "_keybox.html" %}
 <form class="block" id="iform">
@@ -22,7 +22,23 @@
 {% block scripts %}
 <script>
 const DOMAIN = "xe-dao/inbox/v1";
-$("#iform").addEventListener("submit", async e => { e.preventDefault(); try { await XeSigner.post("/v1/inbox", DOMAIN, { message: $("#message").value.trim() }); say("#imsg", "Received and logged.", true); setTimeout(()=>location.reload(), 1200); } catch (err) { say("#imsg", err.message, false); } });
-$("#offline").addEventListener("click", async () => { const t = await XeSigner.offlineTarget(DOMAIN, { message: $("#message").value.trim() }); $("#offline_out").hidden = false; $("#offline_out").textContent = "digest:    " + t.digest + "\ntimestamp: " + t.ts + "\ncanonical: " + t.canonical; });
+const POW = "{{ pow_difficulty }}";
+$("#iform").addEventListener("submit", async e => {
+  e.preventDefault();
+  const btn = $("#iform button[type=submit]"); btn.disabled = true;
+  try {
+    await XeSigner.post("/v1/inbox", DOMAIN, { message: $("#message").value.trim() }, null,
+      { pow: POW, onProgress: n => say("#imsg", "Computing proof of work… " + Math.round(n / 1000) + "k hashes", true) });
+    say("#imsg", "Received. It will appear on the public log once a member has read it.", true);
+    setTimeout(() => location.reload(), 1500);
+  } catch (err) { say("#imsg", err.message, false); }
+  btn.disabled = false;
+});
+$("#offline").addEventListener("click", async () => {
+  const t = await XeSigner.offlineTarget(DOMAIN, { message: $("#message").value.trim() });
+  $("#offline_out").hidden = false;
+  $("#offline_out").textContent = "digest:    " + t.digest + "\ntimestamp: " + t.ts + "\ncanonical: " + t.canonical
+    + "\n\nalso needed: pow_nonce, a u64 with sha256(nonce_le8 || digest)[0:8] (big-endian) >= " + POW;
+});
 </script>
 {% endblock %}

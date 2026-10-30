@@ -19,10 +19,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from xe.chat import ChatError, Envelope, new_envelope, verify_envelope
 from xe.chat_auth import chat_read_proof
 
-from ..auth import Verified
+from ..auth import Verified, require_pow
 from ..context import Context
 from ..models import InboxMessage, OutboxMessage
 from ..signer import SignerError
+from ..text import clean_text, has_bad_control, scrub
 from . import pause
 
 log = logging.getLogger("dao.inbox")
@@ -47,31 +48,52 @@ async def store_envelope(ctx: Context, db: AsyncSession, env: Envelope, channel:
     except ChatError as e:
         verified = False
         log.info("unverified envelope %s: %s", env.id[:12], e)
+    body, status = env.message, "new"
+    if has_bad_control(body):
+        # The signature covers the exact bytes, so we cannot clean a verified body and still call it verified.
+        # Store a visibly scrubbed copy, marked unverified and spam, so the id is remembered and never re-fetched.
+        body, verified, status = scrub(body), False, "spam"
+        log.info("envelope %s carried control characters; stored scrubbed as spam", env.id[:12])
     m = InboxMessage(id=env.id, channel=channel, from_account=env.from_, to_account=env.to, pub_key=env.pub_key,
-                     body=env.message, timestamp=env.timestamp, signature=env.signature, pow_nonce=env.pow_nonce,
-                     verified=verified, status="new")
+                     body=body, timestamp=env.timestamp, signature=env.signature, pow_nonce=env.pow_nonce,
+                     verified=verified, status=status)
     db.add(m)
     ev = await ctx.events.append(db, "inbox.received", f"account:{env.from_}", {
-        "id": env.id, "channel": channel, "from": env.from_, "verified": verified, "body": env.message[:4000],
+        "id": env.id, "channel": channel, "from": env.from_, "verified": verified, "body": body[:4000],
         "timestamp": env.timestamp,
-    }, ref=f"inbox:{env.id}")
+    }, ref=f"inbox:{env.id}", public=status != "spam")
     if verified and channel == "chat" and not await pause.is_paused(db):
         await queue_reply(ctx, db, m, f"{AUTO_ACK} Log index {ev.index}.", from_seat="harness", kind="ack")
     return m
 
 
 async def http_submit(ctx: Context, db: AsyncSession, v: Verified) -> InboxMessage:
-    body = (v.payload.get("message") or "").strip()
-    if not body or len(body) > 8000:
-        raise HTTPException(400, "message is required (max 8000 chars)")
+    """A signed message over HTTP. Costs the sender a chat-level proof of work (XE-0032).
+
+    The receipt is logged privately: it is in the hash chain, but not on the public log until a member has
+    looked at it (`publish_on_triage`). Anyone can still send; nobody can fill the permanent record unread.
+    """
+    require_pow(v, ctx.node.chat_pow_difficulty)
+    body = clean_text(v.payload.get("message"), "message", max_len=8000)
     mid = secrets.token_hex(16)
     m = InboxMessage(id=mid, channel="http", from_account=v.account, to_account=dao_account(ctx), pub_key=v.pub_key,
-                     body=body, timestamp=v.timestamp, signature=v.signature, pow_nonce=0, verified=True, status="new")
+                     body=body, timestamp=v.timestamp, signature=v.signature, pow_nonce=v.pow_nonce or 0,
+                     verified=True, status="new")
     db.add(m)
     await ctx.events.append(db, "inbox.received", v.actor, {
         "id": mid, "channel": "http", "from": v.account, "verified": True, "body": body[:4000], "timestamp": v.timestamp,
-    }, ref=f"inbox:{mid}")
+    }, ref=f"inbox:{mid}", public=False)
     return m
+
+
+async def publish_on_triage(ctx: Context, db: AsyncSession, m: InboxMessage, actor: str) -> None:
+    """First time a member moves an HTTP message out of `new` (and not to spam), put it on the public log."""
+    if m.channel != "http" or m.status != "new":
+        return
+    await ctx.events.append(db, "inbox.published", actor, {
+        "id": m.id, "channel": m.channel, "from": m.from_account, "verified": m.verified, "body": m.body[:4000],
+        "timestamp": m.timestamp,
+    }, ref=f"inbox:{m.id}")
 
 
 async def queue_reply(ctx: Context, db: AsyncSession, m: InboxMessage, text: str, from_seat: str, kind: str = "reply") -> OutboxMessage:
@@ -88,9 +110,8 @@ async def queue_reply(ctx: Context, db: AsyncSession, m: InboxMessage, text: str
 
 
 async def reply(ctx: Context, db: AsyncSession, m: InboxMessage, v: Verified) -> OutboxMessage:
-    text = (v.payload.get("text") or "").strip()
-    if not text or len(text.encode()) > 8000:
-        raise HTTPException(400, "text is required (max 8000 bytes)")
+    text = clean_text(v.payload.get("text"), "text", max_len=8000, max_bytes=8000)
+    await publish_on_triage(ctx, db, m, v.actor)
     return await queue_reply(ctx, db, m, text, from_seat=v.seat.id)
 
 
@@ -98,8 +119,11 @@ async def set_status(ctx: Context, db: AsyncSession, m: InboxMessage, v: Verifie
     status = v.payload.get("status")
     if status not in ("new", "read", "answered", "closed", "spam"):
         raise HTTPException(400, "bad status")
+    if status not in ("new", "spam"):
+        await publish_on_triage(ctx, db, m, v.actor)
     m.status = status
-    m.classification = v.payload.get("classification", m.classification) or m.classification
+    m.classification = clean_text(v.payload.get("classification"), "classification", max_len=64,
+                                  required=False) or m.classification
     await ctx.events.append(db, "inbox.status", v.actor, {"id": m.id, "status": status, "classification": m.classification},
                             ref=f"inbox:{m.id}", public=status != "spam")
     return m

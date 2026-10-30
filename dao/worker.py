@@ -19,6 +19,7 @@ from xe.chat import Envelope
 from xe.client import XeError
 from xe.directory import new_registration
 
+from .auth import purge_seen_signatures
 from .context import Context, build_context, set_context
 from .db import session
 from .log import EventLog
@@ -96,6 +97,9 @@ class Worker:
                 for s in rows:
                     if len(s.approvals) >= s.required_approvals and (not s.not_before or now >= s.not_before):
                         await sessions.rebuild(self.ctx, db, s)
+            purged = await purge_seen_signatures(db)
+            if purged:
+                log.debug("purged %d expired signature claims", purged)
             await mark_run(db, "timers")
             await db.commit()
 

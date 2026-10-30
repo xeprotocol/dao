@@ -55,14 +55,14 @@ docker compose run --rm --no-deps -v $PWD/tests:/app/tests app \
 
 All of these must pass before the next step. If `test_block_hash_matches_testnet` or `test_statechain_genesis_and_oracle_hash` fail, stop: the protocol encoding has drifted and nothing the harness signs would be accepted.
 
-Database-backed log test (uses a scratch database it wipes):
+Database-backed tests: the log chain, and the inbox / vote / fee hardening (uses a scratch database it wipes):
 
 ```sh
 docker compose up -d db
 docker compose exec db psql -U dao -d dao -c "CREATE DATABASE dao_test;"
 docker compose run --rm -v $PWD/tests:/app/tests \
   -e DAO_TEST_DATABASE_URL="postgresql+asyncpg://dao:$(grep ^POSTGRES_PASSWORD .env | cut -d= -f2)@db:5432/dao_test" \
-  app sh -c "pip install -q pytest pytest-asyncio && pytest -q tests/test_log_db.py"
+  app sh -c "pip install -q pytest pytest-asyncio && pytest -q tests/test_log_db.py tests/test_hardening_db.py"
 ```
 
 ## 3. Create the company keys

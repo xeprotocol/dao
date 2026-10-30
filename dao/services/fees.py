@@ -41,6 +41,16 @@ async def settle_due(ctx: Context, db: AsyncSession) -> int:
     rows = list((await db.execute(select(FeeLedger).where(FeeLedger.state.in_(("due_refund", "due_burn"))))).scalars().all())
     n = 0
     for f in rows:
+        if not (f.tx_hashes or {}).get("receive"):
+            # We never received this fee into the fee account, so there is nothing of the payer's to refund or
+            # burn: paying out here would spend other payers' XE (XE-0034). Park it; a member can look.
+            f.state = "unreceived"
+            f.error = "fee send was never received into the fee account; nothing to settle"
+            await ctx.events.append(db, "fee.unreceived", "harness", {
+                "proposal": f.proposal_hash, "payer": f.payer, "amount": f.amount, "fee_block_hash": f.fee_block_hash,
+            }, ref=f"proposal:{f.proposal_hash}")
+            log.warning("fee for %s was never received; not settling", f.proposal_hash)
+            continue
         try:
             if f.state == "due_refund":
                 b = await chainops.send(ctx, "fee", "block.send.refund", f.payer, f.amount, memo=f"fee refund {f.proposal_hash[:12]}")
