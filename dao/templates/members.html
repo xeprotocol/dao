@@ -69,11 +69,14 @@
 <h2>Closed votes awaiting a decision</h2>
 <table><tr><th>Proposal</th><th>Result</th><th>Decision</th></tr>
 {% for p in closed %}<tr><td><a href="/proposals/{{ p.hash }}">{{ p.title }}</a></td><td><span class="pill {{ p.result.outcome }}">{{ p.result.outcome.replace('_',' ') }}</span> {{ p.result.participating_wallets }}/{{ p.result.quorum_wallets }}</td>
-<td><form class="row" data-decide="{{ p.hash }}"><select name="decision"><option>adopt</option><option>decline</option><option>defer</option><option>refer_to_resolution</option></select><input type="text" name="reasons" placeholder="reasons (public)" style="flex:1;min-width:200px" required><button class="ghost">Sign</button></form></td></tr>
+<td><form class="row" data-decide="{{ p.hash }}"><select name="decision"><option>adopt</option><option>decline</option><option>defer</option><option>refer_to_resolution</option></select><input type="text" name="reasons" placeholder="reasons (public)" style="flex:1;min-width:200px" required><input type="text" name="resolution_id" placeholder="resolution id{% if p.ops %} (required to adopt: this proposal carries ops){% endif %}" style="min-width:200px"><button class="ghost">Sign</button></form>
+<div class="small mute">Recorded once. Adopt needs a passed vote{% if p.ops %} and an adopted resolution about this proposal{% endif %}.</div></td></tr>
 {% else %}<tr><td colspan="3" class="mute">None.</td></tr>{% endfor %}</table>
 <div id="decmsg" class="msg" hidden></div>
 
 <h2>Inbox</h2>
+<p class="mute" id="untriaged">{% if untriaged %}{{ untriaged }} unread HTTP message{{ 's' if untriaged != 1 }} — shown here once your seat key is loaded, and to everyone once a member has read {{ 'them' if untriaged != 1 else 'it' }}.{% else %}No unread HTTP messages.{% endif %}</p>
+<div id="inbox">
 {% for m in messages %}
 <div class="card" style="margin-bottom:10px">
   <div class="k"><code>{{ m.from_account|short(16) }}</code> via {{ m.channel }} · {{ m.timestamp|ns }} · <span class="pill">{{ m.status }}</span>{% if not m.verified %} · <span class="pill">unverified</span>{% endif %}</div>
@@ -81,7 +84,8 @@
   <form class="row" data-reply="{{ m.id }}"><input type="text" name="text" placeholder="reply (sent from the DAO account over chat; public)" style="flex:1;min-width:240px" required><button class="ghost">Sign and send</button>
   <select name="status"><option value="">status…</option><option>read</option><option>closed</option><option>spam</option></select></form>
 </div>
-{% else %}<p class="mute">Empty.</p>{% endfor %}
+{% else %}<p class="mute" id="inbox-empty">Empty.</p>{% endfor %}
+</div>
 <div id="inmsg" class="msg" hidden></div>
 
 <h2>Public note</h2>
@@ -90,7 +94,30 @@
 {% block scripts %}
 <script>
 const MA = "xe-dao/member-action/v1", RES = "xe-dao/resolution/v1", OPS = "xe-dao/ops-approval/v1";
-window.onKeyLoaded = async (pub) => { try { const r = await (await fetch("/v1/members/whoami/" + pub)).json(); $("#seatline").textContent = r.seat ? ("Seat: " + r.seat + " (" + r.name + ", " + r.kind + "). Rights: " + r.may.join(", ")) : "This key holds no seat."; } catch (e) { $("#seatline").textContent = "This key holds no seat."; } };
+window.onKeyLoaded = async (pub) => {
+  try { const r = await (await fetch("/v1/members/whoami/" + pub)).json(); $("#seatline").textContent = r.seat ? ("Seat: " + r.seat + " (" + r.name + ", " + r.kind + "). Rights: " + r.may.join(", ")) : "This key holds no seat."; if (r.seat) loadUntriaged(); }
+  catch (e) { $("#seatline").textContent = "This key holds no seat."; }
+};
+// Unread HTTP messages are held back from every public surface until a member has read them (XE-0195);
+// a seat holder fetches them with a signed request and they are rendered here with the same forms.
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const whenNs = (ns) => { const d = new Date(Number(BigInt(ns) / 1000000n)); return d.toISOString().slice(0, 16).replace("T", " ") + " UTC"; };
+async function loadUntriaged() {
+  if ($("#inbox [data-untriaged]")) return;
+  try {
+    const r = await XeSigner.post("/v1/members/inbox/untriaged", MA, { action: "list_untriaged" });
+    if (!r.messages.length) return;
+    const empty = $("#inbox-empty"); if (empty) empty.remove();
+    const html = r.messages.map(m => `<div class="card" data-untriaged style="margin-bottom:10px">
+  <div class="k"><code>${esc(m.from.slice(0, 16))}${m.from.length > 16 ? "…" : ""}</code> via ${esc(m.channel)} · ${whenNs(m.timestamp)} · <span class="pill">${esc(m.status)}</span>${m.verified ? "" : ' · <span class="pill">unverified</span>'} · <span class="pill">unread, not yet public</span></div>
+  <pre style="margin:6px 0">${esc(m.body)}</pre>
+  <form class="row" data-reply="${esc(m.id)}"><input type="text" name="text" placeholder="reply (sent from the DAO account over chat; public)" style="flex:1;min-width:240px" required><button class="ghost">Sign and send</button>
+  <select name="status"><option value="">status…</option><option>read</option><option>closed</option><option>spam</option></select></form>
+</div>`).join("");
+    $("#inbox").insertAdjacentHTML("afterbegin", html);
+    $("#untriaged").textContent = r.messages.length + " unread HTTP message" + (r.messages.length === 1 ? "" : "s") + ", visible to seat holders only until read.";
+  } catch (err) { say("#inmsg", err.message, false); }
+}
 const reload = () => setTimeout(() => location.reload(), 900);
 const on = (sel, ev, fn) => { const el = $(sel); if (el) el.addEventListener(ev, fn); };
 
@@ -115,9 +142,10 @@ $$("button[data-signblock]").forEach(b => b.addEventListener("click", async () =
 $$("button[data-rebuild]").forEach(b => b.addEventListener("click", async () => { try { await XeSigner.post("/v1/members/sessions/" + b.dataset.rebuild + "/rebuild", MA, { session_id: b.dataset.rebuild, action: "rebuild" }); reload(); } catch (err) { say("#sessmsg", err.message, false); } }));
 $$("button[data-cancel]").forEach(b => b.addEventListener("click", async () => { const reason = prompt("Reason (public)"); if (!reason) return; try { await XeSigner.post("/v1/members/sessions/" + b.dataset.cancel + "/cancel", MA, { session_id: b.dataset.cancel, reason }); reload(); } catch (err) { say("#sessmsg", err.message, false); } }));
 
-$$("form[data-decide]").forEach(f => f.addEventListener("submit", async e => { e.preventDefault(); try { await XeSigner.post("/v1/proposals/" + f.dataset.decide + "/decision", MA, { proposal: f.dataset.decide, decision: f.decision.value, reasons: f.reasons.value.trim() }); say("#decmsg", "Recorded.", true); reload(); } catch (err) { say("#decmsg", err.message, false); } }));
-$$("form[data-reply]").forEach(f => { f.addEventListener("submit", async e => { e.preventDefault(); try { await XeSigner.post("/v1/members/inbox/" + f.dataset.reply + "/reply", MA, { message_id: f.dataset.reply, text: f.text.value.trim() }); say("#inmsg", "Queued for sending.", true); reload(); } catch (err) { say("#inmsg", err.message, false); } });
-  f.status.addEventListener("change", async () => { if (!f.status.value) return; try { await XeSigner.post("/v1/members/inbox/" + f.dataset.reply + "/status", MA, { message_id: f.dataset.reply, status: f.status.value }); reload(); } catch (err) { say("#inmsg", err.message, false); } }); });
+$$("form[data-decide]").forEach(f => f.addEventListener("submit", async e => { e.preventDefault(); try { const p = { proposal: f.dataset.decide, decision: f.decision.value, reasons: f.reasons.value.trim() }; if (f.resolution_id.value.trim()) p.resolution_id = f.resolution_id.value.trim(); await XeSigner.post("/v1/proposals/" + f.dataset.decide + "/decision", MA, p); say("#decmsg", "Recorded.", true); reload(); } catch (err) { say("#decmsg", err.message, false); } }));
+// delegated, so the forms rendered by loadUntriaged() work too
+on("#inbox", "submit", async e => { const f = e.target.closest("form[data-reply]"); if (!f) return; e.preventDefault(); try { await XeSigner.post("/v1/members/inbox/" + f.dataset.reply + "/reply", MA, { message_id: f.dataset.reply, text: f.text.value.trim() }); say("#inmsg", "Queued for sending.", true); reload(); } catch (err) { say("#inmsg", err.message, false); } });
+on("#inbox", "change", async e => { const f = e.target.closest("form[data-reply]"); if (!f || e.target.name !== "status" || !f.status.value) return; try { await XeSigner.post("/v1/members/inbox/" + f.dataset.reply + "/status", MA, { message_id: f.dataset.reply, status: f.status.value }); reload(); } catch (err) { say("#inmsg", err.message, false); } });
 on("#noteform", "submit", async e => { e.preventDefault(); try { const r = await XeSigner.post("/v1/members/notes", MA, { title: $("#ntitle").value.trim(), text: $("#ntext").value.trim() }); say("#notemsg", "Published as log #" + r.index, true); reload(); } catch (err) { say("#notemsg", err.message, false); } });
 </script>
 {% endblock %}

@@ -181,9 +181,12 @@ async def _pause(db, pid: str):
 
 # ---- inbox handling ---------------------------------------------------------------------------
 
-@router.get("/inbox")
-async def inbox_all(db: Db, status: str | None = None, limit: int = 200):
-    rows = await inbox_svc.list_messages(db, status, limit)
+@router.post("/inbox/untriaged")
+async def inbox_untriaged(req: SignedRequest, ctx: Ctx, db: Db):
+    """HTTP messages no member has looked at yet. Signed by a seat holder: these are the one part of the
+    inbox the public surfaces hold back (XE-0195), so reading them is a seat action like answering them."""
+    require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
+    rows = await inbox_svc.list_untriaged(db, 100)
     return {"messages": [inbox_svc.to_dict(m) for m in rows]}
 
 

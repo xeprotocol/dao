@@ -182,6 +182,35 @@ async def list_messages(db: AsyncSession, status: str | None = None, limit: int 
     return list((await db.execute(q)).scalars().all())
 
 
+def is_public(m: InboxMessage) -> bool:
+    """What the public surfaces may show (XE-0195). Spam never; an HTTP message not until a member has
+    moved it out of `new`, matching when its receipt reaches the public log (`publish_on_triage`). Chat
+    messages are logged on receipt and are public from the start."""
+    return m.status != "spam" and not (m.channel == "http" and m.status == "new")
+
+
+async def list_public(db: AsyncSession, limit: int = 100) -> list[InboxMessage]:
+    """Public listing: spam and untriaged HTTP messages excluded, so `limit` counts visible rows."""
+    q = (select(InboxMessage).where(InboxMessage.status != "spam")
+         .where(~((InboxMessage.channel == "http") & (InboxMessage.status == "new")))
+         .order_by(InboxMessage.timestamp.desc()).limit(limit))
+    return list((await db.execute(q)).scalars().all())
+
+
+async def list_untriaged(db: AsyncSession, limit: int = 100) -> list[InboxMessage]:
+    """For a seat holder, over a signed request: HTTP messages nobody has looked at yet."""
+    q = (select(InboxMessage).where(InboxMessage.channel == "http", InboxMessage.status == "new")
+         .order_by(InboxMessage.timestamp.desc()).limit(limit))
+    return list((await db.execute(q)).scalars().all())
+
+
+async def get_public(db: AsyncSession, mid: str) -> InboxMessage:
+    m = await get(db, mid)
+    if not is_public(m):
+        raise HTTPException(404, "message not found")
+    return m
+
+
 async def get(db: AsyncSession, mid: str) -> InboxMessage:
     m = (await db.execute(select(InboxMessage).where(InboxMessage.id == mid))).scalar_one_or_none()
     if m is None:

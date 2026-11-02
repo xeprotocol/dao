@@ -21,7 +21,7 @@ from ..auth import Verified
 from ..canonical import DOMAIN_PROPOSAL, canonical_json, sha256_hex
 from ..chainops import account_snapshot
 from ..context import Context
-from ..models import FeeLedger, Proposal, Vote
+from ..models import FeeLedger, Proposal, Resolution, Vote
 from ..text import clean_text
 from . import sessions
 
@@ -225,10 +225,29 @@ async def close_due(ctx: Context, db: AsyncSession) -> list[Proposal]:
     return due
 
 
+async def _decision_resolution(db: AsyncSession, pr: Proposal, res_id: str) -> Resolution:
+    """A resolution named by a decision must exist, be adopted, and be about this proposal (XE-0201)."""
+    r = (await db.execute(select(Resolution).where(Resolution.id == res_id))).scalar_one_or_none()
+    if r is None:
+        raise HTTPException(400, "resolution_id names no resolution")
+    if r.related_proposal != pr.hash:
+        raise HTTPException(409, "that resolution is not about this proposal")
+    if r.status != "adopted":
+        raise HTTPException(409, f"that resolution is {r.status}, not adopted")
+    return r
+
+
 async def decide(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Proposal:
-    """The DAO's response to a closed proposal: adopt / decline / defer, with reasons. Members or
-    officers with operational_review may record it; adoption of anything with ops goes via resolution."""
-    if pr.status not in ("closed", "decided"):
+    """The DAO's response to a closed proposal: adopt / decline / defer / refer_to_resolution, with reasons.
+    Members or officers with operational_review may record it, once (XE-0201): the record is the DAO's
+    published position, so a single seat key cannot flip it afterwards. `adopt` needs the vote to have
+    passed; `adopt` of a proposal carrying state-chain ops also needs an adopted resolution about this
+    proposal that authorises exactly those ops. `decline`, `defer` and `refer_to_resolution` are recordable
+    on any closed vote, including a failed or no-quorum one. Nothing here executes anything; ops still
+    move only through a resolution and a signing session."""
+    if pr.status == "decided":
+        raise HTTPException(409, "a decision is already recorded for this proposal")
+    if pr.status != "closed":
         raise HTTPException(409, "proposal is not closed")
     decision = v.payload.get("decision")
     if decision not in ("adopt", "decline", "defer", "refer_to_resolution"):
@@ -236,8 +255,19 @@ async def decide(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> P
     reasons = clean_text(v.payload.get("reasons"), "reasons", max_len=MAX_BODY)
     if len(reasons) < 10:
         raise HTTPException(400, "reasons are required")
+    res_id = clean_text(v.payload.get("resolution_id"), "resolution_id", max_len=64, required=False)
+    outcome = (pr.result or {}).get("outcome")
+    resolution = await _decision_resolution(db, pr, res_id) if res_id else None
+    if decision == "adopt":
+        if outcome != "passed":
+            raise HTTPException(409, f"the vote {outcome or 'has no tally'}; a proposal is adopted only when it passed")
+        if pr.ops:
+            if resolution is None:
+                raise HTTPException(409, "a proposal with ops is adopted via an adopted resolution; give its resolution_id")
+            if resolution.ops != pr.ops:
+                raise HTTPException(409, "that resolution does not authorise exactly this proposal's ops")
     pr.decision = {"decision": decision, "reasons": reasons, "by": v.seat.id, "timestamp": v.timestamp,
-                   "resolution_id": clean_text(v.payload.get("resolution_id"), "resolution_id", max_len=64, required=False)}
+                   "resolution_id": res_id, "outcome": outcome}
     pr.status = "decided"
     await ctx.events.append(db, "proposal.decided", v.actor, {"proposal": pr.hash, **pr.decision}, ref=f"proposal:{pr.hash}")
     return pr

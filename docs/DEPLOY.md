@@ -19,7 +19,10 @@ Two deployments, one codebase: `dao.test.network` reads and writes testnet (`htt
   }
   ```
 
-  `systemctl reload caddy`. Caddy provisions the certificate.
+  `systemctl reload caddy`. Caddy provisions the certificate. Caddy 2.5 or later: it replaces any
+  `X-Forwarded-For` a client sends with the real address, and the app honours the header only from the
+  Docker bridge range the proxy arrives from (`FORWARDED_ALLOW_IPS`). With nginx, do not use
+  `$proxy_add_x_forwarded_for`; set `X-Forwarded-For $remote_addr`.
 
 ## 1. Get the code
 

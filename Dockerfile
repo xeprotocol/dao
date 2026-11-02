@@ -26,4 +26,7 @@ ENV DAO_GIT_COMMIT=${GIT_COMMIT}
 
 EXPOSE 8000
 
-CMD ["uvicorn", "dao.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]
+# X-Forwarded-* are honoured only from FORWARDED_ALLOW_IPS (uvicorn reads the variable; compose sets it to the
+# Docker bridge range the reverse proxy arrives from). Never `*`: it would let any direct client pick its own
+# address and walk round the per-IP rate limits (XE-0196).
+CMD ["uvicorn", "dao.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]

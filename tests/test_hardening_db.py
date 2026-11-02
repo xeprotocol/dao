@@ -257,3 +257,100 @@ async def test_proposal_text_with_nul_is_a_400_not_a_500(db):
     with pytest.raises(HTTPException) as e:
         await portal.submit(ctx, db, _v(payload={"title": "x\x00y", "body": "fine", "fee_block_hash": "e" * 64}))
     assert e.value.status_code == 400 and "title" in e.value.detail
+
+
+# ---- XE-0195: the public read surfaces hold an HTTP message back until a member has read it ----
+
+async def test_untriaged_http_messages_are_not_on_the_public_surfaces(db):
+    ctx = _ctx()
+    m = await inbox.http_submit(ctx, db, _v(payload={"message": "not yet"}))
+    chat = InboxMessage(id="chat1", channel="chat", from_account="b" * 64, to_account="d" * 64, body="hi",
+                        timestamp=time.time_ns(), verified=True, status="new")
+    db.add(chat)
+    await db.commit()
+    assert [x.id for x in await inbox.list_public(db)] == ["chat1"]      # chat is public on receipt
+    assert [x.id for x in await inbox.list_untriaged(db)] == [m.id]
+    with pytest.raises(HTTPException) as e:
+        await inbox.get_public(db, m.id)
+    assert e.value.status_code == 404
+    member = _v(payload={"status": "read"})
+    member.seat = SimpleNamespace(id="m1")
+    await inbox.set_status(ctx, db, m, member)
+    await db.commit()
+    assert {x.id for x in await inbox.list_public(db)} == {"chat1", m.id}
+    assert (await inbox.get_public(db, m.id)).id == m.id
+    assert await inbox.list_untriaged(db) == []
+    spam = _v(payload={"status": "spam"})
+    spam.seat = SimpleNamespace(id="m1")
+    await inbox.set_status(ctx, db, chat, spam)
+    await db.commit()
+    assert [x.id for x in await inbox.list_public(db)] == [m.id]
+
+
+# ---- XE-0201: a decision follows the tally, names a real resolution, and is recorded once -------
+
+def _closed(ctx, h, outcome, ops=None):
+    now = time.time_ns()
+    return Proposal(hash=h, title="t", body="b", ops=ops, author_account=AUTHOR, author_pub_key="p" * 64,
+                    author_signature="s", author_timestamp=now, fee_block_hash=h, status="closed", opened_at=now - D,
+                    closes_at=now - 1, rules=ctx.config.pinned_rules(), analysis=[],
+                    result={"outcome": outcome, "participating_wallets": 0, "quorum_wallets": 20})
+
+
+def _seat(payload):
+    v = _v(payload=payload)
+    v.seat = SimpleNamespace(id="cto")
+    return v
+
+
+async def test_adopt_needs_a_passed_vote_and_is_recorded_once(db):
+    from dao.models import Resolution
+    ctx = _ctx()
+    failed = _closed(ctx, "1" * 64, "no_quorum")
+    passed_ops = _closed(ctx, "2" * 64, "passed", ops=[{"action": "set", "key": "dao.test", "value": "1"}])
+    db.add_all([failed, passed_ops])
+    await db.flush()
+    # no quorum: adopt refused, decline recorded, then nothing more
+    with pytest.raises(HTTPException) as e:
+        await portal.decide(ctx, db, failed, _seat({"decision": "adopt", "reasons": "adopting anyway for the test"}))
+    assert e.value.status_code == 409 and "no_quorum" in e.value.detail
+    await portal.decide(ctx, db, failed, _seat({"decision": "decline", "reasons": "no quorum was reached"}))
+    assert failed.status == "decided" and failed.decision["decision"] == "decline" and failed.decision["outcome"] == "no_quorum"
+    with pytest.raises(HTTPException) as e:
+        await portal.decide(ctx, db, failed, _seat({"decision": "adopt", "reasons": "flipping the record later"}))
+    assert e.value.status_code == 409 and "already recorded" in e.value.detail
+    assert failed.decision["decision"] == "decline"
+    # passed, carries ops: adopt needs an adopted resolution about this proposal with exactly these ops
+    with pytest.raises(HTTPException) as e:
+        await portal.decide(ctx, db, passed_ops, _seat({"decision": "adopt", "reasons": "adopting without a resolution"}))
+    assert e.value.status_code == 409 and "resolution_id" in e.value.detail
+    with pytest.raises(HTTPException) as e:
+        await portal.decide(ctx, db, passed_ops, _seat({"decision": "adopt", "reasons": "adopting with a fake id",
+                                                         "resolution_id": "does-not-exist"}))
+    assert e.value.status_code == 400
+    res = Resolution(id="r1", number=1, title="adopt", body="b", matter="adopt_open_vote", ops=passed_ops.ops,
+                     proposed_by="founder-a", status="open", signatures=[], related_proposal=passed_ops.hash)
+    other = Resolution(id="r2", number=2, title="other", body="b", matter="adopt_open_vote", ops=passed_ops.ops,
+                       proposed_by="founder-a", status="adopted", signatures=[], related_proposal="9" * 64)
+    db.add_all([res, other])
+    await db.flush()
+    for rid, code in (("r1", 409), ("r2", 409)):                           # not adopted / not about this proposal
+        with pytest.raises(HTTPException) as e:
+            await portal.decide(ctx, db, passed_ops, _seat({"decision": "adopt", "reasons": "adopting on a wrong resolution",
+                                                             "resolution_id": rid}))
+        assert e.value.status_code == code
+    res.status = "adopted"
+    res.ops = [{"action": "set", "key": "dao.other", "value": "1"}]
+    await db.flush()
+    with pytest.raises(HTTPException) as e:
+        await portal.decide(ctx, db, passed_ops, _seat({"decision": "adopt", "reasons": "ops do not match the vote",
+                                                         "resolution_id": "r1"}))
+    assert "exactly" in e.value.detail
+    res.ops = passed_ops.ops
+    await db.flush()
+    await portal.decide(ctx, db, passed_ops, _seat({"decision": "adopt", "reasons": "passed and resolved",
+                                                     "resolution_id": "r1"}))
+    await db.commit()
+    assert passed_ops.decision["decision"] == "adopt" and passed_ops.decision["resolution_id"] == "r1"
+    ev = (await db.execute(select(Event).where(Event.kind == "proposal.decided").order_by(Event.index.desc()))).scalars().first()
+    assert ev.payload["outcome"] == "passed" and ev.payload["resolution_id"] == "r1"

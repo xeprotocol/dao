@@ -38,6 +38,8 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-dao}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-dao}
       DAO_ROLE: api
+      # the reverse proxy reaches the container from the Docker bridge; only those addresses may set X-Forwarded-For
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
     volumes:
       - ./config:/app/config:ro
       - ./secrets:/app/secrets:ro

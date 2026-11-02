@@ -189,7 +189,7 @@ async def snapshot(account: str, ctx: Ctx, at: int | None = None):
 
 @router.get("/inbox")
 async def inbox_info(ctx: Ctx, db: Db, limit: int = 50):
-    rows = await inbox_svc.list_messages(db, None, limit)
+    rows = await inbox_svc.list_public(db, limit)
     return {
         "account": inbox_svc.dao_account(ctx),
         "how": "send an XE chat envelope to the account above, or POST a signed message here with a proof of work",
@@ -199,8 +199,8 @@ async def inbox_info(ctx: Ctx, db: Db, limit: int = 50):
                     "signing_digest = sha256(domain || 0x00 || canonical_json({payload, timestamp}))",
             "domain": DOMAIN_INBOX_HTTP.rstrip(b"\x00").decode(),
         },
-        "logging": "messages sent here are kept in the hash chain on receipt and appear on the public log once a member has read them",
-        "recent": [inbox_svc.to_dict(m) for m in rows if m.status != "spam"],
+        "logging": "messages sent here are kept in the hash chain on receipt and appear here and on the public log once a member has read them",
+        "recent": [inbox_svc.to_dict(m) for m in rows],
     }
 
 
@@ -218,9 +218,8 @@ async def inbox_post(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
 
 @router.get("/inbox/{mid}")
 async def inbox_get(mid: str, db: Db):
-    m = await inbox_svc.get(db, mid)
-    if m.status == "spam":
-        raise HTTPException(404, "message not found")
+    """One message with its replies; an untriaged HTTP message is not here until a member has read it."""
+    m = await inbox_svc.get_public(db, mid)
     return inbox_svc.to_dict(m, await inbox_svc.replies_for(db, mid))
 
 

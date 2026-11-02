@@ -222,7 +222,7 @@ async def inbox_page(request: Request):
     c = get_context()
     async with session() as db:
         common = await _common(db)
-        rows = [m for m in await inbox_svc.list_messages(db, None, 100) if m.status != "spam"]
+        rows = await inbox_svc.list_public(db, 100)
     return render(request, "inbox.html", {**common, "messages": rows, "dao_account": inbox_svc.dao_account(c),
                                           "pow_difficulty": f"0x{c.node.chat_pow_difficulty:016x}"})
 
@@ -255,14 +255,15 @@ async def members_page(request: Request):
         common = await _common(db)
         res = await resolutions.list_resolutions(db)
         sess = await sessions.list_sessions(db)
-        msgs = await inbox_svc.list_messages(db, None, 100)
+        msgs = await inbox_svc.list_public(db, 100)
+        untriaged = len(await inbox_svc.list_untriaged(db, 100))
         closed = await portal.list_proposals(db, "closed", 0, 50)
     try:
         ks = await c.chain.dao_keyset()
     except XeError as e:
         ks = {"error": str(e), "keys": [], "threshold": 0}
     return render(request, "members.html", {
-        **common, "cfg": c.config, "resolutions": res, "sessions": sess, "messages": msgs, "closed": closed, "keyset": ks,
-        "reserved": sorted(resolutions.RESERVED_MATTERS), "ordinary": sorted(resolutions.ORDINARY_MATTERS),
+        **common, "cfg": c.config, "resolutions": res, "sessions": sess, "messages": msgs, "untriaged": untriaged,
+        "closed": closed, "keyset": ks, "reserved": sorted(resolutions.RESERVED_MATTERS), "ordinary": sorted(resolutions.ORDINARY_MATTERS),
         "res_dict": lambda r: resolutions.to_dict(r, c.config), "sess_dict": sessions.to_dict,
     })
