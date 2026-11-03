@@ -13,8 +13,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from dao.auth import MAX_SKEW_NS, Verified, claim_signature, purge_seen_signatures
 from dao.db import Base
 from dao.log import EventLog
-from dao.models import Event, FeeLedger, InboxMessage, Proposal, SeenSignature, Vote
-from dao.services import fees, inbox, portal
+from dao.models import Event, FeeLedger, InboxMessage, Proposal, SeenSignature, SigningSession, Vote
+from dao.services import fees, inbox, portal, sessions
 from dao.signer import Signer
 from xe.client import XeError
 from xe.keys import KeyPair
@@ -354,3 +354,46 @@ async def test_adopt_needs_a_passed_vote_and_is_recorded_once(db):
     assert passed_ops.decision["decision"] == "adopt" and passed_ops.decision["resolution_id"] == "r1"
     ev = (await db.execute(select(Event).where(Event.kind == "proposal.decided").order_by(Event.index.desc()))).scalars().first()
     assert ev.payload["outcome"] == "passed" and ev.payload["resolution_id"] == "r1"
+
+
+# ---- XE-0284: no path to the chain shortens the upgrade timelock -------------------------------
+
+async def test_rebuild_sign_and_submit_wait_for_the_timelock(db):
+    ctx = _ctx()
+
+    async def tip():
+        return {"index": 0, "hash": "0" * 64}
+
+    ctx.chain.statechain_tip = tip
+    now = time.time_ns()
+    s = SigningSession(id="s1", kind="parameter", title="R1", ops=[{"action": "set", "key": "dao.test", "value": "1"}],
+                       ops_digest="d" * 64, status="approving", approvals=[{"public_key": "k1"}, {"public_key": "k2"}],
+                       required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0,
+                       not_before=now + 3600 * 1_000_000_000)
+    db.add(s)
+    await db.flush()
+    # the route's own gate passes (approving, threshold met); rebuild itself must refuse
+    with pytest.raises(HTTPException) as e:
+        await sessions.rebuild(ctx, db, s, actor="seat:cto")
+    assert e.value.status_code == 409 and "timelock" in e.value.detail and s.status == "approving" and s.block is None
+    # a session somehow in signing with a block is not signed or submitted either
+    s.status, s.block, s.block_hash = "signing", {"index": 1, "prev_hash": "0" * 64, "timestamp": now, "hash": "a" * 64}, "a" * 64
+    with pytest.raises(HTTPException) as e:
+        await sessions.sign(ctx, db, s, "k1", "00" * 64, actor="seat:cto")
+    assert e.value.status_code == 409 and "timelock" in e.value.detail
+    with pytest.raises(HTTPException) as e:
+        await sessions.submit(ctx, db, s)
+    assert e.value.status_code == 409 and "timelock" in e.value.detail
+    # once the window has run, rebuild goes ahead
+    s.status, s.block, s.block_hash = "approving", None, ""
+    s.not_before = now - 1
+    await sessions.rebuild(ctx, db, s, actor="seat:cto")
+    assert s.status == "signing" and s.block["index"] == 1 and s.block_hash
+    # no timelock at all (status proposed, mainnet off) is unchanged
+    s2 = SigningSession(id="s2", kind="parameter", title="R2", ops=s.ops, ops_digest="e" * 64, status="approving",
+                        approvals=s.approvals, required_approvals=2, block=None, block_hash="", block_signatures=[],
+                        rebuilds=0, not_before=None)
+    db.add(s2)
+    await db.flush()
+    await sessions.rebuild(ctx, db, s2, actor="seat:cto")
+    assert s2.status == "signing"

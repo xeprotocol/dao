@@ -136,8 +136,18 @@ async def approve(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified
     return s
 
 
+def require_timelock_run(s: SigningSession) -> None:
+    """The upgrade timelock is the window between adoption and execution in which members can still cancel.
+    Every path that moves a session towards the chain checks it here, so no route can shorten it (XE-0284)."""
+    now = time.time_ns()
+    if s.not_before and now < s.not_before:
+        left = (s.not_before - now) // 1_000_000_000
+        raise HTTPException(409, f"the upgrade timelock on this session runs for another {left // 3600}h {left % 3600 // 60}m")
+
+
 async def rebuild(ctx: Context, db: AsyncSession, s: SigningSession, actor: str = "harness") -> SigningSession:
-    """Build (or re-build) the block at the live tip. Resets block signatures."""
+    """Build (or re-build) the block at the live tip. Resets block signatures. Not before the timelock has run."""
+    require_timelock_run(s)
     await require_unpaused(db)
     try:
         tip = await ctx.chain.statechain_tip()
@@ -163,6 +173,7 @@ async def sign(ctx: Context, db: AsyncSession, s: SigningSession, pub_key: str, 
     """Collect a raw ed25519 signature over the block hash from a keyset key. Submit when enough."""
     if s.status != "signing":
         raise HTTPException(409, f"session is {s.status}, not signing")
+    require_timelock_run(s)
     await require_unpaused(db)
     pub_key = pub_key.lower()
     ks = await live_keyset(ctx)
@@ -196,6 +207,7 @@ async def is_stale(ctx: Context, s: SigningSession) -> bool:
 
 
 async def submit(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSession:
+    require_timelock_run(s)
     await require_unpaused(db)
     blk = _block_from_session(s)
     try:
