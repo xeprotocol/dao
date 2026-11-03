@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.client import XeError
 from xe.keys import KeyError_, verify_hex_signature
-from xe.statechain import StateBlock, StateOp, build_block
+from xe.statechain import StateBlock, StateChainError, StateOp, build_block
 
 from ..auth import Verified
 from ..canonical import canonical_json, sha256_hex
@@ -30,18 +30,30 @@ from ..models import SigningSession
 from . import pause
 
 KINDS = {"registry", "anchor", "parameter", "keyset"}
+MAX_OPS = 32
 
 
 def ops_digest(ops: list[dict]) -> str:
     return sha256_hex(canonical_json(ops))
 
 
-def normalise_ops(ops: list[dict]) -> list[dict]:
+def normalise_ops(ops) -> list[dict]:
     """Store `value` as the exact compact JSON text that will be hashed. JSONB reorders object keys,
-    so values must never be stored as parsed objects."""
+    so values must never be stored as parsed objects. Every op is validated as the node would, so a
+    proposal or resolution cannot carry ops that could never be written."""
+    if not isinstance(ops, list) or not ops:
+        raise HTTPException(400, "ops must be a non-empty list")
+    if len(ops) > MAX_OPS:
+        raise HTTPException(400, f"at most {MAX_OPS} ops")
     out = []
     for o in ops:
-        op = StateOp.from_json(o)
+        if not isinstance(o, dict) or not isinstance(o.get("action"), str) or not isinstance(o.get("key"), str):
+            raise HTTPException(400, "each op is an object with a string action and key")
+        try:
+            op = StateOp.from_json(o)
+            op.validate()
+        except (StateChainError, TypeError, ValueError) as e:
+            raise HTTPException(400, f"ops are malformed: {e}") from e
         d = {"action": op.action, "key": op.key}
         if op.action == "set":
             d["value"] = op.value
@@ -110,6 +122,13 @@ async def list_sessions(db: AsyncSession, status: str | None = None, limit: int 
     return list((await db.execute(q)).scalars().all())
 
 
+def approvals_met(s: SigningSession, ks: dict) -> bool:
+    """Enough approvals from keys that are in the keyset now. A key rotated out takes its approval with it,
+    and a raised threshold applies to sessions already open; the figure stored at creation is a record."""
+    live = {k.lower() for k in ks["keys"]}
+    return sum(1 for a in s.approvals if a["public_key"] in live) >= int(ks["threshold"])
+
+
 async def approve(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified) -> SigningSession:
     """`v.payload` must be {"session_id", "ops_digest"} and signed by a keyset key (checked via the
     member-action domain by the router); here we additionally require keyset membership."""
@@ -127,7 +146,7 @@ async def approve(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified
     await ctx.events.append(db, "session.approved", v.actor, {
         "session_id": s.id, "ops_digest": s.ops_digest, "approvals": len(s.approvals), "required": ks["threshold"],
     }, ref=f"session:{s.id}")
-    if len(s.approvals) >= ks["threshold"]:
+    if approvals_met(s, ks):
         now = time.time_ns()
         if (s.not_before and now < s.not_before) or await pause.is_paused(db):
             # timelock or pause: stay in approving; the worker's timer job promotes it when clear
@@ -146,9 +165,14 @@ def require_timelock_run(s: SigningSession) -> None:
 
 
 async def rebuild(ctx: Context, db: AsyncSession, s: SigningSession, actor: str = "harness") -> SigningSession:
-    """Build (or re-build) the block at the live tip. Resets block signatures. Not before the timelock has run."""
+    """Build (or re-build) the block at the live tip. Resets block signatures. Only an approved session,
+    counted against the keyset as it is now, and not before the timelock has run."""
+    if s.status not in ("approving", "signing"):
+        raise HTTPException(409, f"session is {s.status}")
     require_timelock_run(s)
     await require_unpaused(db)
+    if not approvals_met(s, await live_keyset(ctx)):
+        raise HTTPException(409, "the session does not hold enough approvals from the live keyset")
     try:
         tip = await ctx.chain.statechain_tip()
     except XeError as e:

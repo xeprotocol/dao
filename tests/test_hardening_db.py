@@ -52,6 +52,9 @@ class FakeChain:
     async def full_chain(self, account):
         return self.chains.get(account, [{"timestamp": 0, "asset": "XE", "balance": 5_000_000, "hash": "b" * 64}])
 
+    async def dao_keyset(self):
+        return {"keys": ["k1", "k2", "k3"], "threshold": 2}
+
 
 class FakeSigner:
     def __init__(self, scopes=("harness",)):
@@ -297,8 +300,8 @@ def _closed(ctx, h, outcome, ops=None):
                     result={"outcome": outcome, "participating_wallets": 0, "quorum_wallets": 20})
 
 
-def _seat(payload):
-    v = _v(payload=payload)
+def _seat(payload, pr=None):
+    v = _v(payload={**({"proposal": pr.hash} if pr else {}), **payload})
     v.seat = SimpleNamespace(id="cto")
     return v
 
@@ -312,44 +315,44 @@ async def test_adopt_needs_a_passed_vote_and_is_recorded_once(db):
     await db.flush()
     # no quorum: adopt refused, decline recorded, then nothing more
     with pytest.raises(HTTPException) as e:
-        await portal.decide(ctx, db, failed, _seat({"decision": "adopt", "reasons": "adopting anyway for the test"}))
+        await portal.decide(ctx, db, failed, _seat({"decision": "adopt", "reasons": "adopting anyway for the test"}, failed))
     assert e.value.status_code == 409 and "no_quorum" in e.value.detail
-    await portal.decide(ctx, db, failed, _seat({"decision": "decline", "reasons": "no quorum was reached"}))
+    await portal.decide(ctx, db, failed, _seat({"decision": "decline", "reasons": "no quorum was reached"}, failed))
     assert failed.status == "decided" and failed.decision["decision"] == "decline" and failed.decision["outcome"] == "no_quorum"
     with pytest.raises(HTTPException) as e:
-        await portal.decide(ctx, db, failed, _seat({"decision": "adopt", "reasons": "flipping the record later"}))
+        await portal.decide(ctx, db, failed, _seat({"decision": "adopt", "reasons": "flipping the record later"}, failed))
     assert e.value.status_code == 409 and "already recorded" in e.value.detail
     assert failed.decision["decision"] == "decline"
-    # passed, carries ops: adopt needs an adopted resolution about this proposal with exactly these ops
+    # passed, carries ops: adopt needs a passed resolution about this proposal with exactly these ops
     with pytest.raises(HTTPException) as e:
-        await portal.decide(ctx, db, passed_ops, _seat({"decision": "adopt", "reasons": "adopting without a resolution"}))
+        await portal.decide(ctx, db, passed_ops, _seat({"decision": "adopt", "reasons": "adopting without a resolution"}, passed_ops))
     assert e.value.status_code == 409 and "resolution_id" in e.value.detail
     with pytest.raises(HTTPException) as e:
         await portal.decide(ctx, db, passed_ops, _seat({"decision": "adopt", "reasons": "adopting with a fake id",
-                                                         "resolution_id": "does-not-exist"}))
+                                                         "resolution_id": "does-not-exist"}, passed_ops))
     assert e.value.status_code == 400
     res = Resolution(id="r1", number=1, title="adopt", body="b", matter="adopt_open_vote", ops=passed_ops.ops,
                      proposed_by="founder-a", status="open", signatures=[], related_proposal=passed_ops.hash)
     other = Resolution(id="r2", number=2, title="other", body="b", matter="adopt_open_vote", ops=passed_ops.ops,
-                       proposed_by="founder-a", status="adopted", signatures=[], related_proposal="9" * 64)
+                       proposed_by="founder-a", status="passed", signatures=[], related_proposal="9" * 64)
     db.add_all([res, other])
     await db.flush()
-    for rid, code in (("r1", 409), ("r2", 409)):                           # not adopted / not about this proposal
+    for rid, code in (("r1", 409), ("r2", 409)):                           # not passed / not about this proposal
         with pytest.raises(HTTPException) as e:
             await portal.decide(ctx, db, passed_ops, _seat({"decision": "adopt", "reasons": "adopting on a wrong resolution",
-                                                             "resolution_id": rid}))
+                                                             "resolution_id": rid}, passed_ops))
         assert e.value.status_code == code
-    res.status = "adopted"
+    res.status = "passed"
     res.ops = [{"action": "set", "key": "dao.other", "value": "1"}]
     await db.flush()
     with pytest.raises(HTTPException) as e:
         await portal.decide(ctx, db, passed_ops, _seat({"decision": "adopt", "reasons": "ops do not match the vote",
-                                                         "resolution_id": "r1"}))
+                                                         "resolution_id": "r1"}, passed_ops))
     assert "exactly" in e.value.detail
     res.ops = passed_ops.ops
     await db.flush()
     await portal.decide(ctx, db, passed_ops, _seat({"decision": "adopt", "reasons": "passed and resolved",
-                                                     "resolution_id": "r1"}))
+                                                     "resolution_id": "r1"}, passed_ops))
     await db.commit()
     assert passed_ops.decision["decision"] == "adopt" and passed_ops.decision["resolution_id"] == "r1"
     ev = (await db.execute(select(Event).where(Event.kind == "proposal.decided").order_by(Event.index.desc()))).scalars().first()
@@ -397,3 +400,48 @@ async def test_rebuild_sign_and_submit_wait_for_the_timelock(db):
     await db.flush()
     await sessions.rebuild(ctx, db, s2, actor="seat:cto")
     assert s2.status == "signing"
+
+
+# ---- a signed payload names what it acts on; approvals are counted against the live keyset -------
+
+async def test_decision_payload_must_name_the_proposal(db):
+    ctx = _ctx()
+    pr = _closed(ctx, "3" * 64, "no_quorum")
+    db.add(pr)
+    await db.flush()
+    with pytest.raises(HTTPException) as e:
+        await portal.decide(ctx, db, pr, _seat({"proposal": "4" * 64, "decision": "decline", "reasons": "signed for another one"}))
+    assert e.value.status_code == 400 and "proposal" in e.value.detail and pr.status == "closed"
+    await portal.decide(ctx, db, pr, _seat({"decision": "decline", "reasons": "no quorum was reached"}, pr))
+    assert pr.status == "decided"
+
+
+async def test_rebuild_counts_approvals_against_the_live_keyset(db):
+    ctx = _ctx()
+
+    async def tip():
+        return {"index": 0, "hash": "0" * 64}
+
+    ctx.chain.statechain_tip = tip
+    s = SigningSession(id="s3", kind="parameter", title="R3", ops=[{"action": "set", "key": "dao.test", "value": "1"}],
+                       ops_digest="f" * 64, status="approving", approvals=[{"public_key": "k1"}, {"public_key": "gone"}],
+                       required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0, not_before=None)
+    db.add(s)
+    await db.flush()
+    # two approvals on record, one from a key no longer in the keyset: not enough
+    with pytest.raises(HTTPException) as e:
+        await sessions.rebuild(ctx, db, s, actor="seat:cto")
+    assert e.value.status_code == 409 and "live keyset" in e.value.detail and s.status == "approving"
+    s.approvals = [*s.approvals, {"public_key": "k2"}]
+    await db.flush()
+    await sessions.rebuild(ctx, db, s, actor="seat:cto")
+    assert s.status == "signing"
+
+
+async def test_proposal_ops_are_validated_at_submit(db):
+    ctx = _ctx(FakeChain(blocks={"c" * 64: _send(True)}))
+    for ops in ([], "x", [{"action": "set"}], [{"action": "delete", "key": "sys.dao_keyset"}],
+                [{"action": "set", "key": "not a key!", "value": {"a": 1}}]):
+        with pytest.raises(HTTPException) as e:
+            await portal.submit(ctx, db, _v(payload={"title": "t", "body": "b", "fee_block_hash": "c" * 64, "ops": ops}))
+        assert e.value.status_code == 400, ops

@@ -94,9 +94,16 @@ class Worker:
             now = time.time_ns()
             if not await pause.is_paused(db):
                 rows = (await db.execute(select(SigningSession).where(SigningSession.status == "approving"))).scalars().all()
+                ks = None
                 for s in rows:
-                    if len(s.approvals) >= s.required_approvals and (not s.not_before or now >= s.not_before):
-                        await sessions.rebuild(self.ctx, db, s)
+                    if s.not_before and now < s.not_before:
+                        continue
+                    try:
+                        ks = ks or await sessions.live_keyset(self.ctx)
+                        if sessions.approvals_met(s, ks):
+                            await sessions.rebuild(self.ctx, db, s)
+                    except Exception as e:  # one session or a node hiccup must not hold up closing votes
+                        log.warning("promote session %s: %s", s.id, e)
             purged = await purge_seen_signatures(db)
             if purged:
                 log.debug("purged %d expired signature claims", purged)

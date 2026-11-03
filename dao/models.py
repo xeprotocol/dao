@@ -66,7 +66,7 @@ class Resolution(Base):
     matter: Mapped[str] = mapped_column(String(64), nullable=False)          # reserved | ordinary | charter
     ops: Mapped[list | None] = mapped_column(JSONB, nullable=True)           # optional state-chain ops it authorises
     proposed_by: Mapped[str] = mapped_column(String(64), nullable=False)     # seat id
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")  # open | adopted | declined | withdrawn
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")  # open | passed | rejected | withdrawn
     signatures: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)   # [{seat, public_key, signature, ts, decision}]
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from sse_starlette.sse import EventSourceResponse
 
@@ -15,7 +15,7 @@ from ..auth import SignedRequest, claim_signature, require_seat, verify_and_clai
 from ..canonical import DOMAIN_INBOX_HTTP, DOMAIN_MEMBER_ACTION, DOMAIN_PROPOSAL, DOMAIN_VOTE
 from ..db import session
 from ..log import EventLog, event_to_dict
-from ..ratelimit import INBOX, PROPOSAL, VOTE, enforce
+from ..ratelimit import INBOX, PROPOSAL, SNAPSHOT, VOTE, enforce
 from ..services import inbox as inbox_svc
 from ..services import pause as pause_svc
 from ..services import portal, records
@@ -105,7 +105,7 @@ async def seat_prompt(seat_id: str, ctx: Ctx):
 # ---- proposals and votes ----------------------------------------------------------------------
 
 @router.get("/proposals")
-async def list_proposals(db: Db, status: str | None = None, offset: int = 0, limit: int = 50):
+async def list_proposals(db: Db, status: str | None = None, offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
     rows = await portal.list_proposals(db, status, offset, limit)
     return {"proposals": [portal.to_dict(p, include_body=False) for p in rows], "counts": await portal.counts(db)}
 
@@ -165,7 +165,7 @@ async def cast_vote_flat(request: Request, req: SignedRequest, ctx: Ctx, db: Db)
 
 
 @router.get("/decisions")
-async def decisions(db: Db, limit: int = 50):
+async def decisions(db: Db, limit: int = Query(50, ge=1, le=200)):
     rows = await portal.list_proposals(db, "decided", 0, limit)
     closed = await portal.list_proposals(db, "closed", 0, limit)
     return {"decided": [portal.to_dict(p, include_body=False) for p in rows],
@@ -173,9 +173,13 @@ async def decisions(db: Db, limit: int = 50):
 
 
 @router.get("/snapshot/{account}")
-async def snapshot(account: str, ctx: Ctx, at: int | None = None):
-    """What a wallet's weight and participation would be at time `at` (ns), default now."""
+async def snapshot(request: Request, account: str, ctx: Ctx, at: int | None = Query(None, ge=0)):
+    """What a wallet's weight and participation would be at time `at` (ns), default now. Reads the wallet's
+    whole chain from the node, so it is metered like a vote."""
     from ..chainops import account_snapshot
+    if not portal.HEX64.fullmatch(account.lower()):
+        raise HTTPException(400, "account must be 64 hex characters")
+    enforce(request, SNAPSHOT)
     rules = ctx.config.pinned_rules()
     at = at or time.time_ns()
     snap = await account_snapshot(ctx.chain, account.lower(), at)
@@ -188,7 +192,7 @@ async def snapshot(account: str, ctx: Ctx, at: int | None = None):
 # ---- inbox ------------------------------------------------------------------------------------
 
 @router.get("/inbox")
-async def inbox_info(ctx: Ctx, db: Db, limit: int = 50):
+async def inbox_info(ctx: Ctx, db: Db, limit: int = Query(50, ge=1, le=200)):
     rows = await inbox_svc.list_public(db, limit)
     return {
         "account": inbox_svc.dao_account(ctx),
@@ -226,7 +230,7 @@ async def inbox_get(mid: str, db: Db):
 # ---- log --------------------------------------------------------------------------------------
 
 @router.get("/log")
-async def log_page(db: Db, offset: int = 0, limit: int = 100, kind: str | None = None, ref: str | None = None):
+async def log_page(db: Db, offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000), kind: str | None = None, ref: str | None = None):
     rows = await EventLog.page(db, offset, limit, kind, ref)
     head = await EventLog.head(db)
     return {"head": {"index": head.index, "hash": head.hash}, "events": [event_to_dict(e) for e in rows]}
@@ -242,11 +246,13 @@ async def log_head(ctx: Ctx, db: Db):
 
 @router.get("/log/verify")
 async def log_verify(db: Db):
-    return await EventLog.verify(db)
+    return await EventLog.verify_cached(db)
 
 
 @router.get("/log/{index}")
 async def log_get(index: int, db: Db):
+    if index < 0:
+        raise HTTPException(404, "no such event")
     ev = await EventLog.get(db, index)
     if ev is None or not ev.public:
         raise HTTPException(404, "no such event")

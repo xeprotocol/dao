@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.client import XeError
 
-from ..auth import Verified
+from ..auth import Verified, bind
 from ..canonical import DOMAIN_PROPOSAL, canonical_json, sha256_hex
 from ..chainops import account_snapshot
 from ..context import Context
@@ -85,10 +85,7 @@ async def submit(ctx: Context, db: AsyncSession, v: Verified) -> Proposal:
     if fee_block_hash and not HEX64.fullmatch(fee_block_hash):
         raise HTTPException(400, "fee_block_hash must be 64 hex characters")
     if ops is not None:
-        try:
-            ops = sessions.normalise_ops(ops)
-        except Exception as e:
-            raise HTTPException(400, f"ops are malformed: {e}") from e
+        ops = sessions.normalise_ops(ops)
     rules = ctx.config.pinned_rules()
     fee = int(rules["fee_micro_xe"])
     if fee and not fee_block_hash:
@@ -226,14 +223,14 @@ async def close_due(ctx: Context, db: AsyncSession) -> list[Proposal]:
 
 
 async def _decision_resolution(db: AsyncSession, pr: Proposal, res_id: str) -> Resolution:
-    """A resolution named by a decision must exist, be adopted, and be about this proposal (XE-0201)."""
+    """A resolution named by a decision must exist, have passed, and be about this proposal (XE-0201)."""
     r = (await db.execute(select(Resolution).where(Resolution.id == res_id))).scalar_one_or_none()
     if r is None:
         raise HTTPException(400, "resolution_id names no resolution")
     if r.related_proposal != pr.hash:
         raise HTTPException(409, "that resolution is not about this proposal")
-    if r.status != "adopted":
-        raise HTTPException(409, f"that resolution is {r.status}, not adopted")
+    if r.status != "passed":
+        raise HTTPException(409, f"that resolution is {r.status}, not passed")
     return r
 
 
@@ -241,10 +238,11 @@ async def decide(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> P
     """The DAO's response to a closed proposal: adopt / decline / defer / refer_to_resolution, with reasons.
     Members or officers with operational_review may record it, once (XE-0201): the record is the DAO's
     published position, so a single seat key cannot flip it afterwards. `adopt` needs the vote to have
-    passed; `adopt` of a proposal carrying state-chain ops also needs an adopted resolution about this
+    passed; `adopt` of a proposal carrying state-chain ops also needs a passed resolution about this
     proposal that authorises exactly those ops. `decline`, `defer` and `refer_to_resolution` are recordable
     on any closed vote, including a failed or no-quorum one. Nothing here executes anything; ops still
     move only through a resolution and a signing session."""
+    bind(v, proposal=pr.hash)
     if pr.status == "decided":
         raise HTTPException(409, "a decision is already recorded for this proposal")
     if pr.status != "closed":
@@ -263,7 +261,7 @@ async def decide(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> P
             raise HTTPException(409, f"the vote {outcome or 'has no tally'}; a proposal is adopted only when it passed")
         if pr.ops:
             if resolution is None:
-                raise HTTPException(409, "a proposal with ops is adopted via an adopted resolution; give its resolution_id")
+                raise HTTPException(409, "a proposal with ops is adopted via a passed resolution; give its resolution_id")
             if resolution.ops != pr.ops:
                 raise HTTPException(409, "that resolution does not authorise exactly this proposal's ops")
     pr.decision = {"decision": decision, "reasons": reasons, "by": v.seat.id, "timestamp": v.timestamp,
@@ -274,6 +272,7 @@ async def decide(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> P
 
 
 async def add_analysis(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Proposal:
+    bind(v, proposal=pr.hash)
     text = clean_text(v.payload.get("text"), "text", max_len=MAX_BODY)
     entry = {"by": v.seat.id if v.seat else v.account, "timestamp": v.timestamp, "text": text}
     pr.analysis = [*pr.analysis, entry]

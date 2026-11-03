@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -21,6 +21,7 @@ from xe.chat_auth import chat_read_proof
 
 from ..auth import Verified, require_pow
 from ..context import Context
+from ..log import EventLog
 from ..models import InboxMessage, OutboxMessage
 from ..signer import SignerError
 from ..text import clean_text, has_bad_control, scrub
@@ -28,6 +29,7 @@ from . import pause
 
 log = logging.getLogger("dao.inbox")
 
+OUTBOX_RETRY_DAYS = 7
 AUTO_ACK = ("Received by the XE DAO and recorded in the public log. A person reads every message; "
             "replies come from this account. Nothing in this message is a commitment.")
 
@@ -87,8 +89,11 @@ async def http_submit(ctx: Context, db: AsyncSession, v: Verified) -> InboxMessa
 
 
 async def publish_on_triage(ctx: Context, db: AsyncSession, m: InboxMessage, actor: str) -> None:
-    """First time a member moves an HTTP message out of `new` (and not to spam), put it on the public log."""
-    if m.channel != "http" or m.status != "new":
+    """First time a member moves an HTTP message out of `new` or `spam`, put it on the public log. Once is
+    enough: a message marked spam and then reconsidered is published then, not twice."""
+    if m.channel != "http" or m.status not in ("new", "spam"):
+        return
+    if await EventLog.page(db, 0, 1, "inbox.published", f"inbox:{m.id}"):
         return
     await ctx.events.append(db, "inbox.published", actor, {
         "id": m.id, "channel": m.channel, "from": m.from_account, "verified": m.verified, "body": m.body[:4000],
@@ -135,7 +140,14 @@ async def flush_outbox(ctx: Context, db: AsyncSession) -> int:
         return 0
     rows = list((await db.execute(select(OutboxMessage).where(OutboxMessage.status == "queued").limit(10))).scalars().all())
     n = 0
+    give_up_before = datetime.now(timezone.utc) - timedelta(days=OUTBOX_RETRY_DAYS)
     for o in rows:
+        if o.created_at and o.created_at < give_up_before:
+            # retried on every tick for a week; the channel is not going to open. Stop, and say so on the record.
+            o.status = "failed"
+            await ctx.events.append(db, "outbox.failed", "harness", {"id": o.id, "to": o.to_account, "error": o.error[:300]},
+                                    ref=f"inbox:{o.in_reply_to}")
+            continue
         try:
             kp = ctx.signer.keypair("dao", "chat.send")
             env = await asyncio.to_thread(new_envelope, kp, o.to_account, o.body, ctx.node.chat_pow_difficulty)

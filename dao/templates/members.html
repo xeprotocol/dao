@@ -123,7 +123,7 @@ const on = (sel, ev, fn) => { const el = $(sel); if (el) el.addEventListener(ev,
 
 on("#pauseform", "submit", async e => { e.preventDefault(); try { await XeSigner.post("/v1/members/pause", MA, { ground: $("#ground").value, determination: $("#determination").value.trim() }); say("#pausemsg", "Paused.", true); reload(); } catch (err) { say("#pausemsg", err.message, false); } });
 {% if paused %}
-on("#postform", "submit", async e => { e.preventDefault(); try { await XeSigner.post("/v1/members/pause/{{ paused.id }}/post", MA, { text: $("#posttext").value.trim() }); say("#postmsg", "Published.", true); reload(); } catch (err) { say("#postmsg", err.message, false); } });
+on("#postform", "submit", async e => { e.preventDefault(); try { await XeSigner.post("/v1/members/pause/{{ paused.id }}/post", MA, { pause_id: "{{ paused.id }}", text: $("#posttext").value.trim() }); say("#postmsg", "Published.", true); reload(); } catch (err) { say("#postmsg", err.message, false); } });
 on("#extend", "click", async () => { try { await XeSigner.post("/v1/members/pause/{{ paused.id }}/extend", MA, { pause_id: "{{ paused.id }}", action: "extend" }); say("#pausemsg", "Signed.", true); reload(); } catch (err) { say("#pausemsg", err.message, false); } });
 on("#lift", "click", async () => { try { await XeSigner.post("/v1/members/pause/{{ paused.id }}/lift", MA, { pause_id: "{{ paused.id }}", action: "lift" }); say("#pausemsg", "Signed.", true); reload(); } catch (err) { say("#pausemsg", err.message, false); } });
 {% endif %}

@@ -142,6 +142,18 @@ async def purge_seen_signatures(db: AsyncSession) -> int:
     return res.rowcount or 0
 
 
+def bind(v: Verified, **expected: str) -> Verified:
+    """The signed payload must name what the route acts on. The URL says where a request was posted; only
+    the payload says what the key holder agreed to, so the two must match: a signature over a cancel of
+    session A is not a cancel of session B, whatever path it arrives on. Values compare case-insensitively
+    (ids and hashes are hex)."""
+    for field, want in expected.items():
+        got = v.payload.get(field)
+        if not isinstance(got, str) or got.lower() != str(want).lower():
+            raise HTTPException(400, f"signed payload does not name this {field.replace('_', ' ')}")
+    return v
+
+
 def require_seat(v: Verified, cfg: Config, right: str | None = None, members_only: bool = False) -> Verified:
     seat = cfg.seat_by_key(v.pub_key)
     if seat is None:

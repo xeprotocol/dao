@@ -233,3 +233,73 @@ def test_registry_value_is_compact_and_small():
     raw = compact_json(val)
     assert len(raw.encode()) < 4096
     assert json.loads(raw)["entity"] == "XE Network DAO LLC"
+
+
+# ---- vote weight: a receive dated before the snapshot whose send is dated after it does not count -----
+
+H = 3600 * 1_000_000_000
+
+
+class _Lattice:
+    """Two wallets and the blocks between them, as a node would serve them."""
+
+    def __init__(self, chains, blocks):
+        self.chains, self.blocks, self.lookups = chains, blocks, 0
+
+    async def full_chain(self, account):
+        from xe.client import XeError
+        if account not in self.chains:
+            raise XeError(404, "no such account")
+        return self.chains[account]
+
+    async def block(self, h):
+        from xe.client import XeError
+        self.lookups += 1
+        if h not in self.blocks:
+            raise XeError(404, "no such block")
+        return self.blocks[h]
+
+
+async def test_snapshot_does_not_count_a_receive_whose_send_is_after_it():
+    from dao.chainops import account_snapshot
+    T = 100 * H
+    a_recv = {"type": "receive", "asset": "XE", "balance": 1000, "timestamp": T - 10 * H, "hash": "a1", "source": "ext"}
+    a_send = {"type": "send", "asset": "XE", "balance": 0, "timestamp": T + 30 * 60 * 10**9, "hash": "a2",
+              "destination": "B", "amount": 1000}                                   # dated half an hour late
+    b_recv = {"type": "receive", "asset": "XE", "balance": 1000, "timestamp": T - 60 * 10**9, "hash": "b1", "source": "a2"}
+    chain = _Lattice({"A": [a_recv, a_send], "B": [b_recv]},
+                     {"ext": {"timestamp": T - 11 * H}, "a2": a_send})
+    a = await account_snapshot(chain, "A", T)
+    b = await account_snapshot(chain, "B", T)
+    assert a["balance"] == 1000                     # the send is dated after the snapshot, so A still holds it
+    assert b["balance"] == 0 and b["excluded_receives"] == ["b1"] and b["exists"] is False
+    # the same XE is not counted twice; and A's old receive was not looked up (outside the two-hour window)
+    assert a["balance"] + b["balance"] == 1000 and chain.lookups == 1
+    # once the send is dated at or before the snapshot, B's receive counts and A's balance is after the send
+    a_send["timestamp"] = T - 2 * 60 * 10**9
+    a = await account_snapshot(chain, "A", T)
+    b = await account_snapshot(chain, "B", T)
+    assert a["balance"] == 0 and b["balance"] == 1000 and b["exists"] is True
+    # an account the node does not know
+    assert (await account_snapshot(chain, "C", T))["exists"] is False
+
+
+def test_request_bodies_over_the_limit_are_refused_before_parsing():
+    from fastapi.testclient import TestClient
+    from dao.main import MAX_BODY_BYTES, BodyLimit
+    from fastapi import FastAPI
+
+    inner = FastAPI()
+
+    @inner.post("/v1/x")
+    async def x(body: dict):
+        return {"n": len(body)}
+
+    inner.add_middleware(BodyLimit)
+    c = TestClient(inner)
+    big = '{"a":"' + "x" * MAX_BODY_BYTES + '"}'
+    assert c.post("/v1/x", content=big, headers={"content-type": "application/json"}).status_code == 413
+    # the same without a content-length (chunked) is counted as it streams
+    r = c.post("/v1/x", content=iter([big.encode()]), headers={"content-type": "application/json"})
+    assert r.status_code == 413 and r.json()["error"] == "request body too large"
+    assert c.post("/v1/x", json={"a": 1}).status_code == 200

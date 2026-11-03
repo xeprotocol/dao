@@ -24,6 +24,7 @@ class Limit:
 INBOX = (Limit(10, 5), Limit(4, 2))
 VOTE = (Limit(60, 20), Limit(12, 6))
 PROPOSAL = (Limit(10, 5), Limit(2, 2))
+SNAPSHOT = (Limit(30, 10), Limit(30, 10))   # read, but each one walks a whole account chain on the node
 
 
 class Buckets:

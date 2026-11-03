@@ -123,6 +123,20 @@ class EventLog:
                 yield r
             start = rows[-1].index + 1
 
+    _verify_cache: tuple[float, dict] | None = None
+    VERIFY_CACHE_S = 60
+
+    @classmethod
+    async def verify_cached(cls, db: AsyncSession) -> dict:
+        """`verify()` for the public route: a full replay is O(log); one is kept for a minute per process so
+        the route cannot be used to make the database re-read the whole chain on demand."""
+        now = time.monotonic()
+        if cls._verify_cache and now - cls._verify_cache[0] < cls.VERIFY_CACHE_S:
+            return {**cls._verify_cache[1], "cached": True}
+        out = await cls.verify(db)
+        cls._verify_cache = (now, out)
+        return {**out, "cached": False}
+
     @staticmethod
     async def verify(db: AsyncSession) -> dict:
         """Replay the chain. Returns {ok, count, head, first_error}."""

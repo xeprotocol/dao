@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -55,6 +56,55 @@ app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 # every page as markdown: /x.md, /index.md, or Accept: text/markdown
 app.add_middleware(MarkdownMirror, base_url=lambda: get_context().settings.public_base_url)
 
+# The largest legitimate write is a resolution (50k chars of body plus ops of up to 64 KiB each); anything
+# past a megabyte is not a request we have a route for, and is refused before it is parsed.
+MAX_BODY_BYTES = 1 << 20
+
+
+class BodyLimit:
+    def __init__(self, app, limit: int = MAX_BODY_BYTES):
+        self.app, self.limit = app, limit
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method") not in ("POST", "PUT", "PATCH"):
+            return await self.app(scope, receive, send)
+        declared = next((v for k, v in scope.get("headers", []) if k == b"content-length"), None)
+        if declared is not None and declared.isdigit() and int(declared) > self.limit:
+            return await self._refuse(send)
+        seen = 0
+        tripped = False
+
+        async def counted():
+            nonlocal seen, tripped
+            msg = await receive()
+            if msg["type"] == "http.request":
+                seen += len(msg.get("body", b""))
+                if seen > self.limit:
+                    tripped = True
+                    raise _TooLarge()
+            return msg
+
+        try:
+            await self.app(scope, counted, send)
+        except _TooLarge:
+            if not tripped:
+                raise
+            await self._refuse(send)
+
+    @staticmethod
+    async def _refuse(send):
+        body = b'{"error":"request body too large","status":413}'
+        await send({"type": "http.response.start", "status": 413, "headers": [
+            (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body})
+
+
+class _TooLarge(Exception):
+    pass
+
+
+app.add_middleware(BodyLimit)
+
 
 @app.exception_handler(StarletteHTTPException)
 async def http_error(request: Request, exc: StarletteHTTPException):
@@ -65,6 +115,18 @@ async def http_error(request: Request, exc: StarletteHTTPException):
     resp = render(request, "error.html", {"status": exc.status_code, "detail": exc.detail}, status_code=exc.status_code)
     resp.headers.update(headers)
     return resp
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    """Same shape as every other error: one line naming the field, no echo of the input (XE-0080)."""
+    first = (exc.errors() or [{}])[0]
+    where = ".".join(str(x) for x in first.get("loc", []) if x not in ("body", "query", "path"))
+    detail = f"{where}: {first.get('msg', 'invalid')}" if where else str(first.get("msg", "invalid request"))
+    if request.url.path.startswith("/v1"):
+        return JSONResponse({"error": detail, "status": 422}, status_code=422)
+    from .ui import render
+    return render(request, "error.html", {"status": 422, "detail": detail}, status_code=422)
 
 
 @app.exception_handler(Exception)

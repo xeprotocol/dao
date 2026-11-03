@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from markdown_it import MarkdownIt
@@ -92,7 +92,7 @@ async def home(request: Request):
 
 
 @router.get("/proposals", response_class=HTMLResponse)
-async def proposals_page(request: Request, status: str | None = None, offset: int = 0):
+async def proposals_page(request: Request, status: str | None = None, offset: int = Query(0, ge=0)):
     async with session() as db:
         common = await _common(db)
         rows = await portal.list_proposals(db, status, offset, 50)
@@ -192,7 +192,7 @@ async def decision_record_example(request: Request):
 
 
 @router.get("/log", response_class=HTMLResponse)
-async def log_page(request: Request, offset: int = 0, kind: str | None = None, ref: str | None = None):
+async def log_page(request: Request, offset: int = Query(0, ge=0), kind: str | None = None, ref: str | None = None):
     async with session() as db:
         common = await _common(db)
         rows = await EventLog.page(db, offset, 100, kind, ref)
