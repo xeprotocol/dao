@@ -201,7 +201,8 @@ async def inbox_untriaged(req: SignedRequest, ctx: Ctx, db: Db):
 
 @router.post("/inbox/{mid}/reply", status_code=201)
 async def inbox_reply(mid: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
+    # Replying publishes a held message and speaks for the DAO: members only (XE-0635).
+    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, members_only=True)
     bind(v, message_id=mid)
     m = await inbox_svc.get(db, mid)
     o = await inbox_svc.reply(ctx, db, m, v)
@@ -211,7 +212,7 @@ async def inbox_reply(mid: str, req: SignedRequest, ctx: Ctx, db: Db):
 
 @router.post("/inbox/{mid}/status")
 async def inbox_status(mid: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
+    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, members_only=True)
     bind(v, message_id=mid)
     m = await inbox_svc.get(db, mid)
     await inbox_svc.set_status(ctx, db, m, v)

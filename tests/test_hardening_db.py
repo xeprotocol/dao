@@ -547,3 +547,30 @@ async def test_proposal_ops_are_validated_at_submit(db):
         with pytest.raises(HTTPException) as e:
             await portal.submit(ctx, db, _v(payload={"title": "t", "body": "b", "fee_block_hash": "c" * 64, "ops": ops}))
         assert e.value.status_code == 400, ops
+
+
+# ---- XE-0600: a resolution counts only current members' signatures --------------------------------
+
+async def test_resolution_counts_only_current_members(db):
+    from dao.models import Resolution
+    from dao.services import resolutions
+    ctx = _ctx()
+    ctx.config.members = [SimpleNamespace(id="founder-a", is_member=True), SimpleNamespace(id="founder-b", is_member=True)]
+    ctx.config.windows = {}
+    # an ordinary matter needs a majority of two: 2. "gone" signed for while a member, then left.
+    r = Resolution(id="r9", number=9, title="note", body="b", matter="note", ops=None, proposed_by="founder-a",
+                   status="open", signatures=[{"seat": "gone", "public_key": "g", "signature": "s", "decision": "for", "timestamp": 1}])
+    db.add(r)
+    await db.flush()
+
+    def member(seat, decision):
+        v = _v(payload={"resolution_id": "r9", "body_hash": resolutions.body_hash(r), "decision": decision})
+        v.seat = SimpleNamespace(id=seat, is_member=True)
+        return v
+
+    await resolutions.decide(ctx, db, r, member("founder-a", "for"), "for")
+    assert r.status == "open", "one live vote plus a departed member's vote is not a majority"
+    ev = (await db.execute(select(Event).where(Event.kind == "resolution.signed"))).scalars().all()[-1]
+    assert ev.payload["for"] == 1 and ev.payload["set_aside"] == ["gone"]
+    await resolutions.decide(ctx, db, r, member("founder-b", "for"), "for")
+    assert r.status == "passed"

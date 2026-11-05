@@ -85,10 +85,17 @@ async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, dec
     r.signatures = [*r.signatures, {"seat": v.seat.id, "public_key": v.pub_key, "signature": v.signature,
                                     "decision": decision, "timestamp": v.timestamp}]
     needed, rule = _matter_rule(ctx.config, r.matter)
-    fors = sum(1 for s in r.signatures if s["decision"] == "for")
-    againsts = sum(1 for s in r.signatures if s["decision"] == "against")
+    # Only current members count, the same way a session counts approvals against the live keyset: a seat
+    # that has left since signing carries nothing, for or against (XE-0600). The threshold is computed from
+    # the current membership, so the count must be too.
+    members = {s.id for s in ctx.config.members}
+    live = [s for s in r.signatures if s["seat"] in members]
+    fors = sum(1 for s in live if s["decision"] == "for")
+    againsts = sum(1 for s in live if s["decision"] == "against")
+    set_aside = sorted(s["seat"] for s in r.signatures if s["seat"] not in members)
     await ctx.events.append(db, "resolution.signed", v.actor, {
         "resolution_id": r.id, "decision": decision, "for": fors, "against": againsts, "needed": needed, "rule": rule,
+        **({"set_aside": set_aside} if set_aside else {}),
     }, ref=f"resolution:{r.id}")
     n_members = len(ctx.config.members)
     if fors >= needed:

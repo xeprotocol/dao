@@ -119,13 +119,16 @@ async def claim_signature(db: AsyncSession, v: Verified) -> None:
     """Record the signature as used, inside the caller's transaction. 409 if it was used before.
 
     The primary key does the work: two concurrent requests with the same signature cannot both insert,
-    and the row is only durable if the write it authorised commits too.
+    and the row is only durable if the write it authorised commits too. The outcome is read from RETURNING,
+    not from the cursor's rowcount, which SQLAlchemy only guarantees for UPDATE and DELETE and which some
+    drivers report as -1 for an INSERT (XE-0590).
     """
     res = await db.execute(
         pg_insert(SeenSignature).values(sig=v.signature, timestamp=v.timestamp, account=v.account)
         .on_conflict_do_nothing(index_elements=["sig"])
+        .returning(SeenSignature.sig)
     )
-    if res.rowcount == 0:
+    if res.scalar_one_or_none() is None:
         raise HTTPException(409, "this signature has already been used")
 
 
