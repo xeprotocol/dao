@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import struct
 import time
 
@@ -50,8 +51,15 @@ def compute_pow(hash_bytes: bytes, difficulty: int, deadline_s: float | None = N
             raise TimeoutError("proof of work deadline exceeded")
 
 
+_DIFFICULTY_RE = re.compile(r"[0-9a-fA-F]{1,16}")
+
+
 def parse_difficulty(hex_str: str | None, default: int) -> int:
-    """Nodes advertise thresholds as hex strings in GET /node; "0" means PoW disabled."""
+    """Nodes advertise thresholds as hex strings in GET /node; "0" means PoW disabled. Anything that is not
+    1-16 hex digits (a u64, as the node formats it) is treated as absent: the default, never a crash and
+    never a negative or oversize threshold (XE-0775)."""
     if hex_str is None or hex_str == "":
         return default
+    if not isinstance(hex_str, str) or not _DIFFICULTY_RE.fullmatch(hex_str):
+        raise ValueError(f"malformed difficulty {hex_str!r}")
     return int(hex_str, 16)

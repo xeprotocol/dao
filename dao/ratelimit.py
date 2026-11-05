@@ -33,6 +33,7 @@ INBOX = RouteClass("inbox", Limit(10, 5), Limit(4, 2))
 VOTE = RouteClass("vote", Limit(60, 20), Limit(12, 6))
 PROPOSAL = RouteClass("proposal", Limit(10, 5), Limit(2, 2))
 SNAPSHOT = RouteClass("snapshot", Limit(30, 10), Limit(30, 10))   # read, but each one walks a whole account chain on the node
+NODE_READ = RouteClass("node_read", Limit(60, 20), Limit(60, 20))  # a public read that costs a node round trip (XE-0652)
 
 
 class Buckets:

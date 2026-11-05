@@ -574,3 +574,96 @@ async def test_resolution_counts_only_current_members(db):
     assert ev.payload["for"] == 1 and ev.payload["set_aside"] == ["gone"]
     await resolutions.decide(ctx, db, r, member("founder-b", "for"), "for")
     assert r.status == "passed"
+
+
+# ---- XE-0646: a pause counts only current members' signatures -----------------------------------
+
+async def test_pause_lift_ignores_a_departed_members_signature(db):
+    from dao.models import PauseRecord
+    from dao.services import pause
+    ctx = _ctx()
+    ctx.config.members = [SimpleNamespace(id="founder-a", is_member=True), SimpleNamespace(id="founder-b", is_member=True)]
+    ctx.config.pause = {}
+    now = time.time_ns()
+    r = PauseRecord(id="p1", determined_by="founder-a", ground="g", determination="d" * 20, started_at=now,
+                    expires_at=now + 10 ** 12, indefinite=False, extensions=[], status="active",
+                    lifted_by=[{"seat": "gone", "public_key": "g", "signature": "s", "timestamp": 1}])
+    db.add(r)
+    await db.flush()
+
+    def member(seat):
+        v = _v(payload={"pause_id": "p1"})
+        v.seat = SimpleNamespace(id=seat, is_member=True)
+        return v
+
+    await pause.lift(ctx, db, r, member("founder-a"))
+    assert r.status == "active", "a departed member's signature plus one current member is not every member"
+    ev = (await db.execute(select(Event).where(Event.kind == "pause.lift_signed"))).scalars().all()[-1]
+    assert ev.payload["signatures"] == 1 and ev.payload["set_aside"] == ["gone"]
+    await pause.lift(ctx, db, r, member("founder-b"))
+    assert r.status == "lifted"
+    # the same rule for an extension
+    r2 = PauseRecord(id="p2", determined_by="founder-a", ground="g", determination="d" * 20, started_at=now,
+                     expires_at=now + 10 ** 12, indefinite=False, lifted_by=[], status="active",
+                     extensions=[{"applied": False, "signatures": [{"seat": "gone", "public_key": "g", "signature": "s", "timestamp": 1}]}])
+    db.add(r2)
+    await db.flush()
+    before = r2.expires_at
+    await pause.extend(ctx, db, r2, member("founder-a"))
+    assert r2.expires_at == before and not r2.extensions[-1]["applied"]
+
+
+# ---- XE-0672: a withdrawn resolution takes its session with it -----------------------------------
+
+async def test_withdrawing_a_resolution_cancels_the_session_it_opened(db):
+    from dao.models import Resolution
+    from dao.services import resolutions
+    ctx = _ctx()
+    ctx.config.members = [SimpleNamespace(id="founder-a", is_member=True)]
+    s = SigningSession(id="s1", kind="parameter", title="t", ops=[], ops_digest="d", status="approving", approvals=[],
+                       required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0, resolution_id="r1")
+    r = Resolution(id="r1", number=1, title="t", body="b", matter="note", ops=None, proposed_by="founder-a",
+                   status="open", signatures=[], session_id="s1")
+    db.add_all([s, r])
+    await db.flush()
+    v = _v(payload={"resolution_id": "r1"})
+    v.seat = SimpleNamespace(id="founder-a", is_member=True)
+    await resolutions.withdraw(ctx, db, r, v)
+    assert r.status == "withdrawn" and s.status == "cancelled" and s.error == "resolution withdrawn"
+    # and a cancelled session cannot be rebuilt back to life
+    with pytest.raises(HTTPException) as e:
+        await sessions.rebuild(ctx, db, s)
+    assert e.value.status_code == 409
+
+
+# ---- XE-0740: a burn takes the fee; what was sent above it goes back -----------------------------
+
+async def test_an_overpaid_fee_burns_the_fee_and_returns_the_rest(db, monkeypatch):
+    ctx = _ctx(_fee_chain([]))
+    now = time.time_ns()
+    pr = Proposal(hash="a" * 64, title="t", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64,
+                  author_signature="s", author_timestamp=now, fee_block_hash="1" * 64, status="closed", opened_at=now - D,
+                  closes_at=now - 1, rules=ctx.config.pinned_rules(), analysis=[])
+    db.add(pr)
+    db.add(FeeLedger(fee_block_hash="1" * 64, proposal_hash="a" * 64, payer=AUTHOR, amount=1500, state="due_burn",
+                     tx_hashes={"receive": "9" * 64}))
+    await db.commit()
+    moved: list[tuple] = []
+
+    async def burn(ctx_, key, scope, amount, memo=""):
+        moved.append(("burn", amount, memo))
+        return SimpleNamespace(hash="b" * 64)
+
+    async def send(ctx_, key, scope, dest, amount, memo=""):
+        moved.append(("send", dest, amount, memo))
+        return SimpleNamespace(hash="e" * 64)
+
+    monkeypatch.setattr(fees.chainops, "burn", burn)
+    monkeypatch.setattr(fees.chainops, "send", send)
+    assert await fees.settle_due(ctx, db) == 1
+    assert moved[0][:2] == ("burn", 1000) and moved[1][:3] == ("send", AUTHOR, 500)
+    assert moved[0][2].split()[1] == "burn" and moved[1][3].split()[1] == "excess"
+    row = (await db.execute(select(FeeLedger))).scalar_one()
+    assert row.state == "burned" and row.tx_hashes["burn"] == "b" * 64 and row.tx_hashes["excess"] == "e" * 64
+    kinds = (await db.execute(select(Event.kind))).scalars().all()
+    assert kinds.count("fee.burned") == 1 and kinds.count("fee.excess_returned") == 1

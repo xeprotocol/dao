@@ -45,7 +45,9 @@ templates.env.filters["short"] = _short
 templates.env.filters["xe"] = lambda v: from_micro(int(v or 0))
 templates.env.filters["md_path"] = md_path
 
-_md = MarkdownIt("commonmark")  # config-authored markdown only (prompts, charter); never user input
+# Config-authored markdown only (prompts, charter), never user input; and HTML off regardless, so the
+# renderer is safe by configuration and not only by what reaches it (XE-0702).
+_md = MarkdownIt("commonmark", {"html": False, "linkify": False})
 
 
 def _render_md(text: str | None) -> Markup:

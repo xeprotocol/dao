@@ -7,12 +7,13 @@ resolution.
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from xe.client import XeError
 
 from .. import __version__
 from ..log import EventLog
+from ..ratelimit import NODE_READ, enforce_ip
 from ..services import pause as pause_svc
 from ..services import records, resolutions
 from .deps import Ctx, Db
@@ -121,7 +122,8 @@ async def pause_state(ctx: Ctx, db: Db):
 
 
 @router.get("/treasury")
-async def treasury(ctx: Ctx):
+async def treasury(request: Request, ctx: Ctx):
+    enforce_ip(request, NODE_READ)   # balances come from the node per call
     return {"accounts": await records.treasury(ctx), "policy": "members only; the harness holds no treasury key"}
 
 

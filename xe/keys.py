@@ -10,26 +10,30 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from dataclasses import dataclass
 
 from nacl.signing import SigningKey, VerifyKey
 from nacl.exceptions import BadSignatureError
 
 ACCOUNT_ADDRESS_DOMAIN = b"xe/account/v1"
+_HEX_RE = re.compile(r"[0-9a-fA-F]+")
 
 
 class KeyError_(ValueError):
     pass
 
 
+def _hex(value: str, n: int, what: str) -> bytes:
+    """Exactly 2n hex digits. `bytes.fromhex` alone also accepts whitespace, which the node's
+    `hex.DecodeString` does not, and which would make two spellings of one signature (XE-0699)."""
+    if not isinstance(value, str) or len(value) != 2 * n or not _HEX_RE.fullmatch(value):
+        raise KeyError_(f"invalid {what}: want {2 * n} hex digits")
+    return bytes.fromhex(value)
+
+
 def _hex32(value: str, what: str) -> bytes:
-    try:
-        raw = bytes.fromhex(value)
-    except ValueError as e:
-        raise KeyError_(f"invalid {what} hex") from e
-    if len(raw) != 32:
-        raise KeyError_(f"invalid {what} length: got {len(raw)}, want 32")
-    return raw
+    return _hex(value, 32, what)
 
 
 def derive_address(pub_key_hex: str) -> str:
@@ -88,12 +92,7 @@ def verify_signature(pub_key: bytes, signature: bytes, message: bytes) -> bool:
 def verify_hex_signature(pub_key_hex: str, sig_hex: str, message: bytes) -> None:
     """Raises KeyError_ on any failure (mirrors core.VerifyHexSignature)."""
     pub = _hex32(pub_key_hex, "public key")
-    try:
-        sig = bytes.fromhex(sig_hex)
-    except ValueError as e:
-        raise KeyError_("invalid signature hex") from e
-    if len(sig) != 64:
-        raise KeyError_(f"invalid signature length: got {len(sig)}, want 64")
+    sig = _hex(sig_hex, 64, "signature")
     if not verify_signature(pub, sig, message):
         raise KeyError_("signature verification failed")
 

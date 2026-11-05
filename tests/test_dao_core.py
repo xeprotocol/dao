@@ -342,3 +342,53 @@ def test_request_bodies_over_the_limit_are_refused_before_parsing():
     r = c.post("/v1/x", content=iter([big.encode()]), headers={"content-type": "application/json"})
     assert r.status_code == 413 and r.json()["error"] == "request body too large"
     assert c.post("/v1/x", json={"a": 1}).status_code == 200
+
+
+def test_signature_and_key_hex_must_be_canonical():
+    """XE-0699: `bytes.fromhex` would accept whitespace; the signature is the replay key, so only the exact
+    128 (and 64) hex digits are a valid spelling, at the model and in the verifier."""
+    from pydantic import ValidationError
+    from xe.keys import KeyError_, verify_hex_signature
+    kp = KeyPair.generate()
+    payload = {"x": 1}
+    ts = time.time_ns()
+    sig = kp.sign_hex(digest(DOMAIN_VOTE, {"payload": payload, "timestamp": ts}))
+    spaced = " ".join(sig[i:i + 2] for i in range(0, len(sig), 2))
+    for bad_sig in (spaced, " " + sig, sig + "\n", sig[:-2]):
+        with pytest.raises(ValidationError):
+            SignedRequest(payload=payload, timestamp=ts, pub_key=kp.pub_key_hex, signature=bad_sig)
+    with pytest.raises(ValidationError):
+        SignedRequest(payload=payload, timestamp=ts, pub_key=kp.pub_key_hex[:2] + " " + kp.pub_key_hex[2:], signature=sig)
+    target = digest(DOMAIN_VOTE, {"payload": payload, "timestamp": ts})
+    verify_hex_signature(kp.pub_key_hex.upper(), sig, target)   # case is not canonical form; it is normalised later
+    with pytest.raises(KeyError_):
+        verify_hex_signature(kp.pub_key_hex, spaced, target)
+    with pytest.raises(KeyError_):
+        verify_hex_signature(" " + kp.pub_key_hex[1:], sig, target)
+
+
+def test_node_difficulty_is_a_u64_hex_or_the_default():
+    """XE-0775: the node's advertised difficulty is parsed strictly, and a lying node leaves the defaults."""
+    import asyncio
+    from xe.pow import parse_difficulty
+    assert parse_difficulty("fffff80000000000", 7) == 0xFFFFF80000000000
+    assert parse_difficulty("0", 7) == 0 and parse_difficulty(None, 7) == 7 and parse_difficulty("", 7) == 7
+    for bad in ("zz", "-1", "+ff", "0x10", " ff", "f_f", "1" * 17, 12, True, [], {}):
+        with pytest.raises(ValueError):
+            parse_difficulty(bad, 7)
+
+    from dao.context import Context
+    for body in ({"pow_difficulty": "zz", "chat_pow_difficulty": "-1"}, ["not", "a", "dict"], "nope", {"pow_difficulty": 5}):
+        ctx = Context.__new__(Context)
+        ctx.chain = SimpleNamespace(node=_const(body))
+        from dao.context import NodeIdentity
+        ctx.node = NodeIdentity()
+        before = (ctx.node.pow_difficulty, ctx.node.chat_pow_difficulty)
+        node = asyncio.run(ctx.refresh_node())
+        assert (node.pow_difficulty, node.chat_pow_difficulty) == before
+
+
+def _const(value):
+    async def f():
+        return value
+    return f

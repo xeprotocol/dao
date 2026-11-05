@@ -108,8 +108,11 @@ async def create(ctx: Context, db: AsyncSession, *, kind: str, title: str, ops: 
     return s
 
 
-async def get(db: AsyncSession, session_id: str) -> SigningSession:
-    s = (await db.execute(select(SigningSession).where(SigningSession.id == session_id))).scalar_one_or_none()
+async def get(db: AsyncSession, session_id: str, *, lock: bool = False) -> SigningSession:
+    """`lock=True` takes the row FOR UPDATE: every path that changes a session loads it this way, so two
+    writers queue instead of each saving its own copy of a list over the other's (XE-0672)."""
+    q = select(SigningSession).where(SigningSession.id == session_id)
+    s = (await db.execute(q.with_for_update() if lock else q)).scalar_one_or_none()
     if s is None:
         raise HTTPException(404, "session not found")
     return s

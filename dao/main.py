@@ -73,6 +73,7 @@ class BodyLimit:
             return await self._refuse(send)
         seen = 0
         tripped = False
+        answered = False
 
         async def counted():
             nonlocal seen, tripped
@@ -84,11 +85,21 @@ class BodyLimit:
                     raise _TooLarge()
             return msg
 
-        try:
-            await self.app(scope, counted, send)
-        except _TooLarge:
+        async def guarded(msg):
+            # Once the stream is cut, whatever the app answers (FastAPI turns an error in its body reader
+            # into its own 400) is replaced by the one 413 in the common shape (XE-0650).
+            nonlocal answered
             if not tripped:
-                raise
+                return await send(msg)
+            if not answered:
+                answered = True
+                await self._refuse(send)
+
+        try:
+            await self.app(scope, counted, guarded)
+        except _TooLarge:
+            pass
+        if tripped and not answered:
             await self._refuse(send)
 
     @staticmethod
@@ -145,6 +156,15 @@ async def security_headers(request: Request, call_next):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
     resp.headers.setdefault("X-Frame-Options", "DENY")
+    # Pages carry seat keys in the signer; everything they load is first-party except the fonts, and they
+    # talk only to this origin. Inline scripts remain (the page scripts), so this bounds exfiltration and
+    # injection surface rather than script execution (XE-0702).
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; connect-src 'self'; "
+        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'",
+    )
     if request.url.path.startswith("/v1"):
         resp.headers.setdefault("Access-Control-Allow-Origin", "*")
         resp.headers.setdefault("Cache-Control", "no-store")

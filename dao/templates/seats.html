@@ -2,7 +2,7 @@
 {% block title %}{{ copy.labels.seats }}{% endblock %}
 {% block content %}
 <h1>{{ copy.labels.seats }}</h1>
-<p class="sub">Mode: <b>{{ mode }}</b>. {% if mode == 'members-direct' %}The people below run the DAO directly while the agent seats are being designated. Each agent seat gets its own on-chain account when it is switched on.{% else %}The orchestrator recommends; the specialists analyse; the people below hold the reserved levers.{% endif %}</p>
+<p class="sub">Mode: <b>{{ 'direct' if mode == 'members-direct' else mode }}</b>. {% if mode == 'members-direct' %}The people below run the DAO directly while the agent seats are being designated. Each agent seat gets its own on-chain account when it is switched on.{% else %}The orchestrator recommends; the specialists analyse; the people below hold the reserved levers.{% endif %}</p>
 
 <h2>People</h2>
 <table><tr><th>Seat</th><th>Name</th><th>Role</th><th>Public key</th><th>Account</th></tr>

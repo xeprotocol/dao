@@ -129,11 +129,20 @@ async def withdraw(ctx: Context, db: AsyncSession, r: Resolution, v: Verified) -
     r.status = "withdrawn"
     r.decided_at = datetime.now(timezone.utc)
     await ctx.events.append(db, "resolution.withdrawn", v.actor, {"resolution_id": r.id}, ref=f"resolution:{r.id}")
+    if r.session_id:
+        # A passing vote that raced this withdrawal may have opened the execution session already; it goes
+        # with the resolution, so nothing the record calls withdrawn stays executable (XE-0672).
+        s = await sessions.get(db, r.session_id, lock=True)
+        if s.status not in ("submitted", "cancelled"):
+            await sessions.cancel(ctx, db, s, v, "resolution withdrawn")
     return r
 
 
-async def get(db: AsyncSession, res_id: str) -> Resolution:
-    r = (await db.execute(select(Resolution).where(Resolution.id == res_id))).scalar_one_or_none()
+async def get(db: AsyncSession, res_id: str, *, lock: bool = False) -> Resolution:
+    """`lock=True` takes the row FOR UPDATE: every path that changes a resolution loads it this way, so two
+    writers queue instead of each saving its own copy of a list over the other's (XE-0672)."""
+    q = select(Resolution).where(Resolution.id == res_id)
+    r = (await db.execute(q.with_for_update() if lock else q)).scalar_one_or_none()
     if r is None:
         raise HTTPException(404, "resolution not found")
     return r

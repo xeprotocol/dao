@@ -108,8 +108,11 @@ async def submit(ctx: Context, db: AsyncSession, v: Verified) -> Proposal:
     return pr
 
 
-async def get(db: AsyncSession, h: str) -> Proposal:
-    pr = (await db.execute(select(Proposal).where(Proposal.hash == h.lower()))).scalar_one_or_none()
+async def get(db: AsyncSession, h: str, *, lock: bool = False) -> Proposal:
+    """`lock=True` takes the row FOR UPDATE: every path that changes a proposal loads it this way, so two
+    writers queue instead of each saving its own copy of a list over the other's (XE-0672)."""
+    q = select(Proposal).where(Proposal.hash == h.lower())
+    pr = (await db.execute(q.with_for_update() if lock else q)).scalar_one_or_none()
     if pr is None:
         raise HTTPException(404, "proposal not found")
     return pr
@@ -209,7 +212,8 @@ def tally(pr: Proposal, votes: list[Vote]) -> dict:
 async def close_due(ctx: Context, db: AsyncSession) -> list[Proposal]:
     """Worker: close proposals whose window has ended; record result; queue the fee action."""
     now = time.time_ns()
-    due = list((await db.execute(select(Proposal).where(Proposal.status == "open", Proposal.closes_at <= now))).scalars().all())
+    due = list((await db.execute(select(Proposal).where(Proposal.status == "open", Proposal.closes_at <= now)
+                                 .with_for_update(skip_locked=True))).scalars().all())
     for pr in due:
         res = tally(pr, await votes_for(db, pr.hash))
         pr.result = res

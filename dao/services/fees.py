@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import chainops
 from ..context import Context
-from ..models import FeeLedger
+from ..models import FeeLedger, Proposal
 from ..signer import SignerError
 
 log = logging.getLogger("dao.fees")
@@ -123,44 +123,75 @@ async def _find_receive(ctx: Context, db: AsyncSession, f: FeeLedger, chain: _Fe
     return False
 
 
+async def _fee_due(db: AsyncSession, f: FeeLedger) -> int:
+    """The fee the proposal pinned when it opened. A payer may have sent more; only this much is the fee."""
+    rules = (await db.execute(select(Proposal.rules).where(Proposal.hash == f.proposal_hash))).scalar_one_or_none() or {}
+    return min(int(rules.get("fee_micro_xe", f.amount)), f.amount)
+
+
+def _phase_amount(f: FeeLedger, fee: int) -> int:
+    """What the current settlement phase pays: the whole sum back on a refund; only the fee on a burn; and
+    on `excess`, the part above the fee back to the payer, since the documented burn is the fee (XE-0740)."""
+    as_ = f.tx_hashes["settle_as"]
+    return f.amount if as_ == "refund" else fee if as_ == "burn" else f.amount - fee
+
+
+def _mark(f: FeeLedger, as_: str) -> None:
+    f.tx_hashes = {**(f.tx_hashes or {}), "settle_as": as_, "settle_nonce": secrets.token_hex(4)}
+    f.state = "settling"
+
+
 async def _settle(ctx: Context, db: AsyncSession, f: FeeLedger) -> None:
-    """Mark, commit, pay, record, commit."""
+    """Mark, commit, pay, record, commit; twice when a burn leaves an excess to return."""
     if f.state in DUE:
-        as_ = "refund" if f.state == "due_refund" else "burn"
-        f.tx_hashes = {**(f.tx_hashes or {}), "settle_as": as_, "settle_nonce": secrets.token_hex(4)}
-        f.state = "settling"
+        _mark(f, "refund" if f.state == "due_refund" else "burn")
         await db.commit()
-    as_, nonce = f.tx_hashes["settle_as"], f.tx_hashes["settle_nonce"]
-    memo = f"fee {as_} {f.proposal_hash[:12]} {nonce}"
-    if as_ == "refund":
-        b = await chainops.send(ctx, "fee", "block.send.refund", f.payer, f.amount, memo=memo)
-    else:
-        b = await chainops.burn(ctx, "fee", "block.burn", f.amount, memo=memo)
-    await _record_settled(ctx, db, f, b.hash)
+    fee = await _fee_due(db, f)
+    while f.state == "settling":
+        as_, nonce = f.tx_hashes["settle_as"], f.tx_hashes["settle_nonce"]
+        memo = f"fee {as_} {f.proposal_hash[:12]} {nonce}"
+        amount = _phase_amount(f, fee)
+        if as_ == "burn":
+            b = await chainops.burn(ctx, "fee", "block.burn", amount, memo=memo)
+        else:
+            b = await chainops.send(ctx, "fee", "block.send.refund", f.payer, amount, memo=memo)
+        await _record_settled(ctx, db, f, b.hash, fee)
 
 
 async def _finish_or_retry(ctx: Context, db: AsyncSession, f: FeeLedger, chain: _FeeChain) -> bool:
-    """A row left `settling`: completed from the chain if the payment landed, else returned to due."""
+    """A row left `settling`: completed from the chain if the payment landed, else returned to due (or, for
+    an excess phase whose burn is already recorded, re-marked so the excess goes out again)."""
     nonce = (f.tx_hashes or {}).get("settle_nonce", "")
     got = await chain.settlement_with(nonce) if nonce else None
     if got:
-        await _record_settled(ctx, db, f, got["hash"], reconciled=True)
-        return True
-    f.state = "due_refund" if f.tx_hashes.get("settle_as") == "refund" else "due_burn"
-    f.tx_hashes = {k: v for k, v in f.tx_hashes.items() if k not in ("settle_as", "settle_nonce")}
+        await _record_settled(ctx, db, f, got["hash"], await _fee_due(db, f), reconciled=True)
+        return f.state != "settling"
+    as_ = f.tx_hashes.get("settle_as")
+    if as_ == "excess":
+        _mark(f, "excess")
+    else:
+        f.state = "due_refund" if as_ == "refund" else "due_burn"
+        f.tx_hashes = {k: v for k, v in f.tx_hashes.items() if k not in ("settle_as", "settle_nonce")}
     await db.commit()
     return False
 
 
-async def _record_settled(ctx: Context, db: AsyncSession, f: FeeLedger, block_hash: str, reconciled: bool = False) -> None:
+async def _record_settled(ctx: Context, db: AsyncSession, f: FeeLedger, block_hash: str, fee: int, reconciled: bool = False) -> None:
     as_ = f.tx_hashes["settle_as"]
+    amount = _phase_amount(f, fee)
     f.tx_hashes = {**{k: v for k, v in f.tx_hashes.items() if k not in ("settle_as", "settle_nonce")}, as_: block_hash}
-    f.state = "refunded" if as_ == "refund" else "burned"
     f.error = ""
-    payload = {"proposal": f.proposal_hash, "payer": f.payer, "amount": f.amount, "block": block_hash}
+    payload = {"proposal": f.proposal_hash, "payer": f.payer, "amount": amount, "block": block_hash}
     if reconciled:
         payload["reconciled"] = True
-    await ctx.events.append(db, f"fee.{f.state}", "harness", payload, ref=f"proposal:{f.proposal_hash}")
+    if as_ == "excess":
+        f.state = "burned"
+        await ctx.events.append(db, "fee.excess_returned", "harness", payload, ref=f"proposal:{f.proposal_hash}")
+    else:
+        f.state = "refunded" if as_ == "refund" else "burned"
+        await ctx.events.append(db, f"fee.{f.state}", "harness", payload, ref=f"proposal:{f.proposal_hash}")
+        if as_ == "burn" and f.amount > fee:
+            _mark(f, "excess")   # the burn is on record; what was sent above the fee goes back next
     await db.commit()
 
 

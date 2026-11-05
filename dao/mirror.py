@@ -172,6 +172,12 @@ def _origin_from_scope(scope) -> str:
 
 # ---- llms.txt ---------------------------------------------------------------------------------------
 
+def public_mode(mode: str) -> str:
+    """The register's word for the harness mode. The config value `members-direct` carries a word the public
+    copy does not use (kill_list.yaml); the pages and llms.txt say `direct` (XE-0650)."""
+    return "direct" if mode == "members-direct" else mode
+
+
 def build_llms_txt(cfg: Config, base_url: str, network_id: str, mode: str) -> str:
     """The reading list, per llmstxt.org: an H1, a blockquote summary, then sections of links."""
     b = base_url.rstrip("/")
@@ -186,7 +192,7 @@ def build_llms_txt(cfg: Config, base_url: str, network_id: str, mode: str) -> st
         "",
         f"> {copy.get('headline', '')} {copy.get('sub', '')}".strip(),
         "",
-        f"Network `{network_id}`, status `{mode}`. Every page here is also markdown: append `.md` to its path "
+        f"Network `{network_id}`, mode `{public_mode(mode)}`. Every page here is also markdown: append `.md` to its path "
         "(the home page is `/index.md`), or request it with `Accept: text/markdown`. The JSON API lives under "
         "`/v1`; `GET /v1` lists it. Writes are signed requests, never forms.",
         "",

@@ -50,12 +50,23 @@ class Context:
         except Exception as e:  # node unreachable at boot is survivable
             log.warning("node unreachable: %s", e)
             return self.node
+        if not isinstance(info, dict):
+            log.warning("node identity is not an object; keeping defaults")
+            return self.node
+
+        def difficulty(key: str, default: int) -> int:
+            try:
+                return parse_difficulty(info.get(key), default)
+            except ValueError as e:   # a lying node is as survivable as an unreachable one (XE-0775)
+                log.warning("node %s: %s; using default", key, e)
+                return default
+
         self.node = NodeIdentity(
-            network_id=info.get("network_id", ""),
-            node_id=info.get("id", ""),
-            version=info.get("version", ""),
-            pow_difficulty=parse_difficulty(info.get("pow_difficulty"), DEFAULT_DIFFICULTY),
-            chat_pow_difficulty=parse_difficulty(info.get("chat_pow_difficulty"), CHAT_POW_DIFFICULTY),
+            network_id=str(info.get("network_id", "")),
+            node_id=str(info.get("id", "")),
+            version=str(info.get("version", "")),
+            pow_difficulty=difficulty("pow_difficulty", DEFAULT_DIFFICULTY),
+            chat_pow_difficulty=difficulty("chat_pow_difficulty", CHAT_POW_DIFFICULTY),
         )
         return self.node
 

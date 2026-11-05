@@ -40,3 +40,7 @@ async def session() -> AsyncIterator[AsyncSession]:
 async def get_db() -> AsyncIterator[AsyncSession]:
     async with sessionmaker()() as s:
         yield s
+        # Reached only when the handler returned normally (an exception is raised into the generator at the
+        # yield). A handler that read and returned still made one write, its signature claim, so the claim
+        # cannot be lost by a missing commit (XE-0647). Handlers that commit themselves make this a no-op.
+        await s.commit()

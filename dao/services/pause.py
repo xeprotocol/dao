@@ -73,8 +73,17 @@ def _draft_post(ctx: Context, ground: str) -> str:
             f"and what happens next.")
 
 
+def _consent(ctx: Context, sigs: list[dict]) -> tuple[bool, int, list[str]]:
+    """Every current member must have signed. A signature from a seat that has since left the company
+    carries nothing (XE-0646, as XE-0600 for resolutions): (met, live_count, set_aside_seats)."""
+    members = {s.id for s in ctx.config.members}
+    live = [s for s in sigs if s["seat"] in members]
+    set_aside = sorted(s["seat"] for s in sigs if s["seat"] not in members)
+    return len(live) >= len(members), len(live), set_aside
+
+
 async def extend(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) -> PauseRecord:
-    """Extensions need both members: the first signature is recorded, the second applies it."""
+    """Extensions need every current member: the first signature is recorded, the last applies it."""
     if r.status != "active":
         raise HTTPException(409, "pause is not active")
     pending = [e for e in r.extensions if not e.get("applied")]
@@ -83,31 +92,36 @@ async def extend(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) ->
         raise HTTPException(409, "this member already signed this extension")
     sigs = [*sigs, {"seat": v.seat.id, "public_key": v.pub_key, "signature": v.signature, "timestamp": v.timestamp}]
     entry = {"signatures": sigs, "applied": False, "reason": clean_text(v.payload.get("reason"), "reason", max_len=2000, required=False)}
-    if len(sigs) >= len(ctx.config.members):
+    met, n_live, set_aside = _consent(ctx, sigs)
+    if met:
         entry["applied"] = True
         base = max(r.expires_at, time.time_ns())
         r.expires_at = base + int(ctx.config.pause.get("extension_days", 7)) * D
         entry["new_expires_at"] = r.expires_at
     r.extensions = [*[e for e in r.extensions if e.get("applied")], entry]
     await ctx.events.append(db, "pause.extended" if entry["applied"] else "pause.extension_signed", v.actor, {
-        "pause_id": r.id, "expires_at": r.expires_at, "signatures": len(sigs), "reason": entry["reason"],
+        "pause_id": r.id, "expires_at": r.expires_at, "signatures": n_live, "reason": entry["reason"],
+        **({"set_aside": set_aside} if set_aside else {}),
     }, ref=f"pause:{r.id}")
     return r
 
 
 async def lift(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) -> PauseRecord:
-    """Lifting early needs both members, like an extension."""
+    """Lifting early needs every current member, like an extension."""
     if r.status != "active":
         raise HTTPException(409, "pause is not active")
     if any(s["seat"] == v.seat.id for s in r.lifted_by):
         raise HTTPException(409, "already signed")
     r.lifted_by = [*r.lifted_by, {"seat": v.seat.id, "public_key": v.pub_key, "signature": v.signature, "timestamp": v.timestamp}]
-    if len(r.lifted_by) >= len(ctx.config.members):
+    met, n_live, set_aside = _consent(ctx, r.lifted_by)
+    if met:
         r.status = "lifted"
         r.lifted_at = time.time_ns()
-        await ctx.events.append(db, "pause.lifted", v.actor, {"pause_id": r.id, "lifted_at": r.lifted_at}, ref=f"pause:{r.id}")
+        await ctx.events.append(db, "pause.lifted", v.actor, {"pause_id": r.id, "lifted_at": r.lifted_at,
+                                                               **({"set_aside": set_aside} if set_aside else {})}, ref=f"pause:{r.id}")
     else:
-        await ctx.events.append(db, "pause.lift_signed", v.actor, {"pause_id": r.id, "signatures": len(r.lifted_by)}, ref=f"pause:{r.id}")
+        await ctx.events.append(db, "pause.lift_signed", v.actor, {"pause_id": r.id, "signatures": n_live,
+                                                                    **({"set_aside": set_aside} if set_aside else {})}, ref=f"pause:{r.id}")
     return r
 
 

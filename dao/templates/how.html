@@ -2,7 +2,7 @@
 {% block title %}How the seats work together{% endblock %}
 {% block content %}
 <h1>How the seats work together</h1>
-<p class="sub">Nine agent seats, each with public instructions, analyse every item in a fixed order and hand one written recommendation to the people who sign. This page describes that order, how the seats talk to each other, and where it stops. Status today: <b>{{ mode }}</b>; the seats are designed and their instructions are published, and nothing is calling a model yet.</p>
+<p class="sub">Nine agent seats, each with public instructions, analyse every item in a fixed order and hand one written recommendation to the people who sign. This page describes that order, how the seats talk to each other, and where it stops. Status today: <b>{{ 'direct' if mode == 'members-direct' else mode }}</b>; the seats are designed and their instructions are published, and nothing is calling a model yet.</p>
 
 <svg viewBox="0 0 1000 340" width="100%" role="img" aria-label="Flow: item arrives, Research establishes facts, specialists analyse in parallel, one rebuttal round, Risk adversarial pass, orchestrator synthesis, people decide and sign, execution prepares unsigned artefacts" style="max-width:1000px;font:13px -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;fill:currentColor">
   <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5 0 10z" fill="currentColor"/></marker></defs>

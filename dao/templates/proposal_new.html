@@ -2,7 +2,7 @@
 {% block title %}Propose{% endblock %}
 {% block content %}
 <h1>Propose</h1>
-<p class="sub">Anyone can. Fee {{ rules.fee_micro_xe|xe }} XE, sent from the proposing account to <code>{{ fee_account or "fee account not yet published" }}</code>. Refunded if {{ rules.quorum_wallets }} wallets take part; otherwise burned. Open for {{ rules.window_days }} days. {{ copy.labels.not_self_executing }}</p>
+<p class="sub">Anyone can. Fee {{ rules.fee_micro_xe|xe }} XE, sent from the proposing account to <code>{{ fee_account or "fee account not yet published" }}</code>. Refunded if {{ rules.quorum_wallets }} wallets take part; otherwise the fee is burned and anything sent above it is returned. Open for {{ rules.window_days }} days. {{ copy.labels.not_self_executing }}</p>
 
 {% include "_keybox.html" %}
 

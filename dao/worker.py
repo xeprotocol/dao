@@ -93,29 +93,50 @@ class Worker:
             # promote approved sessions whose timelock has run, once no pause is in force
             now = time.time_ns()
             if not await pause.is_paused(db):
-                rows = (await db.execute(select(SigningSession).where(SigningSession.status == "approving"))).scalars().all()
+                await db.commit()
                 ks = None
-                for s in rows:
-                    if s.not_before and now < s.not_before:
+                for sid in await self._session_ids(db, "approving"):
+                    # Each row is taken FOR UPDATE and committed on its own, so a member's cancel or approval
+                    # either waits for this pass or is seen by it; never overwritten (XE-0763).
+                    s = await self._take(db, sid, "approving")
+                    if s is None or (s.not_before and now < s.not_before):
+                        await db.rollback()
                         continue
                     try:
                         ks = ks or await sessions.live_keyset(self.ctx)
                         if sessions.approvals_met(s, ks):
                             await sessions.rebuild(self.ctx, db, s)
+                        await db.commit()
                     except Exception as e:  # one session or a node hiccup must not hold up closing votes
-                        log.warning("promote session %s: %s", s.id, e)
+                        await db.rollback()
+                        log.warning("promote session %s: %s", sid, e)
             purged = await purge_seen_signatures(db)
             if purged:
                 log.debug("purged %d expired signature claims", purged)
             await mark_run(db, "timers")
             await db.commit()
 
+    @staticmethod
+    async def _session_ids(db, status: str) -> list[str]:
+        return list((await db.execute(select(SigningSession.id).where(SigningSession.status == status))).scalars().all())
+
+    @staticmethod
+    async def _take(db, sid: str, status: str) -> SigningSession | None:
+        """Lock one session for this pass, or skip it: None if a route holds it or it has left `status`."""
+        q = select(SigningSession).where(SigningSession.id == sid, SigningSession.status == status).with_for_update(skip_locked=True)
+        return (await db.execute(q)).scalar_one_or_none()
+
     async def job_sessions(self):
         """If a signing session's block is stale and nobody has signed it yet, rebuild quietly."""
         async with session() as db:
             paused = await pause.is_paused(db)
-            rows = [] if paused else (await db.execute(select(SigningSession).where(SigningSession.status == "signing"))).scalars().all()
-            for s in rows:
+            ids = [] if paused else await self._session_ids(db, "signing")
+            await db.commit()
+            for sid in ids:
+                s = await self._take(db, sid, "signing")
+                if s is None:
+                    await db.rollback()
+                    continue
                 try:
                     if not s.block_signatures and await sessions.is_stale(self.ctx, s):
                         await sessions.rebuild(self.ctx, db, s)
@@ -127,8 +148,10 @@ class Worker:
                         await sessions.rebuild(self.ctx, db, s)
                     if s.status == "submitted" and s.kind == "anchor":
                         await records.note_anchor_submitted(db, s.id, s.submitted_index, s.submitted_hash)
+                    await db.commit()
                 except Exception as e:
-                    log.warning("session %s: %s", s.id, e)
+                    await db.rollback()
+                    log.warning("session %s: %s", sid, e)
             # record anchors whose session submitted via the API
             subm = (await db.execute(select(SigningSession).where(SigningSession.status == "submitted", SigningSession.kind == "anchor"))).scalars().all()
             for s in subm:

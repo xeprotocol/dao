@@ -36,11 +36,17 @@ from .models import SeenSignature
 MAX_SKEW_NS = 10 * 60 * 1_000_000_000
 
 
+# Exactly 64 / 128 hex digits, either case. `bytes.fromhex` would also accept whitespace, and the signature
+# is the replay key, so the accepted spelling has to be the canonical one (XE-0699).
+HEX32 = r"^[0-9a-fA-F]{64}$"
+HEX64 = r"^[0-9a-fA-F]{128}$"
+
+
 class SignedRequest(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     timestamp: int
-    pub_key: str
-    signature: str
+    pub_key: str = Field(pattern=HEX32)
+    signature: str = Field(pattern=HEX64)
     pow_nonce: int | None = None   # required on routes that cost the sender something (POST /v1/inbox)
 
 

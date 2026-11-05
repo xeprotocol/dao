@@ -1,14 +1,16 @@
-"""/v1/members/*: signed actions by seat holders. Every call carries a SignedRequest under the
-member-action domain; the seat is resolved from the key. Nothing here is reachable without a seat.
-The payload names the thing acted on (`bind`): the path routes the request, the signature authorises it.
+"""/v1/members/*: the seat holders' actions. Every POST carries a SignedRequest under the member-action
+domain; the seat is resolved from the key, and nothing is written without one. The payload names the thing
+acted on (`bind`): the path routes the request, the signature authorises it. The GETs here are public reads
+of public records (sessions appear on /records and in the log); `whoami` is a key lookup (XE-0652).
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from ..auth import SignedRequest, bind, require_seat, verify_and_claim
 from ..canonical import DOMAIN_MEMBER_ACTION, DOMAIN_OPS_APPROVAL, DOMAIN_RESOLUTION
+from ..ratelimit import NODE_READ, enforce_ip
 from ..services import inbox as inbox_svc
 from ..services import pause as pause_svc
 from ..services import records, resolutions, sessions
@@ -41,7 +43,7 @@ async def propose_resolution(req: SignedRequest, ctx: Ctx, db: Db):
 @router.post("/resolutions/{res_id}/sign", status_code=201)
 async def sign_resolution(res_id: str, req: SignedRequest, ctx: Ctx, db: Db):
     v = require_seat(await verify_and_claim(db, req, DOMAIN_RESOLUTION), ctx.config, right="sign_resolutions", members_only=True)
-    r = await resolutions.get(db, res_id)
+    r = await resolutions.get(db, res_id, lock=True)
     await resolutions.decide(ctx, db, r, v, v.payload.get("decision", ""))
     await db.commit()
     return resolutions.to_dict(r, ctx.config)
@@ -51,7 +53,7 @@ async def sign_resolution(res_id: str, req: SignedRequest, ctx: Ctx, db: Db):
 async def withdraw_resolution(res_id: str, req: SignedRequest, ctx: Ctx, db: Db):
     v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
     bind(v, resolution_id=res_id)
-    r = await resolutions.get(db, res_id)
+    r = await resolutions.get(db, res_id, lock=True)
     await resolutions.withdraw(ctx, db, r, v)
     await db.commit()
     return resolutions.to_dict(r, ctx.config)
@@ -65,7 +67,8 @@ async def list_sessions(db: Db, status: str | None = None):
 
 
 @router.get("/sessions/{sid}")
-async def get_session(sid: str, ctx: Ctx, db: Db):
+async def get_session(request: Request, sid: str, ctx: Ctx, db: Db):
+    enforce_ip(request, NODE_READ)   # `stale` asks the node for its tip
     s = await sessions.get(db, sid)
     d = sessions.to_dict(s)
     d["stale"] = await sessions.is_stale(ctx, s)
@@ -99,7 +102,7 @@ async def open_anchor(req: SignedRequest, ctx: Ctx, db: Db):
 async def approve_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
     """payload = {session_id, ops_digest}; signed under the ops-approval domain by a keyset key."""
     v = require_seat(await verify_and_claim(db, req, DOMAIN_OPS_APPROVAL), ctx.config, right="sign_statechain")
-    s = await sessions.get(db, sid)
+    s = await sessions.get(db, sid, lock=True)
     await sessions.approve(ctx, db, s, v)
     await db.commit()
     return sessions.to_dict(s)
@@ -109,7 +112,7 @@ async def approve_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
 async def rebuild_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
     v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right="sign_statechain")
     bind(v, session_id=sid)
-    s = await sessions.get(db, sid)
+    s = await sessions.get(db, sid, lock=True)
     await sessions.rebuild(ctx, db, s, actor=v.actor)
     await db.commit()
     return sessions.to_dict(s)
@@ -121,7 +124,7 @@ async def sign_session_block(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
     block_signature is the raw ed25519 signature over the block hash bytes that goes on chain."""
     v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right="sign_statechain")
     bind(v, session_id=sid)
-    s = await sessions.get(db, sid)
+    s = await sessions.get(db, sid, lock=True)
     if v.payload.get("block_hash") != s.block_hash:
         raise HTTPException(409, "block hash has changed (tip moved); fetch the session again and re-sign")
     await sessions.sign(ctx, db, s, v.pub_key, v.payload.get("block_signature", ""), v.actor)
@@ -133,7 +136,7 @@ async def sign_session_block(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
 async def cancel_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
     v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, members_only=True)
     bind(v, session_id=sid)
-    s = await sessions.get(db, sid)
+    s = await sessions.get(db, sid, lock=True)
     await sessions.cancel(ctx, db, s, v, clean_text(v.payload.get("reason"), "reason", max_len=2000, required=False))
     await db.commit()
     return sessions.to_dict(s)
@@ -182,7 +185,7 @@ async def pause_post(pid: str, req: SignedRequest, ctx: Ctx, db: Db):
 async def _pause(db, pid: str):
     from sqlalchemy import select
     from ..models import PauseRecord
-    r = (await db.execute(select(PauseRecord).where(PauseRecord.id == pid))).scalar_one_or_none()
+    r = (await db.execute(select(PauseRecord).where(PauseRecord.id == pid).with_for_update())).scalar_one_or_none()
     if r is None:
         raise HTTPException(404, "pause not found")
     return r
@@ -196,6 +199,7 @@ async def inbox_untriaged(req: SignedRequest, ctx: Ctx, db: Db):
     inbox the public surfaces hold back (XE-0195), so reading them is a seat action like answering them."""
     bind(require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config), action="list_untriaged")
     rows = await inbox_svc.list_untriaged(db, 100)
+    await db.commit()   # the signature claim is a write even though the action is a read (XE-0647)
     return {"messages": [inbox_svc.to_dict(m) for m in rows]}
 
 
@@ -204,7 +208,7 @@ async def inbox_reply(mid: str, req: SignedRequest, ctx: Ctx, db: Db):
     # Replying publishes a held message and speaks for the DAO: members only (XE-0635).
     v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, members_only=True)
     bind(v, message_id=mid)
-    m = await inbox_svc.get(db, mid)
+    m = await inbox_svc.get(db, mid, lock=True)
     o = await inbox_svc.reply(ctx, db, m, v)
     await db.commit()
     return {"queued": o.id, "to": o.to_account}
@@ -214,7 +218,7 @@ async def inbox_reply(mid: str, req: SignedRequest, ctx: Ctx, db: Db):
 async def inbox_status(mid: str, req: SignedRequest, ctx: Ctx, db: Db):
     v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, members_only=True)
     bind(v, message_id=mid)
-    m = await inbox_svc.get(db, mid)
+    m = await inbox_svc.get(db, mid, lock=True)
     await inbox_svc.set_status(ctx, db, m, v)
     await db.commit()
     return inbox_svc.to_dict(m)

@@ -11,7 +11,7 @@ from fastapi.responses import RedirectResponse
 from sse_starlette.sse import EventSourceResponse
 
 from .. import __version__
-from ..auth import SignedRequest, claim_signature, require_seat, verify_and_claim, verify_signed
+from ..auth import SignedRequest, claim_signature, require_pow, require_seat, verify_and_claim, verify_signed
 from ..canonical import DOMAIN_INBOX_HTTP, DOMAIN_MEMBER_ACTION, DOMAIN_PROPOSAL, DOMAIN_VOTE
 from ..db import session
 from ..log import EventLog, event_to_dict
@@ -214,6 +214,7 @@ async def inbox_post(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
     enforce_ip(request, INBOX)
     v = verify_signed(req, DOMAIN_INBOX_HTTP)
     enforce_account(INBOX, v.account)
+    require_pow(v, ctx.node.chat_pow_difficulty)   # the work is paid before anything touches the database (XE-0699)
     await claim_signature(db, v)
     m = await inbox_svc.http_submit(ctx, db, v)
     await db.commit()
@@ -329,7 +330,7 @@ async def ready(ctx: Ctx, db: Db):
 @router.post("/proposals/{h}/analysis", status_code=201)
 async def proposal_analysis(h: str, req: SignedRequest, ctx: Ctx, db: Db):
     v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
-    pr = await portal.get(db, h)
+    pr = await portal.get(db, h, lock=True)
     await portal.add_analysis(ctx, db, pr, v)
     await db.commit()
     return portal.to_dict(pr)
@@ -340,7 +341,7 @@ async def proposal_decision(h: str, req: SignedRequest, ctx: Ctx, db: Db):
     v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
     if not (v.seat.is_member or v.seat.can("operational_review")):
         raise HTTPException(403, "decisions are recorded by members or an officer with operational_review")
-    pr = await portal.get(db, h)
+    pr = await portal.get(db, h, lock=True)
     await portal.decide(ctx, db, pr, v)
     await db.commit()
     return portal.to_dict(pr)

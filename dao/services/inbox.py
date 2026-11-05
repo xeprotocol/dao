@@ -223,8 +223,11 @@ async def get_public(db: AsyncSession, mid: str) -> InboxMessage:
     return m
 
 
-async def get(db: AsyncSession, mid: str) -> InboxMessage:
-    m = (await db.execute(select(InboxMessage).where(InboxMessage.id == mid))).scalar_one_or_none()
+async def get(db: AsyncSession, mid: str, *, lock: bool = False) -> InboxMessage:
+    """`lock=True` takes the row FOR UPDATE: every path that changes a message loads it this way, so two
+    writers queue instead of each saving its own copy of a list over the other's (XE-0672)."""
+    q = select(InboxMessage).where(InboxMessage.id == mid)
+    m = (await db.execute(q.with_for_update() if lock else q)).scalar_one_or_none()
     if m is None:
         raise HTTPException(404, "message not found")
     return m
