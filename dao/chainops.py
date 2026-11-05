@@ -8,7 +8,9 @@ here can touch the treasury or the keyset.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+from collections.abc import Awaitable, Callable
 
 from xe.client import XeClient, XeError
 from xe.encoding import Block, sign_block
@@ -16,6 +18,8 @@ from xe.keys import KeyPair
 from xe.pow import compute_pow
 
 from .context import Context
+
+log = logging.getLogger("dao.chainops")
 
 
 async def _pow(hash_hex: str, difficulty: int) -> int:
@@ -49,17 +53,39 @@ async def submit_signed(ctx: Context, b: Block, kp: KeyPair) -> Block:
     return b
 
 
-async def receive_pending(ctx: Context, key_name: str, scope: str = "block.receive") -> list[Block]:
-    """Receive every pending send to the account held under `key_name`. Returns the blocks made."""
+async def receive_pending(ctx: Context, key_name: str, scope: str = "block.receive",
+                          on_made: Callable[[Block], Awaitable[None]] | None = None) -> list[Block]:
+    """Receive every pending send to the account held under `key_name`. Returns the blocks made.
+
+    Each block is reported through `on_made` as soon as the node has it, so the caller can record it before
+    the next one is attempted; a send that cannot be received is logged and skipped rather than stopping the
+    run, since the ones behind it are independent (XE-0488)."""
     kp = ctx.signer.keypair(key_name, scope)
     made: list[Block] = []
     for p in await ctx.chain.pending_for(kp.address):
-        prev, bals = await _tip(ctx.chain, kp.address)
-        b = Block(type="receive", account=kp.address, previous=prev,
-                  balance=bals.get(p["asset"], 0) + p["amount"], timestamp=time.time_ns(),
-                  asset=p["asset"], source=p["send_hash"])
-        made.append(await submit_signed(ctx, b, kp))
+        try:
+            prev, bals = await _tip(ctx.chain, kp.address)
+            b = Block(type="receive", account=kp.address, previous=prev,
+                      balance=bals.get(p["asset"], 0) + p["amount"], timestamp=time.time_ns(),
+                      asset=p["asset"], source=p["send_hash"])
+            b = await submit_signed(ctx, b, kp)
+        except XeError as e:
+            log.warning("receive of %s into %s failed: %s", p["send_hash"][:12], key_name, e)
+            continue
+        made.append(b)
+        if on_made is not None:
+            await on_made(b)
     return made
+
+
+async def chain_index(chain: XeClient, account: str) -> list[dict]:
+    """Every block on an account, oldest first; [] for an account the node does not know."""
+    try:
+        return await chain.full_chain(account)
+    except XeError as e:
+        if e.status == 404:
+            return []
+        raise
 
 
 async def send(ctx: Context, key_name: str, scope: str, destination: str, amount: int, memo: str = "",
@@ -88,14 +114,28 @@ async def burn(ctx: Context, key_name: str, scope: str, amount: int, memo: str =
 # ---- read side ---------------------------------------------------------------------------------
 
 # A node accepts a block whose timestamp is within an hour of its clock either way, so a sender can date a
-# block up to an hour early or late. A receive dated before the snapshot whose source send is dated after it
-# is therefore possible on the wire and impossible in fact: the XE cannot be in the receiving wallet before it
-# left the sending one. Counting it would let one balance vote from two wallets (send dated late, receive
-# dated early), as many times as there are wallets. A receive only counts when its source send is also at or
-# before the snapshot. Only receives dated within two hours of the snapshot can be affected, so only those
-# are looked up.
+# block up to an hour early or late. Two things follow for a balance snapshot taken at a point in time.
+#
+# First, a block made after that point can carry a timestamp before it, as long as the gap is under an hour.
+# So the snapshot for a proposal is not taken at the moment it opens but an hour and a margin earlier
+# (`snapshot_time`): a block made at real time r is dated r - 1h at the earliest, which is after the snapshot
+# whenever r is after the open. Nothing done once a proposal is visible can move its snapshot: not a new
+# wallet, not a transfer, not a split (XE-0352). Holders see the balance they had an hour before open.
+#
+# Second, a receive dated before the snapshot whose source send is dated after it is possible on the wire and
+# impossible in fact: the XE cannot be in the receiving wallet before it left the sending one. Counting it
+# would let one balance vote from two wallets (send dated late, receive dated early), as many times as there
+# are wallets. A receive only counts when its source send is also at or before the snapshot. Only receives
+# dated within two hours of the snapshot can be affected, so only those are looked up.
 TIMESTAMP_WINDOW_NS = 3600 * 1_000_000_000
+SNAPSHOT_MARGIN_NS = 5 * 60 * 1_000_000_000
+SNAPSHOT_LEAD_NS = TIMESTAMP_WINDOW_NS + SNAPSHOT_MARGIN_NS
 CAUSAL_CHECK_NS = 2 * TIMESTAMP_WINDOW_NS
+
+
+def snapshot_time(opened_at_ns: int) -> int:
+    """The time a proposal's weight is read at: an hour and a margin before it opened (see above)."""
+    return opened_at_ns - SNAPSHOT_LEAD_NS
 
 
 async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str = "XE") -> dict:

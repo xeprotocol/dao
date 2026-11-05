@@ -1,7 +1,7 @@
 """The open portal: anyone proposes for a fee, anyone with XE votes, the result advises the DAO.
 
 Rules are pinned to a proposal at open time (`proposal.rules`) so a later Schedule B change never
-moves a live vote. Weight is the voter's XE balance at the open snapshot. Quorum is a count of
+moves a live vote. Weight is the voter's XE balance at the snapshot, an hour before open. Quorum is a count of
 participating wallets, not an amount of XE. Agents' weight is bounded and they never count toward
 quorum. Nothing here executes anything: a passed proposal becomes a decision item for the DAO.
 """
@@ -19,7 +19,7 @@ from xe.client import XeError
 
 from ..auth import Verified, bind
 from ..canonical import DOMAIN_PROPOSAL, canonical_json, sha256_hex
-from ..chainops import account_snapshot
+from ..chainops import account_snapshot, snapshot_time
 from ..context import Context
 from ..models import FeeLedger, Proposal, Resolution, Vote
 from ..text import clean_text
@@ -103,7 +103,7 @@ async def submit(ctx: Context, db: AsyncSession, v: Verified) -> Proposal:
                          amount=int(fee_block.get("amount", 0)), state="seen", tx_hashes={}))
     await ctx.events.append(db, "proposal.opened", v.actor, {
         "proposal": h, "title": title, "body": body, "ops": ops, "author": v.account, "fee_block_hash": fee_block_hash,
-        "opened_at": now, "closes_at": pr.closes_at, "rules": rules,
+        "opened_at": now, "snapshot_at": snapshot_time(now), "closes_at": pr.closes_at, "rules": rules,
     }, ref=f"proposal:{h}")
     return pr
 
@@ -135,14 +135,14 @@ async def vote(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Vot
         raise HTTPException(400, "signed payload names a different proposal")
     rules = pr.rules
     pw = rules.get("participating_wallet", {})
-    snap = await account_snapshot(ctx.chain, v.account, pr.opened_at, rules.get("weight_asset", "XE"))
+    snap = await account_snapshot(ctx.chain, v.account, snapshot_time(pr.opened_at), rules.get("weight_asset", "XE"))
     is_agent = v.account in ctx.config.agent_accounts
     excluded = v.account in set(rules.get("excluded_accounts", []))
     reasons = []
     if excluded:
         reasons.append("excluded account")
     if pw.get("must_exist_before_open", True) and not snap["exists"]:
-        reasons.append("account did not exist before the proposal opened")
+        reasons.append("account did not exist at the snapshot, an hour before the proposal opened")
     if snap["balance"] < int(pw.get("min_balance_micro_xe", 0)):
         reasons.append("balance below the participation minimum at snapshot")
     if is_agent and not rules.get("agents", {}).get("count_toward_quorum", False):
@@ -288,7 +288,8 @@ async def counts(db: AsyncSession) -> dict:
 def to_dict(pr: Proposal, votes: list[Vote] | None = None, include_body: bool = True) -> dict:
     d = {
         "hash": pr.hash, "title": pr.title, "author": pr.author_account, "status": pr.status, "opened_at": pr.opened_at,
-        "closes_at": pr.closes_at, "fee_block_hash": pr.fee_block_hash, "rules": pr.rules, "ops": pr.ops,
+        "snapshot_at": snapshot_time(pr.opened_at), "closes_at": pr.closes_at, "fee_block_hash": pr.fee_block_hash,
+        "rules": pr.rules, "ops": pr.ops,
         "result": pr.result, "decision": pr.decision, "analysis": pr.analysis,
     }
     if include_body:

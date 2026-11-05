@@ -15,7 +15,7 @@ from ..auth import SignedRequest, claim_signature, require_seat, verify_and_clai
 from ..canonical import DOMAIN_INBOX_HTTP, DOMAIN_MEMBER_ACTION, DOMAIN_PROPOSAL, DOMAIN_VOTE
 from ..db import session
 from ..log import EventLog, event_to_dict
-from ..ratelimit import INBOX, PROPOSAL, SNAPSHOT, VOTE, enforce
+from ..ratelimit import INBOX, PROPOSAL, SNAPSHOT, VOTE, enforce_account, enforce_ip
 from ..services import inbox as inbox_svc
 from ..services import pause as pause_svc
 from ..services import portal, records
@@ -112,9 +112,9 @@ async def list_proposals(db: Db, status: str | None = None, offset: int = Query(
 
 @router.post("/proposals", status_code=201)
 async def submit_proposal(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
-    enforce(request, PROPOSAL)
+    enforce_ip(request, PROPOSAL)
     v = verify_signed(req, DOMAIN_PROPOSAL)
-    enforce(request, PROPOSAL, v.account)
+    enforce_account(PROPOSAL, v.account)
     await claim_signature(db, v)
     pr = await portal.submit(ctx, db, v)
     await db.commit()
@@ -139,9 +139,9 @@ async def proposal_votes(h: str, db: Db):
 
 @router.post("/proposals/{h}/votes", status_code=201)
 async def cast_vote(request: Request, h: str, req: SignedRequest, ctx: Ctx, db: Db):
-    enforce(request, VOTE)
+    enforce_ip(request, VOTE)
     v = verify_signed(req, DOMAIN_VOTE)
-    enforce(request, VOTE, v.account)
+    enforce_account(VOTE, v.account)
     await claim_signature(db, v)
     pr = await portal.get(db, h)
     row = await portal.vote(ctx, db, pr, v)
@@ -153,9 +153,9 @@ async def cast_vote(request: Request, h: str, req: SignedRequest, ctx: Ctx, db: 
 @router.post("/votes", status_code=201)
 async def cast_vote_flat(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
     """Same as POST /proposals/{hash}/votes; the proposal hash comes from the signed payload."""
-    enforce(request, VOTE)
+    enforce_ip(request, VOTE)
     v = verify_signed(req, DOMAIN_VOTE)
-    enforce(request, VOTE, v.account)
+    enforce_account(VOTE, v.account)
     await claim_signature(db, v)
     pr = await portal.get(db, v.payload.get("proposal", ""))
     row = await portal.vote(ctx, db, pr, v)
@@ -179,7 +179,7 @@ async def snapshot(request: Request, account: str, ctx: Ctx, at: int | None = Qu
     from ..chainops import account_snapshot
     if not portal.HEX64.fullmatch(account.lower()):
         raise HTTPException(400, "account must be 64 hex characters")
-    enforce(request, SNAPSHOT)
+    enforce_ip(request, SNAPSHOT)
     rules = ctx.config.pinned_rules()
     at = at or time.time_ns()
     snap = await account_snapshot(ctx.chain, account.lower(), at)
@@ -211,9 +211,9 @@ async def inbox_info(ctx: Ctx, db: Db, limit: int = Query(50, ge=1, le=200)):
 @router.post("/inbox", status_code=201)
 async def inbox_post(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
     """Signed message plus a chat-level proof of work over the signing digest (see GET /v1/inbox for the rule)."""
-    enforce(request, INBOX)
+    enforce_ip(request, INBOX)
     v = verify_signed(req, DOMAIN_INBOX_HTTP)
-    enforce(request, INBOX, v.account)
+    enforce_account(INBOX, v.account)
     await claim_signature(db, v)
     m = await inbox_svc.http_submit(ctx, db, v)
     await db.commit()
@@ -245,8 +245,9 @@ async def log_head(ctx: Ctx, db: Db):
 
 
 @router.get("/log/verify")
-async def log_verify(db: Db):
-    return await EventLog.verify_cached(db)
+async def log_verify(ctx: Ctx, db: Db):
+    """Replays the chain and checks every event is signed by the harness key published at /v1/log/head."""
+    return await EventLog.verify_cached(db, ctx.signer.public_key("harness") if ctx.signer.has("harness") else "")
 
 
 @router.get("/log/{index}")

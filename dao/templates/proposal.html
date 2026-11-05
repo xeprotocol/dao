@@ -14,7 +14,7 @@
     {% if tally.weight_agent_raw['for'] or tally.weight_agent_raw.against %}<br>Agent weight scaled by {{ tally.agent_scale }}{% endif %}</p>
   </div>
   <div class="card"><h3>Rules pinned at open</h3>
-    <p class="small" style="margin:0">Weight: XE balance at open · quorum {{ p.rules.quorum_wallets }} wallets with ≥ {{ p.rules.participating_wallet.min_balance_micro_xe|xe }} XE · pass mark {{ (p.rules.pass_mark_fraction * 100)|int }}% of for+against · fee {{ p.rules.fee_micro_xe|xe }} XE ({{ p.rules.fee_on_quorum }} on quorum, {{ p.rules.fee_below_quorum }} below)</p>
+    <p class="small" style="margin:0">Weight: XE balance at the snapshot ({{ snapshot_at|ns }}, an hour before open) · quorum {{ p.rules.quorum_wallets }} wallets with ≥ {{ p.rules.participating_wallet.min_balance_micro_xe|xe }} XE · pass mark {{ (p.rules.pass_mark_fraction * 100)|int }}% of for+against · fee {{ p.rules.fee_micro_xe|xe }} XE ({{ p.rules.fee_on_quorum }} on quorum, {{ p.rules.fee_below_quorum }} below)</p>
   </div>
   {% if p.result %}<div class="card"><h3>{{ copy.labels.result_published }}</h3><p style="margin:0"><span class="pill {{ p.result.outcome }}">{{ p.result.outcome.replace('_',' ') }}</span> · {{ copy.labels.not_self_executing }}</p></div>{% endif %}
   {% if p.decision %}<div class="card"><h3>{{ copy.labels.decision_taken }}</h3><p style="margin:0"><b>{{ p.decision.decision }}</b> — {{ p.decision.reasons }}</p></div>
@@ -29,7 +29,7 @@
 
 {% if p.status == 'open' %}
 <h2>Vote</h2>
-<p class="small mute">Your weight is your XE balance when this opened ({{ p.opened_at|ns }}). One vote per account; voting again replaces the earlier one. Reasons are public.</p>
+<p class="small mute">Your weight is your XE balance at the snapshot, {{ snapshot_at|ns }}: an hour before this opened, so nothing moved after it was visible can change a weight. One vote per account; voting again replaces the earlier one. Reasons are public.</p>
 {% include "_keybox.html" %}
 <form class="block" id="vform">
   <div class="row">
@@ -58,7 +58,7 @@ const payload = () => ({ proposal: H, choice: document.querySelector('input[name
 const vf = $("#vform");
 if (vf) {
   vf.addEventListener("submit", async e => { e.preventDefault(); try { const r = await XeSigner.post("/v1/proposals/" + H + "/votes", DOMAIN, payload()); say("#vmsg", "Recorded: " + r.choice + ", weight " + (r.weight/1e6) + " XE" + (r.participating ? ", counts toward quorum." : ", does not count toward quorum: " + (r.eligibility.not_participating_because||[]).join("; ")), true); setTimeout(()=>location.reload(), 1500); } catch (err) { say("#vmsg", err.message, false); } });
-  $("#check").addEventListener("click", async () => { if (!XeSigner.addr()) return say("#vmsg", "load a key first", false); const r = await (await fetch("/v1/snapshot/" + XeSigner.addr() + "?at={{ p.opened_at }}")).json(); say("#vmsg", "Weight " + (r.balance/1e6) + " XE at open; " + (r.participating ? "counts toward quorum." : "does not count toward quorum."), true); });
+  $("#check").addEventListener("click", async () => { if (!XeSigner.addr()) return say("#vmsg", "load a key first", false); const r = await (await fetch("/v1/snapshot/" + XeSigner.addr() + "?at={{ snapshot_at }}")).json(); say("#vmsg", "Weight " + (r.balance/1e6) + " XE at the snapshot; " + (r.participating ? "counts toward quorum." : "does not count toward quorum."), true); });
   $("#offline").addEventListener("click", async () => { const t = await XeSigner.offlineTarget(DOMAIN, payload()); $("#offline_out").hidden = false; $("#offline_out").textContent = "digest:    " + t.digest + "\ntimestamp: " + t.ts + "\ncanonical: " + t.canonical + "\n\nCLI: dao sign --seed <hex> --digest " + t.digest + "\nthen POST /v1/proposals/" + H + "/votes {payload, timestamp, pub_key, signature}"; });
 }
 </script>

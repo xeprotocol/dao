@@ -44,8 +44,23 @@ def wants_markdown(accept: str) -> bool:
 
 # ---- conversion -------------------------------------------------------------------------------------
 
-_converter = MarkdownConverter(
-    heading_style="ATX", bullets="-", escape_underscores=False, escape_asterisks=False, table_infer_header=True,
+class _Converter(MarkdownConverter):
+    """Text is text. Everything the HTML page showed as characters stays characters in the twin: markdown
+    punctuation, `<`, `&` and `[` in user-written text are backslash-escaped, and a preformatted block is
+    fenced with more backticks than any run inside it, so a proposal body, vote reason or inbox message
+    cannot add links, images, headings or raw HTML to the page under the DAO's name (XE-0507)."""
+
+    def convert_pre(self, el, text, parent_tags):
+        if not text:
+            return ""
+        longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+        fence = "`" * max(3, longest + 1)
+        return f"\n\n{fence}\n{text.strip(chr(10))}\n{fence}\n\n"
+
+
+_converter = _Converter(
+    heading_style="ATX", bullets="-", escape_underscores=True, escape_asterisks=True, escape_misc=True,
+    table_infer_header=True,
 )
 
 
@@ -87,7 +102,8 @@ def html_to_markdown(html: str, canonical: str) -> str:
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
     head = f"*Markdown view of <{canonical}>. The page is the record; this is the same page for reading.*"
     if title:
-        head = f"<!-- {title} -->\n{head}"
+        # the title is page-controlled text; it must not be able to close the comment it sits in
+        head = f"<!-- {title.replace('--', '- -').replace('>', '›')} -->\n{head}"
     return f"{head}\n\n{body}\n"
 
 

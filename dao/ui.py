@@ -17,6 +17,7 @@ from xe.amounts import from_micro
 from xe.client import XeError
 
 from . import __version__
+from .chainops import snapshot_time
 from .context import get_context
 from .db import session
 from .log import EventLog, event_to_dict
@@ -115,7 +116,8 @@ async def proposal_page(request: Request, h: str):
         pr = await portal.get(db, h)
         votes = await portal.votes_for(db, pr.hash)
         events = await EventLog.page(db, 0, 50, ref=f"proposal:{pr.hash}")
-    return render(request, "proposal.html", {**common, "p": pr, "votes": votes, "tally": portal.tally(pr, votes), "events": events})
+    return render(request, "proposal.html", {**common, "p": pr, "votes": votes, "tally": portal.tally(pr, votes), "events": events,
+                                             "snapshot_at": snapshot_time(pr.opened_at)})
 
 
 @router.get("/seats", response_class=HTMLResponse)

@@ -20,11 +20,19 @@ class Limit:
     burst: int
 
 
-# per route class: (per IP, per account)
-INBOX = (Limit(10, 5), Limit(4, 2))
-VOTE = (Limit(60, 20), Limit(12, 6))
-PROPOSAL = (Limit(10, 5), Limit(2, 2))
-SNAPSHOT = (Limit(30, 10), Limit(30, 10))   # read, but each one walks a whole account chain on the node
+@dataclass(frozen=True)
+class RouteClass:
+    """One class of route with its own buckets: a burst of inbox posts from an address does not spend the
+    votes of everyone behind it (XE-0478)."""
+    name: str
+    ip: Limit
+    account: Limit
+
+
+INBOX = RouteClass("inbox", Limit(10, 5), Limit(4, 2))
+VOTE = RouteClass("vote", Limit(60, 20), Limit(12, 6))
+PROPOSAL = RouteClass("proposal", Limit(10, 5), Limit(2, 2))
+SNAPSHOT = RouteClass("snapshot", Limit(30, 10), Limit(30, 10))   # read, but each one walks a whole account chain on the node
 
 
 class Buckets:
@@ -63,12 +71,19 @@ def client_ip(request: Request) -> str:
     return (request.client.host if request.client else "") or "unknown"
 
 
-def enforce(request: Request, limits: tuple[Limit, Limit], account: str | None = None) -> None:
-    """429 with Retry-After when the IP or the account is over its limit. Call before any work."""
-    ip_lim, acct_lim = limits
-    wait = _buckets.take(f"ip:{client_ip(request)}", ip_lim)
-    if not wait and account:
-        wait = _buckets.take(f"acct:{account}", acct_lim)
+def _refuse(wait: float) -> None:
     if wait:
         secs = max(1, int(wait + 0.999))
         raise HTTPException(429, "too many requests; slow down", headers={"Retry-After": str(secs)})
+
+
+def enforce_ip(request: Request, cls: RouteClass) -> None:
+    """One token from the address's bucket for this class. Call first, before the signature is checked, so
+    unsigned noise is refused cheaply; call once per request."""
+    _refuse(_buckets.take(f"ip:{cls.name}:{client_ip(request)}", cls.ip))
+
+
+def enforce_account(cls: RouteClass, account: str) -> None:
+    """One token from the signing account's bucket for this class, once the signature has named it. The
+    address is not charged again."""
+    _refuse(_buckets.take(f"acct:{cls.name}:{account}", cls.account))

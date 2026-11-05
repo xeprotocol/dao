@@ -111,13 +111,15 @@ def address(pub_key: str):
 
 @app.command("verify-log")
 def verify_log():
-    """Replay the event log and check every hash and signature."""
+    """Replay the event log and check every hash and signature against the harness key."""
+    from .context import build_context
     from .db import session
     from .log import EventLog
 
     async def go():
+        ctx = build_context()
         async with session() as db:
-            return await EventLog.verify(db)
+            return await EventLog.verify(db, ctx.signer.public_key("harness"))
     res = asyncio.run(go())
     typer.echo(json.dumps(res, indent=1))
     raise typer.Exit(0 if res["ok"] else 1)

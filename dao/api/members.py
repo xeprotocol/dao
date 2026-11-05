@@ -85,7 +85,8 @@ async def open_registry(req: SignedRequest, ctx: Ctx, db: Db):
 
 @router.post("/sessions/anchor", status_code=201)
 async def open_anchor(req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
+    # Members only, like the registry: an anchor session takes the next number in the register (XE-0483).
+    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, members_only=True)
     bind(v, action="open_anchor_session")
     if await pause_svc.is_paused(db):
         raise HTTPException(409, "paused")

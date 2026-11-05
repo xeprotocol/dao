@@ -73,11 +73,15 @@ _ctx: Context | None = None
 def build_context() -> Context:
     settings = get_settings()
     config = load_config(settings.config_dir)
+    # The keyfile is the harness's identity: it signs the log every public reader verifies against. A service
+    # that started without it would write a log that cannot be checked, so a missing file or wrong passphrase
+    # stops the process here rather than running unsigned (XE-0494).
     try:
         signer = Signer.load(settings.signer_keyfile, settings.signer_passphrase)
     except SignerError as e:
-        log.warning("signer unavailable (%s); running without company keys", e)
-        signer = Signer.empty()
+        raise SystemExit(f"signer unavailable: {e}; the harness does not run without its keys") from e
+    if not signer.has("harness"):
+        raise SystemExit(f"{settings.signer_keyfile} has no 'harness' key; the log cannot be signed")
     chain = XeClient(settings.xe_node_url)
     events = EventLog(signer)
     return Context(settings=settings, config=config, signer=signer, chain=chain, events=events)

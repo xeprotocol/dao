@@ -39,9 +39,21 @@ class StateChainError(ValueError):
 
 
 def compact_json(value: Any) -> str:
-    """Compact JSON matching Go's encoder output for RawMessage: no spaces, HTML-escaped."""
+    """Compact JSON matching Go's encoder output for RawMessage: no spaces, HTML-escaped.
+
+    Go's encoder escapes `<`, `>`, `&` and the line separators U+2028 and U+2029 inside strings; the node
+    re-marshals op values on gossip and sync, so a value that differs from this form hashes one way on the
+    submitting node and another on every peer (XE-0465). This is the one form every op value takes."""
     s = json.dumps(value, separators=(",", ":"), ensure_ascii=False, sort_keys=False)
-    return s.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    return (s.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+             .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
+def canonical_value(raw: Any) -> str:
+    """The compact text for an op value given either as JSON text or as a parsed object."""
+    if isinstance(raw, str) and _looks_like_json(raw):
+        raw = json.loads(raw)
+    return compact_json(raw)
 
 
 @dataclass
@@ -60,12 +72,9 @@ class StateOp:
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> "StateOp":
-        raw = d.get("value")
-        if d["action"] == ACTION_SET:
-            # Preserve wire bytes when they were given as a string of JSON; re-compact otherwise.
-            value = raw if isinstance(raw, str) and _looks_like_json(raw) else compact_json(raw)
-        else:
-            value = None
+        # A value given as JSON text is parsed and re-compacted like any other, never kept as typed: pretty
+        # printing or a bare `<` in the text would otherwise be hashed here and compacted by the node (XE-0569).
+        value = canonical_value(d.get("value")) if d["action"] == ACTION_SET else None
         return cls(d["action"], d["key"], value)
 
     def to_json(self) -> dict[str, Any]:
@@ -86,9 +95,11 @@ class StateOp:
             if len(raw) > MAX_VALUE_SIZE:
                 raise StateChainError("value too large")
             try:
-                json.loads(self.value)
+                parsed = json.loads(self.value)
             except json.JSONDecodeError as e:
                 raise StateChainError("value is not valid JSON") from e
+            if self.value != compact_json(parsed):
+                raise StateChainError("value is not in compact form; build ops with StateOp.set or from_json")
         elif self.key.startswith("sys."):
             raise StateChainError("sys.* keys cannot be deleted")
 

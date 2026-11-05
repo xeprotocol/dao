@@ -91,6 +91,22 @@ def test_rate_limit_buckets_refill_and_forget():
     assert "k" not in b._b
 
 
+def test_rate_limit_classes_are_separate_and_the_address_pays_once(monkeypatch):
+    """XE-0478: inbox traffic from an address does not spend its votes, and a signed request costs the
+    address one token, not two."""
+    from dao import ratelimit
+    from dao.ratelimit import INBOX, VOTE, Buckets, enforce_account, enforce_ip
+    monkeypatch.setattr(ratelimit, "_buckets", Buckets())
+    req = SimpleNamespace(client=SimpleNamespace(host="203.0.113.9"))
+    for _ in range(INBOX.ip.burst):
+        enforce_ip(req, INBOX)
+    with pytest.raises(HTTPException):
+        enforce_ip(req, INBOX)
+    enforce_ip(req, VOTE)                                  # a different class, a different bucket
+    enforce_account(VOTE, "a" * 64)
+    assert ratelimit._buckets._b["ip:vote:203.0.113.9"][0] == VOTE.ip.burst - 1   # one token for the request
+
+
 def test_signed_request_rejects_stale_timestamp():
     kp = KeyPair.generate()
     ts = time.time_ns() - 3600 * 1_000_000_000
@@ -282,6 +298,29 @@ async def test_snapshot_does_not_count_a_receive_whose_send_is_after_it():
     assert a["balance"] == 0 and b["balance"] == 1000 and b["exists"] is True
     # an account the node does not know
     assert (await account_snapshot(chain, "C", T))["exists"] is False
+
+
+async def test_nothing_made_after_open_can_reach_the_snapshot():
+    """XE-0352: a transfer dated early on both sides passes the causal check, so the snapshot sits an hour
+    and a margin before the open, where no block made after the open can be dated."""
+    from dao.chainops import SNAPSHOT_LEAD_NS, TIMESTAMP_WINDOW_NS, account_snapshot, snapshot_time
+    opened = 100 * H
+    snap_at = snapshot_time(opened)
+    assert opened - snap_at == SNAPSHOT_LEAD_NS > TIMESTAMP_WINDOW_NS
+    # A watches the proposal open, then funds a fresh wallet B, dating both blocks as early as a node allows
+    made_at = opened + 60 * 10**9
+    earliest = made_at - TIMESTAMP_WINDOW_NS
+    a_recv = {"type": "receive", "asset": "XE", "balance": 1000, "timestamp": opened - 10 * H, "hash": "a1", "source": "ext"}
+    a_send = {"type": "send", "asset": "XE", "balance": 0, "timestamp": earliest, "hash": "a2", "destination": "B", "amount": 1000}
+    b_recv = {"type": "receive", "asset": "XE", "balance": 1000, "timestamp": earliest, "hash": "b1", "source": "a2"}
+    chain = _Lattice({"A": [a_recv, a_send], "B": [b_recv]}, {"ext": {"timestamp": opened - 11 * H}, "a2": a_send})
+    # at the open itself both blocks would count: B exists and A has moved its weight across
+    assert (await account_snapshot(chain, "B", opened))["exists"] is True
+    # at the snapshot the harness uses, neither block is visible: B does not exist and A still holds the XE
+    a = await account_snapshot(chain, "A", snap_at)
+    b = await account_snapshot(chain, "B", snap_at)
+    assert b["exists"] is False and b["balance"] == 0
+    assert a["exists"] is True and a["balance"] == 1000
 
 
 def test_request_bodies_over_the_limit_are_refused_before_parsing():

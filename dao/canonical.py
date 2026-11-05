@@ -11,7 +11,8 @@ from typing import Any
 
 # Domain tags. Each kind of signed payload gets its own tag so a signature can never be replayed
 # as a different kind of thing.
-DOMAIN_EVENT = b"xe-dao/event/v1\x00"
+DOMAIN_EVENT = b"xe-dao/event/v1\x00"      # rows written before the v2 envelope; `events.v` says which
+DOMAIN_EVENT_V2 = b"xe-dao/event/v2\x00"   # adds public and ref to the hashed body
 DOMAIN_PROPOSAL = b"xe-dao/proposal/v1\x00"
 DOMAIN_VOTE = b"xe-dao/vote/v1\x00"
 DOMAIN_MEMBER_ACTION = b"xe-dao/member-action/v1\x00"

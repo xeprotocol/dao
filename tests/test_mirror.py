@@ -58,6 +58,26 @@ def test_html_to_markdown_keeps_the_page_and_drops_the_chrome():
     assert "\n\n\n" not in md
 
 
+def test_user_text_stays_text_in_the_twin():
+    """XE-0507: what a page showed as characters cannot become markdown or HTML in the mirror."""
+    page = """<html><head><title>x --> y</title></head><body><main>
+<h1>A &lt;b&gt;title&lt;/b&gt; [here](http://evil)</h1>
+<p class="small">reason: ![img](https://t.example/p.gif) &lt;script&gt;alert(1)&lt;/script&gt; # not a heading</p>
+<pre>body
+```
+# not fenced out
+```</pre>
+</main></body></html>"""
+    md = html_to_markdown(page, "https://dao.test.network/proposals/abc")
+    assert md.startswith("<!-- x - -› y -->\n")                     # the title cannot close its own comment
+    assert "](http://evil)" not in md and "\\[here\\]" in md          # no links from user text
+    assert "![img]" not in md and "!\\[img\\]" in md                   # no images
+    assert "<script>" not in md and "\\<script\\>" in md               # no raw HTML
+    assert "\n# not a heading" not in md
+    # the body's own fence cannot close the fence around it
+    assert "\n````\nbody\n```\n# not fenced out\n```\n````\n" in md
+
+
 def test_llms_txt_is_public_register_and_points_at_markdown():
     cfg = load_config(ROOT / "config")
     text = build_llms_txt(cfg, "https://dao.test.network/", "testnet-0005", cfg.mode)

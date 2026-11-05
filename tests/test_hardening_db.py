@@ -69,6 +69,9 @@ class FakeSigner:
     def public_key(self, s):
         return self._kp[s].pub_key_hex
 
+    def keypair(self, s, _scope=None):
+        return self._kp[s]
+
     def sign(self, s, _scope, data):
         return self._kp[s].sign_hex(data)
 
@@ -182,9 +185,108 @@ async def test_settlement_refuses_fees_never_received(db, monkeypatch):
     assert await fees.settle_due(ctx, db) == 0
     assert not sent
     rows = (await db.execute(select(FeeLedger).order_by(FeeLedger.fee_block_hash))).scalars().all()
-    assert [r.state for r in rows] == ["unreceived", "unreceived"]
+    # the rows stay due with the reason on them, and are looked at again every pass; the event fires once
+    assert [r.state for r in rows] == ["due_refund", "due_burn"] and all(r.error == fees.UNRECEIVED_ERROR for r in rows)
+    assert await fees.settle_due(ctx, db) == 0
     kinds = (await db.execute(select(Event.kind))).scalars().all()
     assert kinds.count("fee.unreceived") == 2
+
+
+# ---- XE-0486 / XE-0488: fee writes are exactly-once and every receive is recorded as it lands ----
+
+def _fee_chain(blocks):
+    """A FakeChain whose fee account carries `blocks`."""
+    return FakeChain(chains={FEE_ACCT: blocks})
+
+
+async def test_settlement_is_marked_before_the_send_and_reconciled_after_a_crash(db, monkeypatch):
+    ctx = _ctx(_fee_chain([]))
+    seen: list[dict] = []
+
+    async def send(ctx_, key, scope, dest, amount, memo=""):
+        # what the database says at the moment the XE leaves: already `settling`, nonce committed, in the memo
+        sm = async_sessionmaker(db.bind, expire_on_commit=False)
+        async with sm() as other:
+            row = (await other.execute(select(FeeLedger))).scalar_one()
+            seen.append({"state": row.state, "memo": memo, "nonce": row.tx_hashes.get("settle_nonce")})
+        return SimpleNamespace(hash="5" * 64)
+
+    monkeypatch.setattr(fees.chainops, "send", send)
+    db.add(FeeLedger(fee_block_hash="1" * 64, proposal_hash="2" * 64, payer=AUTHOR, amount=1000, state="due_refund",
+                     tx_hashes={"receive": "9" * 64}))
+    await db.commit()
+    assert await fees.settle_due(ctx, db) == 1
+    assert seen[0]["state"] == "settling" and seen[0]["memo"].endswith(" " + seen[0]["nonce"])
+    row = (await db.execute(select(FeeLedger))).scalar_one()
+    assert row.state == "refunded" and row.tx_hashes == {"receive": "9" * 64, "refund": "5" * 64}
+
+    # a crash after the send and before the record: the row is `settling`, the block is on the chain
+    nonce = "deadbeef"
+    row.state, row.tx_hashes = "settling", {"receive": "9" * 64, "settle_as": "refund", "settle_nonce": nonce}
+    await db.commit()
+    ctx = _ctx(_fee_chain([{"type": "send", "memo": f"fee refund {'2' * 12} {nonce}", "hash": "6" * 64}]))
+    seen.clear()
+    assert await fees.settle_due(ctx, db) == 1
+    assert not seen, "a settlement already on the chain is never paid again"
+    row = (await db.execute(select(FeeLedger))).scalar_one()
+    assert row.state == "refunded" and row.tx_hashes["refund"] == "6" * 64
+    kinds = (await db.execute(select(Event.kind))).scalars().all()
+    assert kinds.count("fee.refunded") == 2
+
+    # a crash before the send: `settling` with no block on the chain goes back to due and is paid once, now
+    row.state, row.tx_hashes = "settling", {"receive": "9" * 64, "settle_as": "refund", "settle_nonce": "00000000"}
+    await db.commit()
+    ctx = _ctx(_fee_chain([]))
+    assert await fees.settle_due(ctx, db) == 1
+    row = (await db.execute(select(FeeLedger))).scalar_one()
+    assert len(seen) == 1 and seen[0]["nonce"] != "00000000" and row.state == "refunded"
+
+
+async def test_each_receive_is_committed_as_it_lands_and_a_bad_one_is_skipped(db, monkeypatch):
+    ctx = _ctx()
+    pending = [{"send_hash": h * 64, "source": AUTHOR, "destination": FEE_ACCT, "amount": 1000, "asset": "XE", "timestamp": 0}
+               for h in "123"]
+    for h in "123":
+        db.add(FeeLedger(fee_block_hash=h * 64, proposal_hash=h * 64, payer=AUTHOR, amount=1000, state="seen", tx_hashes={}))
+    await db.commit()
+
+    async def pending_for(_addr):
+        return pending
+
+    async def tip(_chain, _acct):
+        return "0", {"XE": 0}
+
+    async def submit(ctx_, b, kp):
+        if b.source == "2" * 64:
+            raise XeError(409, "node refused this one")
+        b.hash = "f" + b.source[1:]
+        return b
+
+    monkeypatch.setattr(ctx.chain, "pending_for", pending_for, raising=False)
+    monkeypatch.setattr(fees.chainops, "_tip", tip)
+    monkeypatch.setattr(fees.chainops, "submit_signed", submit)
+    assert await fees.receive_all(ctx, db) == 2
+    rows = {r.fee_block_hash[0]: r for r in (await db.execute(select(FeeLedger))).scalars().all()}
+    assert rows["1"].tx_hashes.get("receive") == "f" + "1" * 63
+    assert rows["3"].tx_hashes.get("receive") == "f" + "3" * 63, "the entry behind the failed one was still received"
+    assert "receive" not in rows["2"].tx_hashes
+
+
+async def test_a_due_fee_whose_receive_was_never_recorded_is_found_on_the_chain(db, monkeypatch):
+    recv = {"type": "receive", "source": "1" * 64, "hash": "8" * 64, "balance": 1000, "asset": "XE"}
+    ctx = _ctx(_fee_chain([recv]))
+
+    async def burn(ctx_, key, scope, amount, memo=""):
+        return SimpleNamespace(hash="7" * 64)
+
+    monkeypatch.setattr(fees.chainops, "burn", burn)
+    db.add(FeeLedger(fee_block_hash="1" * 64, proposal_hash="2" * 64, payer=AUTHOR, amount=1000, state="due_burn", tx_hashes={}))
+    await db.commit()
+    assert await fees.settle_due(ctx, db) == 1
+    row = (await db.execute(select(FeeLedger))).scalar_one()
+    assert row.state == "burned" and row.tx_hashes == {"receive": "8" * 64, "burn": "7" * 64}
+    kinds = (await db.execute(select(Event.kind))).scalars().all()
+    assert "fee.received" in kinds and "fee.unreceived" not in kinds
 
 
 # ---- XE-0032 / XE-0080: inbox receipt is private until read; bad bytes are refused --------------

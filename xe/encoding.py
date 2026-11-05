@@ -179,7 +179,10 @@ def marshal_block_canonical(b: Block) -> bytes:
     elif t in ("multisig_open", "multisig_update"):
         if not b.keyset:
             raise EncodingError(f"{t} requires keyset")
-        keys = sorted(b.keyset["keys"])
+        # The ledger lowercases hex before it sorts (normalizeBlockHex), so a mixed-case keyset must sort the
+        # same way here or the hash differs from the node's (XE-0474). Other hex fields decode to the same
+        # bytes whatever their case.
+        keys = sorted(k.lower() for k in b.keyset["keys"])
         buf += _u32(b.keyset["threshold"]) + _u32(len(keys))
         for k in keys:
             buf += _hex(k, "keyset key")

@@ -53,7 +53,7 @@ open_vote:
   fee_below_quorum: burn            # refund | burn
   quorum_wallets: 20                # participation count, not an XE amount
   participating_wallet:
-    min_balance_micro_xe: 1000000   # 1 XE at the open snapshot
+    min_balance_micro_xe: 1000000   # 1 XE at the snapshot (an hour before open)
     must_exist_before_open: true    # first block published before the proposal opened
     exclude_agent_accounts: true
   pass_mark_fraction: 0.5           # of XE weight cast, for vs against; abstain is recorded, not counted

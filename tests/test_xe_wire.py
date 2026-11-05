@@ -86,6 +86,33 @@ def test_statechain_dao_blocks_if_any(statechain):
 
 def test_compact_json_matches_go_rawmessage():
     assert compact_json({"a": "<b>&", "n": 1}) == '{"a":"\\u003cb\\u003e\\u0026","n":1}'
+    # XE-0465: Go also escapes the line separators; a raw one would hash one way here and another on peers
+    assert compact_json({"a": "x\u2028y\u2029z"}) == '{"a":"x\\u2028y\\u2029z"}'
+
+
+def test_op_values_given_as_text_are_canonicalised_and_validated():
+    """XE-0569: a value handed in as a JSON string is parsed and re-compacted, never kept as typed."""
+    from xe.statechain import StateChainError
+    pretty = '{\n  "entity": "XE <DAO>",\n  "n": 1\n}'
+    op = StateOp.from_json({"action": "set", "key": "dao.x", "value": pretty})
+    assert op.value == '{"entity":"XE \\u003cDAO\\u003e","n":1}'
+    op.validate()
+    assert StateOp.from_json({"action": "set", "key": "dao.x", "value": "x\u2028"}).value == '"x\\u2028"'
+    # an op built by hand with non-compact text is refused rather than hashed
+    with pytest.raises(StateChainError, match="compact"):
+        StateOp("set", "dao.x", pretty).validate()
+    # and the canonical form is a fixed point, so re-normalising stored ops changes nothing
+    assert StateOp.from_json({"action": "set", "key": "dao.x", "value": op.value}).value == op.value
+
+
+def test_keyset_keys_sort_case_insensitively_like_the_ledger():
+    """XE-0474: the node lowercases hex before sorting; the encoder must agree."""
+    from xe.encoding import marshal_block_canonical
+    lo = ["a" * 64, "b" * 64]
+    mixed = ["B" * 64, "a" * 64]  # raw sort puts "B" first; the ledger's lowercase sort puts "a" first
+    mk = lambda keys: Block(type="multisig_open", account="c" * 64, previous="0", balance=0, timestamp=1, asset="XE",
+                            keyset={"keys": keys, "threshold": 1})
+    assert marshal_block_canonical(mk(mixed)) == marshal_block_canonical(mk(lo))
 
 
 def test_build_block_on_tip(statechain):

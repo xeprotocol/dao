@@ -12,8 +12,8 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, TypeDecorator, UniqueConstraint,
-    func,
+    BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, Numeric, SmallInteger, String, Text, TypeDecorator,
+    UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -34,7 +34,8 @@ class U64(TypeDecorator):
 
 
 class Event(Base):
-    """Append-only, hash-chained. hash = sha256(canonical json of {index, ts, kind, actor, payload, prev_hash})."""
+    """Append-only, hash-chained. v2: hash covers {index, ts, kind, actor, payload, prev_hash, public, ref};
+    v1 rows (before the envelope change) hash the first six only."""
     __tablename__ = "events"
     index: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     ts: Mapped[int] = mapped_column(BigInteger, nullable=False)              # unix ns
@@ -47,6 +48,7 @@ class Event(Base):
     signature: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     ref: Mapped[str] = mapped_column(String(128), nullable=False, default="", index=True)  # proposal hash, session id, ...
+    v: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=2, server_default="1")  # hash envelope version
 
 
 class LogHead(Base):
@@ -148,7 +150,7 @@ class Vote(Base):
     reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
     timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)      # signer's ns timestamp
     signature: Mapped[str] = mapped_column(String(128), nullable=False)
-    weight: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)   # µXE at open snapshot
+    weight: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)   # µXE at the snapshot (an hour before open)
     participating: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_agent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     eligibility: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
@@ -161,8 +163,8 @@ class FeeLedger(Base):
     proposal_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     payer: Mapped[str] = mapped_column(String(64), nullable=False)
     amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    state: Mapped[str] = mapped_column(String(16), nullable=False, default="seen")  # seen | due_refund | due_burn | refunded | burned | unreceived
-    tx_hashes: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="seen")  # seen | due_refund | due_burn | settling | refunded | burned
+    tx_hashes: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)   # receive, refund|burn; settle_as + settle_nonce while settling
     error: Mapped[str] = mapped_column(Text, nullable=False, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
