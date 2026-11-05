@@ -70,7 +70,7 @@ def test_user_text_stays_text_in_the_twin():
 </main></body></html>"""
     md = html_to_markdown(page, "https://dao.test.network/proposals/abc")
     assert md.startswith("<!-- x - -› y -->\n")                     # the title cannot close its own comment
-    assert "](http://evil)" not in md and "\\[here\\]" in md          # no links from user text
+    assert "[here](http://evil)" not in md and "\\[here\\](http://evil)" in md   # brackets escaped: text, not a link
     assert "![img]" not in md and "!\\[img\\]" in md                   # no images
     assert "<script>" not in md and "\\<script\\>" in md               # no raw HTML
     assert "\n# not a heading" not in md
