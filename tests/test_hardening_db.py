@@ -344,8 +344,8 @@ async def test_http_inbox_stores_a_u64_nonce_and_accepts_real_pow(db):
     big.pow_nonce = 2**64 - 1
     m = await inbox.http_submit(ctx, db, big)
     await db.commit()
-    db.expire(m)
-    assert (await db.get(InboxMessage, m.id)).pow_nonce == 2**64 - 1
+    await db.refresh(m)                      # re-read from Postgres, not the identity map
+    assert m.pow_nonce == 2**64 - 1
     # a real proof of work over the real signing digest, at a difficulty that keeps the test quick
     ctx.node.chat_pow_difficulty = 0xFF00000000000000
     payload, ts = {"message": "real pow"}, time.time_ns()
@@ -467,7 +467,7 @@ async def test_rebuild_sign_and_submit_wait_for_the_timelock(db):
     ctx = _ctx()
 
     async def tip():
-        return {"index": 0, "hash": "0" * 64}
+        return {"index": 0, "hash": "0" * 64, "timestamp": 0}
 
     ctx.chain.statechain_tip = tip
     now = time.time_ns()
@@ -522,7 +522,7 @@ async def test_rebuild_counts_approvals_against_the_live_keyset(db):
     ctx = _ctx()
 
     async def tip():
-        return {"index": 0, "hash": "0" * 64}
+        return {"index": 0, "hash": "0" * 64, "timestamp": 0}
 
     ctx.chain.statechain_tip = tip
     s = SigningSession(id="s3", kind="parameter", title="R3", ops=[{"action": "set", "key": "dao.test", "value": "1"}],
