@@ -667,3 +667,41 @@ async def test_an_overpaid_fee_burns_the_fee_and_returns_the_rest(db, monkeypatc
     assert row.state == "burned" and row.tx_hashes["burn"] == "b" * 64 and row.tx_hashes["excess"] == "e" * 64
     kinds = (await db.execute(select(Event.kind))).scalars().all()
     assert kinds.count("fee.burned") == 1 and kinds.count("fee.excess_returned") == 1
+
+
+# ---- XE-0349: keyset rotation runs through a keyset session; nothing can jam at the deciding vote -----
+
+async def test_change_keyset_opens_a_keyset_session_and_bad_ops_are_refused_when_proposed(db):
+    from dao.services import resolutions
+    ctx = _ctx()
+    ctx.config.members = [SimpleNamespace(id="founder-a", is_member=True)]
+    ctx.config.windows = {}
+    k1, k2, k3 = (KeyPair.generate().pub_key_hex for _ in range(3))
+    good = [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2, k3], "threshold": 2}}]
+
+    def proposer(payload):
+        v = _v(payload=payload)
+        v.seat = SimpleNamespace(id="founder-a", is_member=True)
+        return v
+
+    async def refused(matter, ops, why):
+        with pytest.raises(HTTPException) as e:
+            await resolutions.propose(ctx, db, proposer({"title": "t", "body": "b", "matter": matter, "ops": ops}))
+        assert e.value.status_code == 400 and why in e.value.detail, e.value.detail
+
+    await refused("parameter", good, "dao.* keys")                                   # sys.* only through change_keyset
+    await refused("change_treasury_policy", [{"action": "set", "key": "sys.treasury_policy", "value": 1}], "dao.* keys")
+    await refused("change_keyset", [{"action": "set", "key": "dao.x", "value": 1}], "exactly one op")
+    await refused("change_keyset", good + [{"action": "set", "key": "dao.x", "value": 1}], "exactly one op")
+    await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k1], "threshold": 1}}], "distinct")
+    await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2], "threshold": 3}}], "threshold")
+    await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, "0" * 64], "threshold": 2}}], "usable")
+    await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2[:-1] + "G"], "threshold": 2}}], "hex")
+
+    r = await resolutions.propose(ctx, db, proposer({"title": "rotate", "body": "b", "matter": "change_keyset", "ops": good}))
+    await db.flush()
+    v = proposer({"resolution_id": r.id, "body_hash": resolutions.body_hash(r), "decision": "for"})
+    await resolutions.decide(ctx, db, r, v, "for")
+    assert r.status == "passed" and r.session_id
+    s = await sessions.get(db, r.session_id)
+    assert s.kind == "keyset" and s.ops[0]["key"] == "sys.dao_keyset" and s.required_approvals == 2

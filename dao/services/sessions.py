@@ -12,6 +12,8 @@ The harness holds no keyset key. It only assembles, counts, and submits.
 
 from __future__ import annotations
 
+import json
+import re
 import secrets
 import time
 
@@ -20,7 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.client import XeError
-from xe.keys import KeyError_, verify_hex_signature
+from xe.keys import KeyError_, is_valid_public_key, verify_hex_signature
 from xe.statechain import StateBlock, StateChainError, StateOp, build_block
 
 from ..auth import Verified
@@ -30,7 +32,48 @@ from ..models import SigningSession
 from . import pause
 
 KINDS = {"registry", "anchor", "parameter", "keyset"}
+KEYSET_KEY = "sys.dao_keyset"
+KEY_HEX_RE = re.compile(r"[0-9a-f]{64}")
+MAX_KEYSET = 16
 MAX_OPS = 32
+
+
+def check_ops(kind: str, ops: list[dict]) -> None:
+    """What a session of this kind may write. Every kind but `keyset` writes the harness's own `dao.*` keys.
+    A `keyset` session is the one route to a `sys.*` key and it is exactly one op: set `sys.dao_keyset` to
+    a well-formed keyset. The same check runs when a resolution is proposed, so nothing can pass a vote and
+    then be refused at execution (XE-0349)."""
+    parsed = _ops_from_json(ops)
+    for o in parsed:
+        o.validate()
+    if kind != "keyset":
+        for o in parsed:
+            if not o.key.startswith("dao."):
+                raise HTTPException(400, f"harness sessions may only write dao.* keys (got {o.key})")
+        return
+    if len(parsed) != 1 or parsed[0].action != "set" or parsed[0].key != KEYSET_KEY:
+        raise HTTPException(400, f"a keyset session is exactly one op: set {KEYSET_KEY}")
+    _check_keyset(json.loads(parsed[0].value))
+
+
+def _check_keyset(value) -> None:
+    """keys: 2..MAX_KEYSET distinct lowercase hex ed25519 public keys, each a usable point; threshold 1..len.
+    A key nobody can sign with, if the threshold needs it, would leave the chain with no valid signer
+    (XE-0694 on the node side; checked here before the block is ever built)."""
+    if not isinstance(value, dict) or set(value) != {"keys", "threshold"}:
+        raise HTTPException(400, "keyset value must be {keys: [...], threshold: n}")
+    keys, threshold = value["keys"], value["threshold"]
+    if not isinstance(keys, list) or not 2 <= len(keys) <= MAX_KEYSET:
+        raise HTTPException(400, f"keyset needs 2 to {MAX_KEYSET} keys")
+    if any(not isinstance(k, str) or not KEY_HEX_RE.fullmatch(k) for k in keys):
+        raise HTTPException(400, "every keyset key is 64 lowercase hex digits")
+    if len(set(keys)) != len(keys):
+        raise HTTPException(400, "keyset keys must be distinct")
+    for k in keys:
+        if not is_valid_public_key(bytes.fromhex(k)):
+            raise HTTPException(400, f"{k[:12]}… is not a usable ed25519 public key")
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or not 1 <= threshold <= len(keys):
+        raise HTTPException(400, "keyset threshold must be between 1 and the number of keys")
 
 
 def ops_digest(ops: list[dict]) -> str:
@@ -90,10 +133,7 @@ async def create(ctx: Context, db: AsyncSession, *, kind: str, title: str, ops: 
     if kind not in KINDS:
         raise HTTPException(400, f"unknown session kind {kind!r}")
     ops = normalise_ops(ops)
-    for o in _ops_from_json(ops):
-        o.validate()
-        if not o.key.startswith("dao.") and kind != "keyset":
-            raise HTTPException(400, f"harness sessions may only write dao.* keys (got {o.key})")
+    check_ops(kind, ops)
     ks = await live_keyset(ctx)
     s = SigningSession(id=secrets.token_hex(8), kind=kind, title=title, ops=ops, ops_digest=ops_digest(ops),
                        status="approving", approvals=[], required_approvals=ks["threshold"], block=None,

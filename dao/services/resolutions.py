@@ -56,6 +56,9 @@ async def propose(ctx: Context, db: AsyncSession, v: Verified) -> Resolution:
         raise HTTPException(400, f"unknown matter {matter!r}")
     if ops is not None:
         ops = sessions.normalise_ops(ops)
+        # Checked now against the session kind the matter will open, so a resolution that cannot execute is
+        # refused here and not at its deciding vote (XE-0349).
+        sessions.check_ops(session_kind(matter), ops)
     r = Resolution(id=secrets.token_hex(8), number=await _next_number(db), title=title, body=body, matter=matter,
                    ops=ops, proposed_by=v.seat.id, status="open", signatures=[],
                    related_proposal=clean_text(p.get("related_proposal"), "related_proposal", max_len=64, required=False))
@@ -65,6 +68,15 @@ async def propose(ctx: Context, db: AsyncSession, v: Verified) -> Resolution:
         "reserved": matter in RESERVED_MATTERS, "related_proposal": r.related_proposal,
     }, ref=f"resolution:{r.id}")
     return r
+
+
+def session_kind(matter: str) -> str:
+    """The signing session a passed resolution opens. `change_keyset` is the one matter that may write a
+    `sys.*` key, through a `keyset` session that accepts exactly `set sys.dao_keyset`; the chain then holds
+    the rotation block to the current keyset's threshold like any other, and the harness signs nothing."""
+    if matter == "change_keyset":
+        return "keyset"
+    return matter if matter in sessions.KINDS else "parameter"
 
 
 def body_hash(r: Resolution) -> str:
@@ -105,7 +117,7 @@ async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, dec
             "resolution_id": r.id, "number": r.number, "title": r.title, "matter": r.matter, "for": fors, "against": againsts,
         }, ref=f"resolution:{r.id}")
         if r.ops:
-            kind = r.matter if r.matter in sessions.KINDS else "parameter"
+            kind = session_kind(r.matter)
             w = ctx.config.windows
             timelock_h = int(w.get("upgrade_timelock_hours", 0) or 0) if w.get("upgrade_timelock_status") == "active" else 0
             not_before = time.time_ns() + timelock_h * 3600 * 1_000_000_000 if timelock_h else None

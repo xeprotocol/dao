@@ -36,6 +36,18 @@ def _hex32(value: str, what: str) -> bytes:
     return _hex(value, 32, what)
 
 
+def is_valid_public_key(pub: bytes) -> bool:
+    """A usable ed25519 public key: 32 bytes that decode to a canonical point on the main subgroup with no
+    small order (libsodium's check). Without that binding only the length is checked."""
+    if len(pub) != 32:
+        return False
+    try:
+        from nacl.bindings import crypto_core_ed25519_is_valid_point, has_crypto_core_ed25519
+    except ImportError:
+        return True
+    return crypto_core_ed25519_is_valid_point(pub) if has_crypto_core_ed25519 else True
+
+
 def derive_address(pub_key_hex: str) -> str:
     pub = _hex32(pub_key_hex, "public key")
     return hashlib.sha256(ACCOUNT_ADDRESS_DOMAIN + pub).hexdigest()
