@@ -144,7 +144,7 @@ All JSON, versioned at `/v1`, CORS open, rate-limited, no auth for reads. Paths 
 | `GET /v1/decisions` | all decisions across the three paths, with path, recommendation, decision, signatures, execution record | |
 | `GET /v1/log`, `/log/{index}`, `/log/head`, `/log/anchors` | the hash-chained event log, pageable, and its on-chain anchors | Verifiability |
 | `GET /v1/schedule/next` | upcoming scheduled reviews, windows closing, timers expiring | |
-| `GET /v1/health`, `/ready` | liveness; readiness (chain reachable, log consistent, signer up, last anchor age) | |
+| `GET /v1/health`, `/ready` | `/ready`: this process can reach its database. `/v1/health`: the last 10-minute check (chain reachable, tip advancing, keyset unchanged, log consistent, signer up, last anchor age, sessions ageing), each leg failing closed, and not ok once the last check is older than three cadences | |
 | `GET /v1/events` (SSE) | live stream of public events | |
 | `POST /v1/proposals` | signed proposal envelope with fee proof | |
 | `POST /v1/votes` | signed vote envelope | |

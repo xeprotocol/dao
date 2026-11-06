@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from dao.auth import MAX_SKEW_NS, Verified, claim_signature, purge_seen_signatures
 from dao.db import Base
 from dao.log import EventLog
-from dao.models import Event, FeeLedger, HealthCheck, InboxMessage, Proposal, SeenSignature, SigningSession, Vote
+from dao.models import Anchor, Event, FeeLedger, HealthCheck, InboxMessage, Proposal, SeenSignature, SigningSession, Vote
 from dao.services import fees, inbox, portal, sessions
 from dao.signer import Signer
 from xe.client import XeError
@@ -741,53 +741,79 @@ async def test_member_rebuild_is_refused_at_an_unchanged_tip_so_signatures_stand
     assert s.block_hash != h and s.block_signatures == [] and s.rebuilds == 1
 
 
-# ---- XE-0891: the health check watches the keyset, the log, the tip and ageing sessions -----------
+# ---- XE-0891/0907/0908: the health check watches keyset, log, tip, anchor, sessions; fails closed; goes stale
 
-async def test_health_degrades_on_unmatched_keyset_change_log_tamper_frozen_tip_and_reports_aging(db):
-    from datetime import datetime, timedelta, timezone
-    from dao.services import records
+def _health_ctx():
     ctx = _ctx()
     ctx.settings = SimpleNamespace(xe_node_url="http://node")
     ctx.node.network_id = "testnet-x"
+    ctx.config.cadence = {"health_check_minutes": 10}
     state = {"ready": True, "tip": {"index": 5, "hash": "5" * 64, "timestamp": time.time_ns()},
-             "keyset": {"keys": ["k1", "k2", "k3"], "threshold": 2}}
+             "keyset": {"keys": ["k1", "k2", "k3"], "threshold": 2}, "fail": set()}
 
     async def ready():
+        if "ready" in state["fail"]:
+            raise XeError(500, "boom")
         return state["ready"], {"status": "ready"}
 
     async def tip():
+        if "tip" in state["fail"]:
+            raise XeError(500, "boom")
         return dict(state["tip"])
 
     async def keyset():
+        if "keyset" in state["fail"]:
+            raise XeError(500, "boom")
         return dict(state["keyset"])
 
     async def directory(_addr):
         return None
 
     ctx.chain.ready, ctx.chain.statechain_tip, ctx.chain.dao_keyset, ctx.chain.directory = ready, tip, keyset, directory
+    return ctx, state
+
+
+async def _check(ctx, db):
+    from dao.services import records
+    EventLog._verify_cache = None
+    d = await records.health(ctx, db, record=True)
+    await db.commit()
+    return d
+
+
+async def test_health_degrades_on_unmatched_keyset_change_log_tamper_frozen_tip_and_reports_aging(db):
+    from datetime import datetime, timedelta, timezone
+    from dao.services import records
+    ctx, state = _health_ctx()
     await ctx.events.append(db, "x", "harness", {}, public=True)
     await db.commit()
 
-    async def check():
-        EventLog._verify_cache = None
-        d = await records.health(ctx, db, record=True)
-        await db.commit()
-        return d
-
-    d = await check()
+    d = await _check(ctx, db)
     assert d["ok"] and d["keyset"] == {"keys": ["k1", "k2", "k3"], "threshold": 2} and d["log_verified"]
-    assert d["sessions_aging"] == [] and "keyset_changed" not in d
-    # unchanged keyset on the next run: nothing to say
-    d = await check()
+    assert d["sessions_aging"] == [] and "keyset_changed" not in d and d["last_anchor"] is None and "errors" not in d
+    d = await _check(ctx, db)
     assert d["ok"] and "keyset_changed" not in d
-    # the keyset changes with no keyset session of ours behind it: incident
+    # the keyset changes with no keyset session of ours behind it: an incident, and it stays one
     state["keyset"] = {"keys": ["K9", "k2", "k3"], "threshold": 3}
-    d = await check()
-    assert not d["ok"] and d["keyset_changed"]["to"]["threshold"] == 3 and d["keyset_changed"]["matches_session"] is False
+    d = await _check(ctx, db)
+    assert not d["ok"] and d["keyset_changed"]["matches_session"] is False and d["keyset_unmatched"]["to"]["threshold"] == 3
     assert (await db.execute(select(Event).where(Event.kind == "keyset.changed"))).scalars().first() is not None
-    # the run after that is clean again (alert once, not every ten minutes)
-    d = await check()
-    assert d["ok"] and "keyset_changed" not in d
+    d = await _check(ctx, db)
+    assert not d["ok"] and d["keyset_unmatched"] and "keyset_changed" not in d
+    # a keyset fetch fault does not clear it, and the keyset last seen is carried forward
+    state["fail"].add("keyset")
+    d = await _check(ctx, db)
+    assert not d["ok"] and d["keyset_unmatched"] and d["keyset"]["threshold"] == 3 and d["errors"] == ["keyset_error"]
+    state["fail"].discard("keyset")
+    # a keyset session the members signed that writes this keyset acknowledges it
+    db.add(SigningSession(id="ks0", kind="keyset", title="ack", status="submitted", ops_digest="0" * 64,
+                          ops=[{"action": "set", "key": "sys.dao_keyset",
+                                "value": '{"keys":["k9","k2","k3"],"threshold":3}'}],
+                          approvals=[], required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0))
+    await db.flush()
+    d = await _check(ctx, db)
+    assert d["ok"] and "keyset_unmatched" not in d
+    assert (await db.execute(select(Event).where(Event.kind == "keyset.acknowledged"))).scalars().first() is not None
     # a change that a submitted keyset session wrote is recorded, not an incident
     db.add(SigningSession(id="ks1", kind="keyset", title="rotate", status="submitted", ops_digest="a" * 64,
                           ops=[{"action": "set", "key": "sys.dao_keyset",
@@ -795,28 +821,53 @@ async def test_health_degrades_on_unmatched_keyset_change_log_tamper_frozen_tip_
                           approvals=[], required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0))
     await db.flush()
     state["keyset"] = {"keys": ["k3", "k2"], "threshold": 2}
-    d = await check()
+    d = await _check(ctx, db)
     assert d["ok"] and d["keyset_changed"]["matches_session"] is True
+    # a reverted change clears too
+    state["keyset"] = {"keys": ["zz", "k2"], "threshold": 2}
+    assert not (await _check(ctx, db))["ok"]
+    state["keyset"] = {"keys": ["k3", "k2"], "threshold": 2}
+    assert (await _check(ctx, db))["ok"]
     # a tampered event fails the replay
     ev = (await db.execute(select(Event).where(Event.index == 0))).scalar_one()
     original = ev.payload
     ev.payload = {"tampered": True}
     await db.flush()
-    d = await check()
+    d = await _check(ctx, db)
     assert not d["ok"] and d["log_verified"] is False and d["log_first_error"]
     ev.payload = original
     await db.flush()
-    # a frozen tip: the same hash for longer than the allowance degrades; a new hash clears it
-    d = await check()
+    # a frozen tip: the same hash for longer than the allowance degrades, survives a tip fetch fault, clears on a new hash
+    d = await _check(ctx, db)
     assert d["ok"]
     row = (await db.execute(select(HealthCheck).order_by(HealthCheck.ts.desc()).limit(1))).scalar_one()
     row.detail = {**row.detail, "tip_unchanged_since": time.time_ns() - (records.TIP_FROZEN_S + 60) * 1_000_000_000}
     await db.flush()
-    d = await check()
+    d = await _check(ctx, db)
     assert not d["ok"] and d["tip_frozen"]
+    state["fail"].add("tip")
+    d = await _check(ctx, db)
+    assert not d["ok"] and d["tip_frozen"] and d["errors"] == ["statechain_error"] and d["statechain_tip"]["hash"] == "5" * 64
+    state["fail"].discard("tip")
     state["tip"] = {"index": 6, "hash": "6" * 64, "timestamp": time.time_ns()}
-    d = await check()
+    d = await _check(ctx, db)
     assert d["ok"] and "tip_frozen" not in d
+    # every fetch fault fails closed (XE-0907)
+    for leg, err in (("ready", "node_error"), ("tip", "statechain_error"), ("keyset", "keyset_error")):
+        state["fail"] = {leg}
+        d = await _check(ctx, db)
+        assert not d["ok"] and d["errors"] == [err], (leg, d)
+    state["fail"] = set()
+    assert (await _check(ctx, db))["ok"]
+    # an anchor older than the allowance degrades
+    db.add(Anchor(n=1, event_index=0, head_hash="h" * 64, session_id="a1",
+                  created_at=datetime.now(timezone.utc) - timedelta(seconds=records.ANCHOR_OVERDUE_S + 60)))
+    await db.flush()
+    d = await _check(ctx, db)
+    assert not d["ok"] and d["anchor_overdue"] and d["last_anchor"]["n"] == 1
+    db.add(Anchor(n=2, event_index=1, head_hash="i" * 64, session_id="a2"))
+    await db.flush()
+    assert (await _check(ctx, db))["ok"]
     # a session approving for longer than a day is reported
     old = SigningSession(id="old1", kind="parameter", title="R", ops=[{"action": "set", "key": "dao.t", "value": "1"}],
                          ops_digest="b" * 64, status="signing", approvals=[], required_approvals=2, block=None,
@@ -824,5 +875,24 @@ async def test_health_degrades_on_unmatched_keyset_change_log_tamper_frozen_tip_
                          created_at=datetime.now(timezone.utc) - timedelta(days=30))
     db.add(old)
     await db.flush()
-    d = await check()
+    d = await _check(ctx, db)
     assert d["ok"] and d["sessions_aging"] == [{"id": "old1", "kind": "parameter", "status": "signing", "signatures": 1, "required": 2}]
+
+
+async def test_health_endpoint_goes_stale_when_the_worker_stops_and_uptime_counts_missing_checks(db):
+    from dao.services import records
+    ctx, state = _health_ctx()
+    assert records.health_is_stale(ctx, None)
+    d = await _check(ctx, db)
+    assert not records.health_is_stale(ctx, d) and records.health_age_s(d) == 0
+    up = await records.uptime_30d(ctx, db)
+    assert up["checks"] == 1 and up["expected"] == 1 and up["fraction"] == 1.0
+    # the worker stops: the last row is ok, the endpoint is not
+    row = (await db.execute(select(HealthCheck).order_by(HealthCheck.ts.desc()).limit(1))).scalar_one()
+    row.ts = time.time_ns() - 48 * 3600 * 1_000_000_000
+    row.detail = {**row.detail, "ts": row.ts}
+    await db.flush()
+    last = await records.last_health(db)
+    assert last["ok"] and records.health_is_stale(ctx, last) and records.health_age_s(last) >= 48 * 3600
+    up = await records.uptime_30d(ctx, db)
+    assert up["checks"] == 1 and up["expected"] == 48 * 6 and up["fraction"] < 0.01

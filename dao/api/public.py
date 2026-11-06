@@ -311,8 +311,13 @@ async def schedule_next(ctx: Ctx, db: Db):
 
 @router.get("/health")
 async def health(ctx: Ctx, db: Db):
+    """The last recorded check, and whether it is recent enough to mean anything: a check older than a few
+    cadences says the worker is not running, which is not ok whatever the row says (XE-0908)."""
     last = await records.last_health(db)
-    return {"ok": bool(last and last.get("ok")), "last_check": last, "uptime_30d": await records.uptime_30d(db),
+    stale = records.health_is_stale(ctx, last)
+    return {"ok": bool(last and last.get("ok")) and not stale, "stale": stale,
+            "last_check_age_s": records.health_age_s(last), "cadence_s": records.cadence_s(ctx),
+            "last_check": last, "uptime_30d": await records.uptime_30d(ctx, db),
             "paused": await pause_svc.is_paused(db)}
 
 

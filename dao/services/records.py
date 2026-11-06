@@ -125,6 +125,13 @@ async def snapshot_treasury(ctx: Context, db: AsyncSession) -> TreasurySnapshot:
 
 TIP_FROZEN_S = 6 * 3600       # tip unchanged across checks for this long degrades health
 SESSION_AGING_S = 24 * 3600   # a session approving/signing for longer than this is reported
+ANCHOR_OVERDUE_S = 14 * 86400  # weekly anchor; twice the cadence without one degrades
+STALE_CHECKS = 3               # /v1/health is stale (and not ok) after this many missed cadences
+WINDOW_30D_NS = 30 * 86400 * 1_000_000_000
+
+
+def cadence_s(ctx: Context) -> int:
+    return int(ctx.config.cadence.get("health_check_minutes", 10)) * 60
 
 
 def _keyset_shape(ks: dict | None) -> dict | None:
@@ -148,22 +155,33 @@ async def _keyset_session_matches(db: AsyncSession, live: dict) -> bool:
 
 
 async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
-    """The 10-minute check (BRIEF §9): chain reachable, tip advancing, keyset unchanged, log consistent,
-    pending signatures aging. Each leg writes to `detail`; the ones that mean something is wrong flip `ok`,
-    which is what the worker posts as `health.degraded` (XE-0891)."""
+    """The 10-minute check (BRIEF §8/§9): chain reachable, tip advancing, keyset unchanged, log consistent,
+    signer up, last anchor age, pending signatures aging. Rules, so that the check cannot be quietly blind:
+
+    - every leg fails closed: a leg that cannot fetch what it watches records `<leg>_error` and `ok` is false;
+    - what a leg last saw is carried forward from the previous check while it cannot see (the keyset it is
+      comparing against, the moment the tip last changed), so a transient fault neither hides a change nor
+      resets a clock;
+    - a keyset change that no submitted keyset session of ours wrote is an incident (BRIEF §13) and stays
+      `ok: false` on every check until the live keyset returns to what it was or a keyset session the
+      members approve and sign writes it (a no-op rotation is the acknowledgement);
+    - the worker posts `health.degraded` whenever `ok` is false (XE-0891, XE-0907)."""
     detail: dict = {"node_url": ctx.settings.xe_node_url, "network_id": ctx.node.network_id}
     ok = True
     now = time.time_ns()
-    prev = await last_health(db)
+    prev = await last_health(db) or {}
+
+    # chain reachable
     try:
         ready, body = await ctx.chain.ready()
         detail["node_ready"] = ready
         detail["node"] = body if isinstance(body, dict) else {"body": str(body)[:200]}
-        ok = ok and ready
+        ok = ok and bool(ready)
     except Exception as e:
         detail["node_ready"] = False
         detail["node_error"] = str(e)[:300]
-        ok = False
+
+    # tip advancing
     try:
         tip = await ctx.chain.statechain_tip()
         detail["statechain_tip"] = {"index": tip.get("index"), "hash": tip.get("hash"), "timestamp": tip.get("timestamp")}
@@ -171,27 +189,43 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
         detail["statechain_tip_age_s"] = round(age_s)
         if age_s > 3600:
             detail["warning"] = "state chain tip is over an hour old"
-        # tip advancing: carry forward the moment the tip hash was last seen to change
-        prev_tip = (prev or {}).get("statechain_tip") or {}
-        since = (prev or {}).get("tip_unchanged_since") if prev_tip.get("hash") == tip.get("hash") else None
+        prev_tip = prev.get("statechain_tip") or {}
+        since = prev.get("tip_unchanged_since") if prev_tip.get("hash") == tip.get("hash") else None
         detail["tip_unchanged_since"] = since or now
-        if (now - detail["tip_unchanged_since"]) / 1e9 > TIP_FROZEN_S:
-            detail["tip_frozen"] = True
-            ok = False
     except Exception as e:
         detail["statechain_error"] = str(e)[:300]
+        if prev.get("statechain_tip"):
+            detail["statechain_tip"], detail["tip_unchanged_since"] = prev["statechain_tip"], prev.get("tip_unchanged_since", now)
+    if detail.get("tip_unchanged_since") and (now - detail["tip_unchanged_since"]) / 1e9 > TIP_FROZEN_S:
+        detail["tip_frozen"] = True
+        ok = False
+
+    # keyset unchanged
+    unmatched = prev.get("keyset_unmatched")
     try:
         ks = _keyset_shape(await ctx.chain.dao_keyset())
+        if ks is None:
+            raise ValueError("node returned no keyset")
         detail["keyset"] = ks
-        prev_ks = (prev or {}).get("keyset")
-        if ks and prev_ks and ks != prev_ks:
+        prev_ks = prev.get("keyset")
+        if prev_ks and ks != prev_ks:
             matched = await _keyset_session_matches(db, ks)
             detail["keyset_changed"] = {"from": prev_ks, "to": ks, "matches_session": matched}
             await ctx.events.append(db, "keyset.changed", "harness", {**detail["keyset_changed"]}, public=True)
             if not matched:
-                ok = False   # BRIEF §13: a keyset change with no resolution behind it is an incident
+                unmatched = {"from": prev_ks, "to": ks, "at": now}
+        if unmatched and (ks == unmatched.get("from") or await _keyset_session_matches(db, ks)):
+            await ctx.events.append(db, "keyset.acknowledged", "harness", {"keyset": ks, "incident": unmatched}, public=True)
+            unmatched = None
     except Exception as e:
         detail["keyset_error"] = str(e)[:300]
+        if prev.get("keyset"):
+            detail["keyset"] = prev["keyset"]
+    if unmatched:
+        detail["keyset_unmatched"] = unmatched
+        ok = False
+
+    # log consistent
     try:
         head = await EventLog.head(db)
         detail["log_head"] = {"index": head.index, "hash": head.hash}
@@ -202,7 +236,27 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
             ok = False
     except Exception as e:
         detail["log_error"] = str(e)[:300]
-        ok = False
+
+    # signer up
+    detail["signer_keys"] = [k.name for k in ctx.signer.infos()]
+    if not ctx.signer.has("harness"):
+        detail["signer_error"] = "no harness key: events cannot be signed"
+
+    # last anchor age
+    try:
+        a = await latest_anchor(db)
+        if a is not None and a.created_at is not None:
+            age = round(now / 1e9 - a.created_at.timestamp())
+            detail["last_anchor"] = {"n": a.n, "age_s": age}
+            if age > ANCHOR_OVERDUE_S:
+                detail["anchor_overdue"] = True
+                ok = False
+        else:
+            detail["last_anchor"] = None
+    except Exception as e:
+        detail["anchor_error"] = str(e)[:300]
+
+    # pending signatures aging
     try:
         cutoff = datetime.fromtimestamp((now - SESSION_AGING_S * 1_000_000_000) / 1e9, tz=timezone.utc)
         aging = (await db.execute(select(SigningSession).where(SigningSession.status.in_(("approving", "signing")),
@@ -212,6 +266,8 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
                                     for s in aging]
     except Exception as e:
         detail["sessions_error"] = str(e)[:300]
+
+    # directory
     dao_addr = ctx.signer.address("dao") if ctx.signer.has("dao") else ""
     if dao_addr:
         try:
@@ -219,12 +275,28 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
             detail["directory_registered"] = d is not None
         except Exception as e:
             detail["directory_error"] = str(e)[:300]
-    detail["signer_keys"] = [k.name for k in ctx.signer.infos()]
+
+    errors = sorted(k for k in detail if k.endswith("_error"))
+    if errors:
+        detail["errors"] = errors
+        ok = False
     detail["ok"] = ok
-    detail["ts"] = time.time_ns()
+    detail["ts"] = now
     if record:
-        db.add(HealthCheck(ts=detail["ts"], ok=ok, detail=detail))
+        db.add(HealthCheck(ts=now, ok=ok, detail=detail))
     return detail
+
+
+def health_age_s(last: dict | None, now_ns: int | None = None) -> int | None:
+    if not last or not last.get("ts"):
+        return None
+    return round(((now_ns or time.time_ns()) - int(last["ts"])) / 1e9)
+
+
+def health_is_stale(ctx: Context, last: dict | None, now_ns: int | None = None) -> bool:
+    """A check older than STALE_CHECKS cadences means the worker is not running; it is not ok (XE-0908)."""
+    age = health_age_s(last, now_ns)
+    return age is None or age > STALE_CHECKS * cadence_s(ctx)
 
 
 async def last_health(db: AsyncSession) -> dict | None:
@@ -232,8 +304,16 @@ async def last_health(db: AsyncSession) -> dict | None:
     return row.detail if row else None
 
 
-async def uptime_30d(db: AsyncSession) -> dict:
-    since = time.time_ns() - 30 * 24 * 3600 * 1_000_000_000
+async def uptime_30d(ctx: Context, db: AsyncSession) -> dict:
+    """Checks that should have run but did not count as failures, so a stopped worker lowers the figure
+    instead of freezing it (XE-0908)."""
+    now = time.time_ns()
+    since = now - WINDOW_30D_NS
     total = int((await db.execute(select(func.count()).select_from(HealthCheck).where(HealthCheck.ts >= since))).scalar_one())
     good = int((await db.execute(select(func.count()).select_from(HealthCheck).where(HealthCheck.ts >= since, HealthCheck.ok.is_(True)))).scalar_one())
-    return {"checks": total, "ok": good, "fraction": (good / total) if total else None}
+    first = (await db.execute(select(func.min(HealthCheck.ts)))).scalar_one()
+    if first is None:
+        return {"checks": 0, "ok": 0, "expected": 0, "fraction": None}
+    window_s = min(WINDOW_30D_NS, now - int(first)) / 1e9
+    expected = max(total, int(window_s // cadence_s(ctx)))
+    return {"checks": total, "ok": good, "expected": expected, "fraction": (good / expected) if expected else None}

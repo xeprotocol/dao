@@ -167,7 +167,8 @@ class Worker:
             h = await records.last_health(db)
             await self.ctx.events.append(db, "note.daily", "harness", {
                 "date": datetime.now(timezone.utc).date().isoformat(), "log_head": {"index": head.index, "hash": head.hash},
-                "proposals": counts, "treasury": snap.balances, "health_ok": bool(h and h.get("ok")),
+                "proposals": counts, "treasury": snap.balances,
+                "health_ok": bool(h and h.get("ok")) and not records.health_is_stale(self.ctx, h),
                 "paused": await pause.is_paused(db), "network_id": self.ctx.node.network_id,
             })
             await mark_run(db, "daily")
@@ -175,7 +176,7 @@ class Worker:
 
     async def job_weekly(self):
         async with session() as db:
-            up = await records.uptime_30d(db)
+            up = await records.uptime_30d(self.ctx, db)
             open_sessions = await sessions.list_sessions(db, "signing")
             approving = await sessions.list_sessions(db, "approving")
             await self.ctx.events.append(db, "note.weekly", "harness", {
@@ -203,7 +204,7 @@ class Worker:
         async with session() as db:
             await self.ctx.events.append(db, "note.monthly", "harness", {
                 "month": datetime.now(timezone.utc).strftime("%Y-%m"), "proposals": await portal.counts(db),
-                "uptime_30d": await records.uptime_30d(db), "anchors": await records.anchors(db, 6),
+                "uptime_30d": await records.uptime_30d(self.ctx, db), "anchors": await records.anchors(db, 6),
             })
             await mark_run(db, "monthly")
             await db.commit()
