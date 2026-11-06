@@ -741,7 +741,7 @@ async def test_member_rebuild_is_refused_at_an_unchanged_tip_so_signatures_stand
     assert s.block_hash != h and s.block_signatures == [] and s.rebuilds == 1
 
 
-# ---- XE-0891/0907/0908: the health check watches keyset, log, tip, anchor, sessions; fails closed; goes stale
+# ---- XE-0891/0907/0908: health compares against the chain's timestamps and the members' records; fails closed; goes stale
 
 def _health_ctx():
     ctx = _ctx()
@@ -781,7 +781,7 @@ async def _check(ctx, db):
     return d
 
 
-async def test_health_degrades_on_unmatched_keyset_change_log_tamper_frozen_tip_and_reports_aging(db):
+async def test_health_degrades_on_unexpected_keyset_log_tamper_stale_tip_faults_anchor_and_reports_aging(db):
     from datetime import datetime, timedelta, timezone
     from dao.services import records
     ctx, state = _health_ctx()
@@ -790,42 +790,28 @@ async def test_health_degrades_on_unmatched_keyset_change_log_tamper_frozen_tip_
 
     d = await _check(ctx, db)
     assert d["ok"] and d["keyset"] == {"keys": ["k1", "k2", "k3"], "threshold": 2} and d["log_verified"]
-    assert d["sessions_aging"] == [] and "keyset_changed" not in d and d["last_anchor"] is None and "errors" not in d
-    d = await _check(ctx, db)
-    assert d["ok"] and "keyset_changed" not in d
-    # the keyset changes with no keyset session of ours behind it: an incident, and it stays one
+    assert d["sessions_aging"] == [] and d["last_anchor"] is None and "errors" not in d
+    # the keyset changes with no keyset session of ours behind it: not ok, on every check, until it is written back
     state["keyset"] = {"keys": ["K9", "k2", "k3"], "threshold": 3}
     d = await _check(ctx, db)
-    assert not d["ok"] and d["keyset_changed"]["matches_session"] is False and d["keyset_unmatched"]["to"]["threshold"] == 3
+    assert not d["ok"] and d["keyset_unexpected"]["expected"]["threshold"] == 2 and d["keyset_unexpected"]["live"]["threshold"] == 3
     assert (await db.execute(select(Event).where(Event.kind == "keyset.changed"))).scalars().first() is not None
-    d = await _check(ctx, db)
-    assert not d["ok"] and d["keyset_unmatched"] and "keyset_changed" not in d
-    # a keyset fetch fault does not clear it, and the keyset last seen is carried forward
+    assert not (await _check(ctx, db))["ok"]
+    # a keyset fetch fault fails closed on its own
     state["fail"].add("keyset")
     d = await _check(ctx, db)
-    assert not d["ok"] and d["keyset_unmatched"] and d["keyset"]["threshold"] == 3 and d["errors"] == ["keyset_error"]
+    assert not d["ok"] and d["errors"] == ["keyset_error"] and "keyset" not in d
     state["fail"].discard("keyset")
-    # a keyset session the members signed that writes this keyset acknowledges it
-    db.add(SigningSession(id="ks0", kind="keyset", title="ack", status="submitted", ops_digest="0" * 64,
-                          ops=[{"action": "set", "key": "sys.dao_keyset",
-                                "value": '{"keys":["k9","k2","k3"],"threshold":3}'}],
-                          approvals=[], required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0))
-    await db.flush()
-    d = await _check(ctx, db)
-    assert d["ok"] and "keyset_unmatched" not in d
-    assert (await db.execute(select(Event).where(Event.kind == "keyset.acknowledged"))).scalars().first() is not None
-    # a change that a submitted keyset session wrote is recorded, not an incident
+    # reverting clears it
+    state["keyset"] = {"keys": ["k3", "k2", "k1"], "threshold": 2}
+    assert (await _check(ctx, db))["ok"]
+    # a keyset the members wrote through a keyset session is the expected one from then on
     db.add(SigningSession(id="ks1", kind="keyset", title="rotate", status="submitted", ops_digest="a" * 64,
                           ops=[{"action": "set", "key": "sys.dao_keyset",
                                 "value": '{"keys":["k2","k3"],"threshold":2}'}],
                           approvals=[], required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0))
     await db.flush()
-    state["keyset"] = {"keys": ["k3", "k2"], "threshold": 2}
-    d = await _check(ctx, db)
-    assert d["ok"] and d["keyset_changed"]["matches_session"] is True
-    # a reverted change clears too
-    state["keyset"] = {"keys": ["zz", "k2"], "threshold": 2}
-    assert not (await _check(ctx, db))["ok"]
+    assert not (await _check(ctx, db))["ok"]          # session submitted, chain not yet showing it
     state["keyset"] = {"keys": ["k3", "k2"], "threshold": 2}
     assert (await _check(ctx, db))["ok"]
     # a tampered event fails the replay
@@ -837,21 +823,13 @@ async def test_health_degrades_on_unmatched_keyset_change_log_tamper_frozen_tip_
     assert not d["ok"] and d["log_verified"] is False and d["log_first_error"]
     ev.payload = original
     await db.flush()
-    # a frozen tip: the same hash for longer than the allowance degrades, survives a tip fetch fault, clears on a new hash
+    assert (await _check(ctx, db))["ok"]
+    # a tip older than the allowance is a chain that is not advancing
+    state["tip"]["timestamp"] = time.time_ns() - (records.TIP_STALE_S + 60) * 1_000_000_000
     d = await _check(ctx, db)
-    assert d["ok"]
-    row = (await db.execute(select(HealthCheck).order_by(HealthCheck.ts.desc()).limit(1))).scalar_one()
-    row.detail = {**row.detail, "tip_unchanged_since": time.time_ns() - (records.TIP_FROZEN_S + 60) * 1_000_000_000}
-    await db.flush()
-    d = await _check(ctx, db)
-    assert not d["ok"] and d["tip_frozen"]
-    state["fail"].add("tip")
-    d = await _check(ctx, db)
-    assert not d["ok"] and d["tip_frozen"] and d["errors"] == ["statechain_error"] and d["statechain_tip"]["hash"] == "5" * 64
-    state["fail"].discard("tip")
-    state["tip"] = {"index": 6, "hash": "6" * 64, "timestamp": time.time_ns()}
-    d = await _check(ctx, db)
-    assert d["ok"] and "tip_frozen" not in d
+    assert not d["ok"] and d["tip_stale"]
+    state["tip"]["timestamp"] = time.time_ns()
+    assert (await _check(ctx, db))["ok"]
     # every fetch fault fails closed (XE-0907)
     for leg, err in (("ready", "node_error"), ("tip", "statechain_error"), ("keyset", "keyset_error")):
         state["fail"] = {leg}
