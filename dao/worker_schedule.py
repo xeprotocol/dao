@@ -40,7 +40,7 @@ def job_table(ctx: Context) -> dict[str, dict]:
     c = ctx.config.cadence
     now = datetime.now(timezone.utc)
     return {
-        "health": {"every_s": int(c.get("health_check_minutes", 10)) * 60, "desc": "node, state-chain tip, log head, directory"},
+        "health": {"every_s": int(c.get("health_check_minutes", 10)) * 60, "desc": "node reachable, tip advancing, keyset unchanged, log replays, sessions ageing, directory"},
         "directory": {"every_s": int(c.get("directory_reregister_minutes", 20)) * 60, "desc": "re-register the DAO account in the node directory"},
         "fees": {"every_s": 60, "desc": "receive pending fees; refund or burn settled ones"},
         "outbox": {"every_s": 30, "desc": "send queued replies over chat"},

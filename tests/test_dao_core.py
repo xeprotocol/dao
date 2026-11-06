@@ -78,6 +78,23 @@ def test_clean_text_rejects_control_characters_everywhere():
     assert scrub("a\x00b\nc") == "a\ufffdb\nc"
 
 
+def test_clean_text_rejects_lone_surrogates_before_the_driver_sees_them():
+    """XE-0878: a JSON `\\ud800` escape decodes to a lone surrogate, which is not UTF-8 and fails at asyncpg.
+    It is refused with the same 400 as a control character, including on the byte-bounded path, whose own
+    encode would otherwise raise first."""
+    import json
+    from dao.text import clean_text, has_bad_control, scrub
+    s = json.loads('"a\\ud800b"')
+    assert has_bad_control(s)
+    for kwargs in ({}, {"max_bytes": 100}):
+        with pytest.raises(HTTPException) as e:
+            clean_text(s, "reason", max_len=100, **kwargs)
+        assert e.value.status_code == 400 and "reason" in e.value.detail
+    assert clean_text("emoji \U0001f600 and \u2028 pass", "message", max_len=100, max_bytes=100)
+    assert scrub(s) == "a\ufffdb"
+    scrub(s).encode("utf-8")
+
+
 def test_rate_limit_buckets_refill_and_forget():
     from dao.ratelimit import Buckets, Limit
     b = Buckets(sweep_every_s=10)

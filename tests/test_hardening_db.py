@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from dao.auth import MAX_SKEW_NS, Verified, claim_signature, purge_seen_signatures
 from dao.db import Base
 from dao.log import EventLog
-from dao.models import Event, FeeLedger, InboxMessage, Proposal, SeenSignature, SigningSession, Vote
+from dao.models import Event, FeeLedger, HealthCheck, InboxMessage, Proposal, SeenSignature, SigningSession, Vote
 from dao.services import fees, inbox, portal, sessions
 from dao.signer import Signer
 from xe.client import XeError
@@ -68,6 +68,9 @@ class FakeSigner:
 
     def public_key(self, s):
         return self._kp[s].pub_key_hex
+
+    def infos(self):
+        return [SimpleNamespace(name=s) for s in self._kp]
 
     def keypair(self, s, _scope=None):
         return self._kp[s]
@@ -705,3 +708,121 @@ async def test_change_keyset_opens_a_keyset_session_and_bad_ops_are_refused_when
     assert r.status == "passed" and r.session_id
     s = await sessions.get(db, r.session_id)
     assert s.kind == "keyset" and s.ops[0]["key"] == "sys.dao_keyset" and s.required_approvals == 2
+
+
+# ---- XE-0882: a member rebuild only when the tip has moved ---------------------------------------
+
+async def test_member_rebuild_is_refused_at_an_unchanged_tip_so_signatures_stand(db):
+    ctx = _ctx()
+    tip_hash = ["0" * 64]
+
+    async def tip():
+        return {"index": 0, "hash": tip_hash[0], "timestamp": 0}
+
+    ctx.chain.statechain_tip = tip
+    s = SigningSession(id="s1", kind="parameter", title="R1", ops=[{"action": "set", "key": "dao.test", "value": "1"}],
+                       ops_digest="d" * 64, status="approving", approvals=[{"public_key": "k1"}, {"public_key": "k2"}],
+                       required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0)
+    db.add(s)
+    await db.flush()
+    # first build of an approved session: fine
+    await sessions.rebuild_if_stale(ctx, db, s, actor="seat:b")
+    assert s.status == "signing" and s.block_hash
+    s.block_signatures = [{"public_key": "k1", "signature": "00" * 64}]
+    h = s.block_hash
+    # same tip: refused, the collected signature stays, the hash does not change
+    with pytest.raises(HTTPException) as e:
+        await sessions.rebuild_if_stale(ctx, db, s, actor="seat:b")
+    assert e.value.status_code == 409 and "signatures stand" in e.value.detail
+    assert s.block_hash == h and len(s.block_signatures) == 1 and s.rebuilds == 0
+    # tip moved: rebuilt, signatures reset as they must be
+    tip_hash[0] = "1" * 64
+    await sessions.rebuild_if_stale(ctx, db, s, actor="seat:b")
+    assert s.block_hash != h and s.block_signatures == [] and s.rebuilds == 1
+
+
+# ---- XE-0891: the health check watches the keyset, the log, the tip and ageing sessions -----------
+
+async def test_health_degrades_on_unmatched_keyset_change_log_tamper_frozen_tip_and_reports_aging(db):
+    from datetime import datetime, timedelta, timezone
+    from dao.services import records
+    ctx = _ctx()
+    ctx.settings = SimpleNamespace(xe_node_url="http://node")
+    ctx.node.network_id = "testnet-x"
+    state = {"ready": True, "tip": {"index": 5, "hash": "5" * 64, "timestamp": time.time_ns()},
+             "keyset": {"keys": ["k1", "k2", "k3"], "threshold": 2}}
+
+    async def ready():
+        return state["ready"], {"status": "ready"}
+
+    async def tip():
+        return dict(state["tip"])
+
+    async def keyset():
+        return dict(state["keyset"])
+
+    async def directory(_addr):
+        return None
+
+    ctx.chain.ready, ctx.chain.statechain_tip, ctx.chain.dao_keyset, ctx.chain.directory = ready, tip, keyset, directory
+    await ctx.events.append(db, "x", "harness", {}, public=True)
+    await db.commit()
+
+    async def check():
+        EventLog._verify_cache = None
+        d = await records.health(ctx, db, record=True)
+        await db.commit()
+        return d
+
+    d = await check()
+    assert d["ok"] and d["keyset"] == {"keys": ["k1", "k2", "k3"], "threshold": 2} and d["log_verified"]
+    assert d["sessions_aging"] == [] and "keyset_changed" not in d
+    # unchanged keyset on the next run: nothing to say
+    d = await check()
+    assert d["ok"] and "keyset_changed" not in d
+    # the keyset changes with no keyset session of ours behind it: incident
+    state["keyset"] = {"keys": ["K9", "k2", "k3"], "threshold": 3}
+    d = await check()
+    assert not d["ok"] and d["keyset_changed"]["to"]["threshold"] == 3 and d["keyset_changed"]["matches_session"] is False
+    assert (await db.execute(select(Event).where(Event.kind == "keyset.changed"))).scalars().first() is not None
+    # the run after that is clean again (alert once, not every ten minutes)
+    d = await check()
+    assert d["ok"] and "keyset_changed" not in d
+    # a change that a submitted keyset session wrote is recorded, not an incident
+    db.add(SigningSession(id="ks1", kind="keyset", title="rotate", status="submitted", ops_digest="a" * 64,
+                          ops=[{"action": "set", "key": "sys.dao_keyset",
+                                "value": '{"keys":["k2","k3"],"threshold":2}'}],
+                          approvals=[], required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0))
+    await db.flush()
+    state["keyset"] = {"keys": ["k3", "k2"], "threshold": 2}
+    d = await check()
+    assert d["ok"] and d["keyset_changed"]["matches_session"] is True
+    # a tampered event fails the replay
+    ev = (await db.execute(select(Event).where(Event.index == 0))).scalar_one()
+    original = ev.payload
+    ev.payload = {"tampered": True}
+    await db.flush()
+    d = await check()
+    assert not d["ok"] and d["log_verified"] is False and d["log_first_error"]
+    ev.payload = original
+    await db.flush()
+    # a frozen tip: the same hash for longer than the allowance degrades; a new hash clears it
+    d = await check()
+    assert d["ok"]
+    row = (await db.execute(select(HealthCheck).order_by(HealthCheck.ts.desc()).limit(1))).scalar_one()
+    row.detail = {**row.detail, "tip_unchanged_since": time.time_ns() - (records.TIP_FROZEN_S + 60) * 1_000_000_000}
+    await db.flush()
+    d = await check()
+    assert not d["ok"] and d["tip_frozen"]
+    state["tip"] = {"index": 6, "hash": "6" * 64, "timestamp": time.time_ns()}
+    d = await check()
+    assert d["ok"] and "tip_frozen" not in d
+    # a session approving for longer than a day is reported
+    old = SigningSession(id="old1", kind="parameter", title="R", ops=[{"action": "set", "key": "dao.t", "value": "1"}],
+                         ops_digest="b" * 64, status="signing", approvals=[], required_approvals=2, block=None,
+                         block_hash="h", block_signatures=[{"public_key": "k1", "signature": "s"}], rebuilds=0,
+                         created_at=datetime.now(timezone.utc) - timedelta(days=30))
+    db.add(old)
+    await db.flush()
+    d = await check()
+    assert d["ok"] and d["sessions_aging"] == [{"id": "old1", "kind": "parameter", "status": "signing", "signatures": 1, "required": 2}]

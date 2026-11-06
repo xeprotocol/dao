@@ -110,10 +110,12 @@ async def approve_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
 
 @router.post("/sessions/{sid}/rebuild")
 async def rebuild_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
+    """Rebuild the block at the live tip. Only when the tip has moved: a rebuild discards every signature
+    collected so far, so at an unchanged tip one seat could loop it and stall signing (XE-0882)."""
     v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right="sign_statechain")
     bind(v, session_id=sid)
     s = await sessions.get(db, sid, lock=True)
-    await sessions.rebuild(ctx, db, s, actor=v.actor)
+    await sessions.rebuild_if_stale(ctx, db, s, actor=v.actor)
     await db.commit()
     return sessions.to_dict(s)
 

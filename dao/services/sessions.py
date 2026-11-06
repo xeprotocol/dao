@@ -236,6 +236,15 @@ async def rebuild(ctx: Context, db: AsyncSession, s: SigningSession, actor: str 
     return s
 
 
+async def rebuild_if_stale(ctx: Context, db: AsyncSession, s: SigningSession, actor: str) -> SigningSession:
+    """A member-requested rebuild. The first build of an approved session is always allowed; once a block
+    exists it is rebuilt only when the tip has moved, because a rebuild discards every signature collected
+    and at an unchanged tip one seat could loop it and stall signing for good (XE-0882)."""
+    if s.status == "signing" and not await is_stale(ctx, s):
+        raise HTTPException(409, "the block is current; collected signatures stand")
+    return await rebuild(ctx, db, s, actor=actor)
+
+
 async def sign(ctx: Context, db: AsyncSession, s: SigningSession, pub_key: str, signature: str, actor: str) -> SigningSession:
     """Collect a raw ed25519 signature over the block hash from a keyset key. Submit when enough."""
     if s.status != "signing":
