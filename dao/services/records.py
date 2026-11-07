@@ -46,11 +46,44 @@ def registry_value(ctx: Context) -> dict:
     return val
 
 
+# ---- public node reads -------------------------------------------------------------------------
+#
+# The public pages and /v1/legal/* read the keyset, the registry and the treasury balances from the node on
+# every request. Each is the same for everyone and changes on the order of weeks, so one read serves every
+# caller for a few seconds: an unauthenticated burst costs the node one round trip per leg per window, not
+# one per request (XE-0959). Member and worker paths that act on the keyset read it directly.
+
+PUBLIC_READ_TTL_S = 10
+_public_reads: dict[str, tuple[float, object]] = {}
+
+
+async def _shared(key: str, read):
+    now = time.monotonic()
+    hit = _public_reads.get(key)
+    if hit and now - hit[0] < PUBLIC_READ_TTL_S:
+        return hit[1]
+    value = await read()
+    _public_reads[key] = (now, value)
+    return value
+
+
+async def public_keyset(ctx: Context) -> dict:
+    """sys.dao_keyset for display; an unreachable node is shown as {"error": ...}, not raised."""
+    async def read():
+        try:
+            return await ctx.chain.dao_keyset()
+        except XeError as e:
+            return {"error": str(e), "keys": [], "threshold": 0}
+    return await _shared("keyset", read)
+
+
 async def onchain_registry(ctx: Context) -> dict | None:
-    try:
-        return await ctx.chain.statechain_key("dao.registry")
-    except XeError:
-        return None
+    async def read():
+        try:
+            return await ctx.chain.statechain_key("dao.registry")
+        except XeError:
+            return None
+    return await _shared("registry", read)
 
 
 async def open_registry_session(ctx: Context, db: AsyncSession, actor: str) -> dict:
@@ -61,8 +94,13 @@ async def open_registry_session(ctx: Context, db: AsyncSession, actor: str) -> d
 
 # ---- anchors ----------------------------------------------------------------------------------
 
-async def latest_anchor(db: AsyncSession) -> Anchor | None:
-    return (await db.execute(select(Anchor).order_by(Anchor.n.desc()).limit(1))).scalar_one_or_none()
+async def latest_anchor(db: AsyncSession, *, written: bool = False) -> Anchor | None:
+    """The newest anchor; `written=True` for only those that reached the chain. Numbering counts the one in
+    flight so two sessions never take the same n; health counts only what was written (XE-0990)."""
+    q = select(Anchor).order_by(Anchor.n.desc()).limit(1)
+    if written:
+        q = q.where(Anchor.statechain_index.isnot(None))
+    return (await db.execute(q)).scalar_one_or_none()
 
 
 async def open_anchor_session(ctx: Context, db: AsyncSession, actor: str = "harness") -> dict:
@@ -95,6 +133,10 @@ async def anchors(db: AsyncSession, limit: int = 50) -> list[dict]:
 # ---- treasury (read-only) ---------------------------------------------------------------------
 
 async def treasury(ctx: Context) -> dict:
+    return await _shared("treasury", lambda: _treasury(ctx))
+
+
+async def _treasury(ctx: Context) -> dict:
     accts = {
         "treasury": ctx.config.accounts.get("treasury", ""),
         "dao": ctx.signer.address("dao") if ctx.signer.has("dao") else ctx.config.accounts.get("dao", ""),
@@ -217,7 +259,7 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
         detail["signer_error"] = "no harness key: events cannot be signed"
 
     try:   # last anchor age
-        a = await latest_anchor(db)
+        a = await latest_anchor(db, written=True)
         detail["last_anchor"] = {"n": a.n, "age_s": round(now / 1e9 - a.created_at.timestamp())} if a else None
         if a and detail["last_anchor"]["age_s"] > ANCHOR_OVERDUE_S:
             detail["anchor_overdue"] = True

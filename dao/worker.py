@@ -249,14 +249,13 @@ class Worker:
             "timers": self.job_timers, "sessions": self.job_sessions, "daily": self.job_daily, "weekly": self.job_weekly,
             "anchor": self.job_anchor, "monthly": self.job_monthly,
         }
-        periods = {"daily": 86400, "weekly": 7 * 86400, "anchor": 7 * 86400, "monthly": 28 * 86400}
         while not self.stop.is_set():
             try:
                 table = job_table(self.ctx)
                 async with session() as db:
                     last = await last_runs(db)
                 for name, j in table.items():
-                    due = due_interval(last.get(name), j["every_s"]) if "every_s" in j else due_at(last.get(name), j["at"], periods[name])
+                    due = due_interval(last.get(name), j["every_s"]) if "every_s" in j else due_at(last.get(name), j["prev"])
                     if due:
                         try:
                             await handlers[name]()

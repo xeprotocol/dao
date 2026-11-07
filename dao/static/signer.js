@@ -27,8 +27,15 @@
     if (typeof v === "bigint") return v.toString();
     if (typeof v === "string") return canonStr(v);
     if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
-    const keys = Object.keys(v).sort();
+    const keys = Object.keys(v).sort(byCodePoint);
     return "{" + keys.map(k => canonStr(k) + ":" + canon(v[k])).join(",") + "}";
+  }
+  // Python's sort_keys orders by code point; the default JS sort orders by UTF-16 code unit, which puts an
+  // astral-plane key (lead surrogate D800-DBFF) before U+E000-U+FFFF. Compare code points so the two agree.
+  function byCodePoint(a, b) {
+    const x = Array.from(a, c => c.codePointAt(0)), y = Array.from(b, c => c.codePointAt(0));
+    for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i] - y[i];
+    return x.length - y.length;
   }
   function canonStr(s) {
     let out = '"';

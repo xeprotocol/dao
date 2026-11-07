@@ -14,7 +14,7 @@ from ..ratelimit import NODE_READ, enforce_ip
 from ..services import inbox as inbox_svc
 from ..services import pause as pause_svc
 from ..services import records, resolutions, sessions
-from ..text import clean_text
+from ..text import clean_text, field_text
 from .deps import Ctx, Db
 
 router = APIRouter(prefix="/v1/members", tags=["members"])
@@ -33,7 +33,7 @@ async def whoami(pub_key: str, ctx: Ctx):
 @router.post("/resolutions", status_code=201)
 async def propose_resolution(req: SignedRequest, ctx: Ctx, db: Db):
     v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
-    if v.payload.get("matter") in resolutions.RESERVED_MATTERS and not v.seat.is_member:
+    if field_text(v.payload, "matter") in resolutions.RESERVED_MATTERS and not v.seat.is_member:
         raise HTTPException(403, "reserved matters are proposed by members")
     r = await resolutions.propose(ctx, db, v)
     await db.commit()
@@ -44,7 +44,7 @@ async def propose_resolution(req: SignedRequest, ctx: Ctx, db: Db):
 async def sign_resolution(res_id: str, req: SignedRequest, ctx: Ctx, db: Db):
     v = require_seat(await verify_and_claim(db, req, DOMAIN_RESOLUTION), ctx.config, right="sign_resolutions", members_only=True)
     r = await resolutions.get(db, res_id, lock=True)
-    await resolutions.decide(ctx, db, r, v, v.payload.get("decision", ""))
+    await resolutions.decide(ctx, db, r, v, field_text(v.payload, "decision"))
     await db.commit()
     return resolutions.to_dict(r, ctx.config)
 
@@ -127,9 +127,9 @@ async def sign_session_block(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
     v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right="sign_statechain")
     bind(v, session_id=sid)
     s = await sessions.get(db, sid, lock=True)
-    if v.payload.get("block_hash") != s.block_hash:
+    if field_text(v.payload, "block_hash") != s.block_hash:
         raise HTTPException(409, "block hash has changed (tip moved); fetch the session again and re-sign")
-    await sessions.sign(ctx, db, s, v.pub_key, v.payload.get("block_signature", ""), v.actor)
+    await sessions.sign(ctx, db, s, v.pub_key, field_text(v.payload, "block_signature"), v.actor)
     await db.commit()
     return sessions.to_dict(s)
 
@@ -176,7 +176,7 @@ async def lift_pause(pid: str, req: SignedRequest, ctx: Ctx, db: Db):
 
 @router.post("/pause/{pid}/post")
 async def pause_post(pid: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, members_only=True)
+    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right="pause", members_only=True)
     bind(v, pause_id=pid)
     r = await _pause(db, pid)
     await pause_svc.set_post(ctx, db, r, v)

@@ -18,13 +18,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.chat import ChatError, Envelope, new_envelope, verify_envelope
 from xe.chat_auth import chat_read_proof
+from xe.pow import WORKER_POW_DEADLINE_S
 
 from ..auth import Verified, require_pow
 from ..context import Context
 from ..log import EventLog
 from ..models import InboxMessage, OutboxMessage
 from ..signer import SignerError
-from ..text import clean_text, has_bad_control, scrub
+from ..text import clean_text, field_text, has_bad_control, scrub
 from . import pause
 
 log = logging.getLogger("dao.inbox")
@@ -121,7 +122,7 @@ async def reply(ctx: Context, db: AsyncSession, m: InboxMessage, v: Verified) ->
 
 
 async def set_status(ctx: Context, db: AsyncSession, m: InboxMessage, v: Verified) -> InboxMessage:
-    status = v.payload.get("status")
+    status = field_text(v.payload, "status")
     if status not in ("new", "read", "answered", "closed", "spam"):
         raise HTTPException(400, "bad status")
     if status not in ("new", "spam"):
@@ -150,7 +151,10 @@ async def flush_outbox(ctx: Context, db: AsyncSession) -> int:
             continue
         try:
             kp = ctx.signer.keypair("dao", "chat.send")
-            env = await asyncio.to_thread(new_envelope, kp, o.to_account, o.body, ctx.node.chat_pow_difficulty)
+            env = await asyncio.to_thread(new_envelope, kp, o.to_account, o.body, ctx.node.chat_pow_difficulty,
+                                          None, WORKER_POW_DEADLINE_S)
+            if await pause.is_paused(db):   # read after the work, right before the send (XE-1172)
+                return n
             await ctx.chain.chat_send(env.to_json())
             o.envelope = env.to_json()
             o.status = "sent"

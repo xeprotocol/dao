@@ -16,12 +16,13 @@ import time
 
 from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth import Verified
 from ..context import Context
 from ..models import PauseRecord
-from ..text import clean_text
+from ..text import clean_text, field_text
 
 H = 3600 * 1_000_000_000
 D = 24 * H
@@ -42,19 +43,25 @@ async def is_paused(db: AsyncSession) -> bool:
 
 async def start(ctx: Context, db: AsyncSession, v: Verified) -> PauseRecord:
     cfg = ctx.config.pause
-    ground = v.payload.get("ground", "")
+    ground = field_text(v.payload, "ground")
     text = clean_text(v.payload.get("determination"), "determination", max_len=20_000)
     if ground not in cfg.get("grounds", []):
         raise HTTPException(400, f"ground must be one of {cfg.get('grounds', [])}")
     if len(text) < 20:
         raise HTTPException(400, "a written determination is required")
-    if await active(db):
-        raise HTTPException(409, "already paused")
+    await expire_lapsed(ctx, db)
+    await db.flush()
     now = time.time_ns()
     r = PauseRecord(id=secrets.token_hex(8), determined_by=v.seat.id, ground=ground, determination=text,
                     started_at=now, expires_at=now + int(cfg.get("initial_hours", 72)) * H, indefinite=False,
                     extensions=[], lifted_by=[], post_text=_draft_post(ctx, ground), status="active")
     db.add(r)
+    try:
+        # The pause is a singleton and the database says so: one active row (`ux_pause_one_active`). Two
+        # members pausing at once are serialised by the index, not by a read that each can pass (XE-1176).
+        await db.flush()
+    except IntegrityError as e:
+        raise HTTPException(409, "already paused") from e
     await ctx.events.append(db, "pause.started", v.actor, {
         "pause_id": r.id, "ground": ground, "determination": text, "started_at": now, "expires_at": r.expires_at,
         "public_post_due": now + int(cfg.get("public_post_within_hours", 4)) * H,
@@ -74,9 +81,10 @@ def _draft_post(ctx: Context, ground: str) -> str:
 
 
 def _consent(ctx: Context, sigs: list[dict]) -> tuple[bool, int, list[str]]:
-    """Every current member must have signed. A signature from a seat that has since left the company
-    carries nothing (XE-0646, as XE-0600 for resolutions): (met, live_count, set_aside_seats)."""
-    members = {s.id for s in ctx.config.members}
+    """Every current member who holds the pause right must have signed: the set that is counted is the set
+    the routes let sign, so consent can always be reached (XE-1013). A signature from a seat that has since
+    left the company carries nothing (XE-0646, as XE-0600 for resolutions): (met, live_count, set_aside_seats)."""
+    members = {s.id for s in ctx.config.members if s.can("pause")}
     live = [s for s in sigs if s["seat"] in members]
     set_aside = sorted(s["seat"] for s in sigs if s["seat"] not in members)
     return len(live) >= len(members), len(live), set_aside
@@ -126,6 +134,9 @@ async def lift(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) -> P
 
 
 async def set_post(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) -> PauseRecord:
+    """The public post is written while the pause is in force; a lifted or expired pause's record stands."""
+    if r.status != "active":
+        raise HTTPException(409, "pause is not active")
     text = clean_text(v.payload.get("text"), "text", max_len=20_000)
     r.post_text = text
     if r.posted_at:
@@ -140,17 +151,29 @@ async def publish_post(ctx: Context, db: AsyncSession, r: PauseRecord, actor: st
     await ctx.events.append(db, "pause.posted", actor, {"pause_id": r.id, "text": r.post_text}, ref=f"pause:{r.id}")
 
 
+async def _due_rows(db: AsyncSession, *predicates) -> list[PauseRecord]:
+    """Active rows matching the predicates, each FOR UPDATE SKIP LOCKED: a member's extend, lift or post on
+    the same row either waits for this writer or is skipped by it, never overwritten (XE-0987)."""
+    q = select(PauseRecord).where(PauseRecord.status == "active", *predicates).with_for_update(skip_locked=True)
+    return list((await db.execute(q)).scalars().all())
+
+
+async def expire_lapsed(ctx: Context, db: AsyncSession) -> int:
+    now = time.time_ns()
+    rows = await _due_rows(db, PauseRecord.indefinite.is_(False), PauseRecord.expires_at <= now)
+    for r in rows:
+        r.status = "expired"
+        await ctx.events.append(db, "pause.expired", "harness", {"pause_id": r.id, "expires_at": r.expires_at}, ref=f"pause:{r.id}")
+    return len(rows)
+
+
 async def tick(ctx: Context, db: AsyncSession) -> None:
     """Worker: auto-publish overdue posts, expire pauses."""
     now = time.time_ns()
     due_h = int(ctx.config.pause.get("public_post_within_hours", 4))
-    rows = (await db.execute(select(PauseRecord).where(PauseRecord.status == "active"))).scalars().all()
-    for r in rows:
-        if not r.posted_at and now >= r.started_at + due_h * H:
-            await publish_post(ctx, db, r, "harness")
-        if not r.indefinite and now >= r.expires_at:
-            r.status = "expired"
-            await ctx.events.append(db, "pause.expired", "harness", {"pause_id": r.id, "expires_at": r.expires_at}, ref=f"pause:{r.id}")
+    for r in await _due_rows(db, PauseRecord.posted_at.is_(None), PauseRecord.started_at <= now - due_h * H):
+        await publish_post(ctx, db, r, "harness")
+    await expire_lapsed(ctx, db)
 
 
 async def history(db: AsyncSession, limit: int = 50) -> list[PauseRecord]:

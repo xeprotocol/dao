@@ -411,6 +411,10 @@ def _seat(payload, pr=None):
     return v
 
 
+def _member(seat, rights=("pause",)):
+    return SimpleNamespace(id=seat, is_member=True, can=lambda r, _rs=frozenset(rights): r in _rs)
+
+
 async def test_adopt_needs_a_passed_vote_and_is_recorded_once(db):
     from dao.models import Resolution
     ctx = _ctx()
@@ -585,7 +589,7 @@ async def test_pause_lift_ignores_a_departed_members_signature(db):
     from dao.models import PauseRecord
     from dao.services import pause
     ctx = _ctx()
-    ctx.config.members = [SimpleNamespace(id="founder-a", is_member=True), SimpleNamespace(id="founder-b", is_member=True)]
+    ctx.config.members = [_member("founder-a"), _member("founder-b")]
     ctx.config.pause = {}
     now = time.time_ns()
     r = PauseRecord(id="p1", determined_by="founder-a", ground="g", determination="d" * 20, started_at=now,
@@ -874,3 +878,206 @@ async def test_health_endpoint_goes_stale_when_the_worker_stops_and_uptime_count
     assert last["ok"] and records.health_is_stale(ctx, last) and records.health_age_s(last) >= 48 * 3600
     up = await records.uptime_30d(ctx, db)
     assert up["checks"] == 1 and up["expected"] == 48 * 6 and up["fraction"] < 0.01
+
+
+# ---- XE-0960: a vote is written under the proposal's row lock, read without it ------------------
+
+async def test_vote_write_sees_a_close_that_landed_during_the_snapshot_read(db):
+    """The node read happens on an unlocked copy of the proposal; the write re-loads it FOR UPDATE and
+    re-checks the window, so a proposal closed while the snapshot was in flight takes no vote, and the
+    account's existing vote is compared under the same lock."""
+    ctx = _ctx()
+    now = time.time_ns()
+    pr = Proposal(hash="c" * 64, title="t", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64,
+                  author_signature="s", author_timestamp=now, fee_block_hash="c" * 64, status="open", opened_at=now,
+                  closes_at=now + D, rules=ctx.config.pinned_rules(), analysis=[])
+    db.add(pr)
+    await db.commit()
+    stale = await portal.get(db, pr.hash)            # the unlocked copy the route loads
+
+    async def closing_chain(account):
+        # the worker closes the proposal while the voter's chain is being read
+        sm = async_sessionmaker(db.bind, expire_on_commit=False)
+        async with sm() as other:
+            row = await portal.get(other, pr.hash, lock=True)
+            row.status = "closed"
+            await other.commit()
+        return [{"timestamp": 0, "asset": "XE", "balance": 5_000_000, "hash": "b" * 64}]
+
+    ctx.chain.full_chain = closing_chain
+    with pytest.raises(HTTPException) as e:
+        await portal.vote(ctx, db, stale, _v(payload={"proposal": pr.hash, "choice": "for"}))
+    assert e.value.status_code == 409 and "closed" in e.value.detail
+    await db.rollback()
+    assert (await db.execute(select(Vote))).scalars().all() == []
+
+
+# ---- XE-0988: a signing session the keyset moved under goes back to approving --------------------
+
+async def test_signing_session_short_of_live_approvals_returns_to_approving(db):
+    ctx = _ctx()
+    ctx.chain.statechain_tip = lambda: _tip_at(1)
+    s = SigningSession(id="s9", kind="parameter", title="R", ops=[{"action": "set", "key": "dao.test", "value": "1"}],
+                       ops_digest="f" * 64, status="signing", approvals=[{"public_key": "k1"}, {"public_key": "gone"}],
+                       required_approvals=2, block={"index": 1, "prev_hash": "0" * 64, "timestamp": 0, "hash": "h" * 64},
+                       block_hash="h" * 64, block_signatures=[{"public_key": "k1", "signature": "s"}], rebuilds=0, not_before=None)
+    db.add(s)
+    await db.flush()
+    await sessions.rebuild(ctx, db, s)
+    assert s.status == "approving" and s.block is None and s.block_hash == "" and s.block_signatures == []
+    ev = (await db.execute(select(Event).where(Event.kind == "session.reapproval_needed"))).scalars().one()
+    assert ev.payload["live_approvals"] == 1 and ev.payload["required"] == 2
+    # an approving session short of approvals is still refused, as before
+    with pytest.raises(HTTPException) as e:
+        await sessions.rebuild(ctx, db, s)
+    assert e.value.status_code == 409
+
+
+async def _tip_at(index):
+    return {"index": index, "hash": str(index) * 64, "timestamp": 0}
+
+
+# ---- XE-1176 / XE-1013 / XE-0991 / XE-1172: the pause ------------------------------------------
+
+async def test_one_active_pause_is_enforced_by_the_database(db):
+    from dao.models import PauseRecord
+    from dao.services import pause
+    ctx = _ctx()
+    ctx.config.members = [_member("founder-a"), _member("founder-b")]
+    ctx.config.pause = {"grounds": ["g"]}
+
+    def det(seat):
+        v = _v(payload={"ground": "g", "determination": "d" * 20})
+        v.seat = _member(seat)
+        return v
+
+    r = await pause.start(ctx, db, det("founder-a"))
+    await db.commit()
+    # a second start in another session, as two members pausing at once would be, is a 409 from the index
+    sm = async_sessionmaker(db.bind, expire_on_commit=False)
+    async with sm() as other:
+        with pytest.raises(HTTPException) as e:
+            await pause.start(ctx, other, det("founder-b"))
+        assert e.value.status_code == 409
+        await other.rollback()
+    assert len((await db.execute(select(PauseRecord).where(PauseRecord.status == "active"))).scalars().all()) == 1
+    # a lapsed pause is expired by the start that follows it, not left to the worker
+    r.expires_at = time.time_ns() - 1
+    await db.commit()
+    r2 = await pause.start(ctx, db, det("founder-b"))
+    await db.commit()
+    assert r.status == "expired" and r2.status == "active"
+
+
+async def test_pause_consent_counts_only_members_who_hold_the_right_and_post_needs_an_active_pause(db):
+    from dao.models import PauseRecord
+    from dao.services import pause
+    ctx = _ctx()
+    ctx.config.members = [_member("founder-a"), _member("founder-b"), _member("founder-c", rights=())]
+    ctx.config.pause = {}
+    now = time.time_ns()
+    r = PauseRecord(id="p1", determined_by="founder-a", ground="g", determination="d" * 20, started_at=now,
+                    expires_at=now + 10 ** 12, indefinite=False, extensions=[], lifted_by=[], status="active")
+    db.add(r)
+    await db.flush()
+
+    def member(seat):
+        v = _v(payload={"pause_id": "p1", "text": "the public post text"})
+        v.seat = _member(seat)
+        return v
+
+    await pause.lift(ctx, db, r, member("founder-a"))
+    assert r.status == "active"
+    await pause.lift(ctx, db, r, member("founder-b"))
+    assert r.status == "lifted", "the member without the pause right cannot sign, so is not counted"
+    with pytest.raises(HTTPException) as e:
+        await pause.set_post(ctx, db, r, member("founder-a"))
+    assert e.value.status_code == 409
+
+
+async def test_settlement_and_outbox_read_the_pause_right_before_the_chain_write(db, monkeypatch):
+    from dao.models import OutboxMessage, PauseRecord
+    ctx = _ctx()
+    now = time.time_ns()
+    db.add(FeeLedger(fee_block_hash="1" * 64, proposal_hash="2" * 64, payer=AUTHOR, amount=1000, state="due_burn",
+                     tx_hashes={"receive": "r" * 64}))
+    db.add(Proposal(hash="2" * 64, title="t", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64,
+                    author_signature="s", author_timestamp=now, fee_block_hash="2" * 64, status="closed", opened_at=now,
+                    closes_at=now, rules=ctx.config.pinned_rules(), analysis=[]))
+    db.add(OutboxMessage(id="o1", to_account="d" * 64, body="hello", status="queued", in_reply_to="m1", from_seat="cto",
+                         envelope={}, error=""))
+    await db.commit()
+    sent = []
+    pauses = iter(["p1", "p2"])
+
+    async def pause_then(*a, **k):
+        # the pause is committed after the job began and before the chain write
+        db.add(PauseRecord(id=next(pauses), determined_by="founder-a", ground="g", determination="d" * 20, started_at=now,
+                           expires_at=now + 10 ** 12, indefinite=False, extensions=[], lifted_by=[], status="active"))
+        await db.commit()
+        return SimpleNamespace(hash="x" * 64, id="e", to_json=lambda: {})
+
+    async def wrote(*a, **k):
+        sent.append(1)
+
+    ctx.signer = FakeSigner(("harness", "fee", "dao"))
+    monkeypatch.setattr(fees.chainops, "burn", wrote)
+    monkeypatch.setattr(fees.chainops, "send", wrote)
+    monkeypatch.setattr(fees, "_fee_due", pause_then)      # the last await before the burn
+    await fees.settle_due(ctx, db)
+    f = (await db.execute(select(FeeLedger))).scalar_one()
+    assert f.state == "settling" and not f.error and not sent, "marked, but the burn did not go out under the pause"
+    # the same for a queued reply: the pause lands while the envelope's proof of work is being computed
+    (await db.execute(select(PauseRecord))).scalar_one().status = "lifted"
+    await db.commit()
+    ctx.chain.chat_send = wrote
+    monkeypatch.setattr(inbox, "asyncio", SimpleNamespace(to_thread=pause_then))
+    assert await inbox.flush_outbox(ctx, db) == 0
+    o = (await db.execute(select(OutboxMessage))).scalar_one()
+    assert o.status == "queued" and not sent
+
+
+# ---- XE-0990: an anchor that never reached the chain leaves no row ---------------------------------
+
+async def test_cancelled_or_failed_anchor_session_removes_its_anchor_row(db):
+    from dao.services import records
+    ctx = _ctx()
+    ctx.settings = SimpleNamespace(public_base_url="http://dao")
+    ctx.config.members = [_member("founder-a")]
+    await ctx.events.append(db, "x", "harness", {}, public=True)
+    out = await records.open_anchor_session(ctx, db)
+    s = await sessions.get(db, out["id"])
+    assert (await records.latest_anchor(db)).n == 1 and await records.latest_anchor(db, written=True) is None
+    v = _v(payload={"session_id": s.id})
+    v.seat = _member("founder-a")
+    await sessions.cancel(ctx, db, s, v, "not this week")
+    await db.commit()
+    db.expunge_all()
+    assert await records.latest_anchor(db) is None
+    # the next session takes n = 1 again, and only a submitted one is seen by health
+    out2 = await records.open_anchor_session(ctx, db)
+    assert (await records.latest_anchor(db)).n == 1
+    await records.note_anchor_submitted(db, out2["id"], 7, "7" * 64)
+    assert (await records.latest_anchor(db, written=True)).n == 1
+
+
+# ---- XE-1003: the snapshot carries tainted XE forward and spends it first ------------------------
+
+async def test_snapshot_taint_is_spent_by_later_sends_and_other_assets_are_causally_checked(db):
+    from dao.chainops import CAUSAL_CHECK_NS, account_snapshot
+    at = 10 ** 15
+    blocks = {"late": {"timestamp": at + 1}, "early": {"timestamp": at - 10}}
+    chain = FakeChain(blocks=blocks, chains={
+        "v": [{"timestamp": at - CAUSAL_CHECK_NS - 1, "asset": "XE", "balance": 500, "hash": "b0", "type": "open"},
+              {"timestamp": at - 5, "asset": "XE", "balance": 1500, "hash": "b1", "type": "receive", "source": "late"},
+              {"timestamp": at - 4, "asset": "XE", "balance": 500, "hash": "b2", "type": "send"},
+              {"timestamp": at - 3, "asset": "XE", "balance": 700, "hash": "b3", "type": "receive", "source": "early"},
+              {"timestamp": at - 2, "asset": "XE", "balance": 1700, "hash": "b4", "type": "receive", "source": "late"},
+              {"timestamp": at + 1, "asset": "XE", "balance": 1, "hash": "b5", "type": "send"}],
+        "w": [{"timestamp": at - 1, "asset": "XUSD", "balance": 9, "hash": "c0", "type": "receive", "source": "late"}],
+    })
+    v = await account_snapshot(chain, "v", at)
+    # 500 clean; +1000 tainted; the 1000 send spends the taint; +200 clean; +1000 tainted again
+    assert v["balance"] == 700 and v["excluded_receives"] == ["b1", "b4"] and v["snapshot_block"] == "b3" and v["exists"]
+    w = await account_snapshot(chain, "w", at)
+    assert not w["exists"] and w["snapshot_block"] == "" and w["excluded_receives"] == ["c0"]

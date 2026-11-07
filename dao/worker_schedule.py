@@ -36,9 +36,28 @@ def _next_monthly(now: datetime, day: int, hour: int = 9) -> datetime:
     return t.replace(year=y, month=m)
 
 
+def _prev_monthly(now: datetime, day: int, hour: int = 9) -> datetime:
+    """The most recent monthly time at or before now: the mirror of `_next_monthly`, so a dated job's
+    "have we run since it was last due" is read off the calendar, not off a fixed period that is shorter
+    than the month it stands for (XE-1192)."""
+    t = now.replace(day=min(day, 28), hour=hour, minute=0, second=0, microsecond=0)
+    if t <= now:
+        return t
+    y, m = (now.year - (1 if now.month == 1 else 0), 12 if now.month == 1 else now.month - 1)
+    return t.replace(year=y, month=m)
+
+
+def dated(nxt: datetime, prev: datetime, desc: str) -> dict:
+    return {"at": nxt, "prev": prev, "desc": desc}
+
+
 def job_table(ctx: Context) -> dict[str, dict]:
     c = ctx.config.cadence
     now = datetime.now(timezone.utc)
+    daily = _next_daily(now, int(c.get("daily_note_hour_utc", 8)))
+    weekly = _next_weekly(now, int(c.get("weekly_review_weekday", 1)), int(c.get("weekly_review_hour_utc", 9)))
+    anchor = _next_weekly(now, int(c.get("anchor_weekday", 1)), int(c.get("anchor_hour_utc", 9)))
+    monthly_day = int(c.get("monthly_report_day", 1))
     return {
         "health": {"every_s": int(c.get("health_check_minutes", 10)) * 60, "desc": "node reachable, tip advancing, keyset unchanged, log replays, sessions ageing, directory"},
         "directory": {"every_s": int(c.get("directory_reregister_minutes", 20)) * 60, "desc": "re-register the DAO account in the node directory"},
@@ -46,10 +65,10 @@ def job_table(ctx: Context) -> dict[str, dict]:
         "outbox": {"every_s": 30, "desc": "send queued replies over chat"},
         "timers": {"every_s": 60, "desc": "close votes whose window ended; expire pauses; publish overdue pause posts; promote timelocked sessions"},
         "sessions": {"every_s": 120, "desc": "rebuild signing-session blocks when the tip has moved and no signatures are pending"},
-        "daily": {"at": _next_daily(now, int(c.get("daily_note_hour_utc", 8))), "desc": "daily state note into the log; treasury snapshot"},
-        "weekly": {"at": _next_weekly(now, int(c.get("weekly_review_weekday", 1)), int(c.get("weekly_review_hour_utc", 9))), "desc": "weekly review note"},
-        "anchor": {"at": _next_weekly(now, int(c.get("anchor_weekday", 1)), int(c.get("anchor_hour_utc", 9))), "desc": "open the weekly anchor session (dao.anchor.n)"},
-        "monthly": {"at": _next_monthly(now, int(c.get("monthly_report_day", 1))), "desc": "monthly summary note"},
+        "daily": dated(daily, daily - timedelta(days=1), "daily state note into the log; treasury snapshot"),
+        "weekly": dated(weekly, weekly - timedelta(days=7), "weekly review note"),
+        "anchor": dated(anchor, anchor - timedelta(days=7), "open the weekly anchor session (dao.anchor.n)"),
+        "monthly": dated(_next_monthly(now, monthly_day), _prev_monthly(now, monthly_day), "monthly summary note"),
     }
 
 
@@ -71,9 +90,8 @@ def due_interval(last_ts: int | None, every_s: int) -> bool:
     return last_ts is None or time.time_ns() - last_ts >= every_s * NS
 
 
-def due_at(last_ts: int | None, at: datetime, period_s: int) -> bool:
-    """A dated job is due when its most recent scheduled time has passed and we have not run since."""
-    prev = at - timedelta(seconds=period_s)
+def due_at(last_ts: int | None, prev: datetime) -> bool:
+    """A dated job is due when we have not run since its most recent scheduled time."""
     prev_ns = int(prev.timestamp() * NS)
     return time.time_ns() >= prev_ns and (last_ts is None or last_ts < prev_ns)
 

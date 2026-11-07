@@ -12,7 +12,7 @@ import re
 import time
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.client import XeError
@@ -22,13 +22,14 @@ from ..canonical import DOMAIN_PROPOSAL, canonical_json, sha256_hex
 from ..chainops import account_snapshot, snapshot_time
 from ..context import Context
 from ..models import FeeLedger, Proposal, Resolution, Vote
-from ..text import clean_text
+from ..text import clean_text, field_text
 from . import sessions
 
 D = 24 * 3600 * 1_000_000_000
 MAX_TITLE = 160
 MAX_BODY = 20_000
 HEX64 = re.compile(r"[0-9a-f]{64}")
+FINAL = ("adopt", "decline")
 
 
 def fee_account(ctx: Context) -> str:
@@ -81,7 +82,7 @@ async def submit(ctx: Context, db: AsyncSession, v: Verified) -> Proposal:
     title = clean_text(p.get("title"), "title", max_len=MAX_TITLE)
     body = clean_text(p.get("body"), "body", max_len=MAX_BODY)
     ops = p.get("ops")
-    fee_block_hash = (p.get("fee_block_hash") or "").lower()
+    fee_block_hash = field_text(p, "fee_block_hash").lower()
     if fee_block_hash and not HEX64.fullmatch(fee_block_hash):
         raise HTTPException(400, "fee_block_hash must be 64 hex characters")
     if ops is not None:
@@ -112,7 +113,9 @@ async def get(db: AsyncSession, h: str, *, lock: bool = False) -> Proposal:
     """`lock=True` takes the row FOR UPDATE: every path that changes a proposal loads it this way, so two
     writers queue instead of each saving its own copy of a list over the other's (XE-0672)."""
     q = select(Proposal).where(Proposal.hash == h.lower())
-    pr = (await db.execute(q.with_for_update() if lock else q)).scalar_one_or_none()
+    if lock:   # and read the row as it is now, even if an unlocked copy is already in this session (XE-0960)
+        q = q.with_for_update().execution_options(populate_existing=True)
+    pr = (await db.execute(q)).scalar_one_or_none()
     if pr is None:
         raise HTTPException(404, "proposal not found")
     return pr
@@ -125,16 +128,33 @@ async def list_proposals(db: AsyncSession, status: str | None = None, offset: in
     return list((await db.execute(q)).scalars().all())
 
 
+async def awaiting_decision(db: AsyncSession, limit: int = 50) -> list[Proposal]:
+    """Closed proposals with no decision, and decided ones whose decision was interim (deferred or referred)."""
+    q = (select(Proposal).where(or_(Proposal.status == "closed",
+                                    and_(Proposal.status == "decided", Proposal.decision["decision"].astext.notin_(FINAL))))
+         .order_by(Proposal.opened_at.desc()).limit(min(limit, 200)))
+    return list((await db.execute(q)).scalars().all())
+
+
 # ---- votes ------------------------------------------------------------------------------------
 
-async def vote(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Vote:
-    """payload = {proposal, choice, reason?}. One vote per account; a later vote replaces an earlier one."""
+def _open(pr: Proposal) -> None:
     if pr.status != "open" or time.time_ns() >= pr.closes_at:
         raise HTTPException(409, "voting is closed")
-    choice = v.payload.get("choice")
+
+
+async def vote(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Vote:
+    """payload = {proposal, choice, reason?}. One vote per account; a later vote replaces an earlier one.
+
+    The node read (the voter's snapshot) happens on an unlocked copy of the proposal; the write happens
+    under row locks taken afterwards: the proposal FOR UPDATE, so a close that lands during the read is seen
+    before anything is recorded, and the account's existing vote FOR UPDATE, so two votes from one account
+    compare timestamps against the same row (XE-0960). Votes serialise for the write, not for the read."""
+    _open(pr)
+    choice = field_text(v.payload, "choice")
     if choice not in ("for", "against", "abstain"):
         raise HTTPException(400, "choice must be for | against | abstain")
-    if (v.payload.get("proposal") or "").lower() != pr.hash:
+    if field_text(v.payload, "proposal").lower() != pr.hash:
         raise HTTPException(400, "signed payload names a different proposal")
     rules = pr.rules
     pw = rules.get("participating_wallet", {})
@@ -153,7 +173,10 @@ async def vote(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Vot
     participating = not reasons
     weight = 0 if excluded else int(snap["balance"])
     reason = clean_text(v.payload.get("reason"), "reason", max_len=2000, required=False)
-    existing = (await db.execute(select(Vote).where(Vote.proposal_hash == pr.hash, Vote.account == v.account))).scalar_one_or_none()
+    pr = await get(db, pr.hash, lock=True)
+    _open(pr)
+    existing = (await db.execute(select(Vote).where(Vote.proposal_hash == pr.hash, Vote.account == v.account)
+                                 .with_for_update())).scalar_one_or_none()
     if existing:
         # Replacement is by signer time, not arrival: a vote signed earlier than the one on record is stale
         # and cannot overwrite it, whoever replays it and whenever (XE-0033).
@@ -244,16 +267,20 @@ async def decide(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> P
     published position, so a single seat key cannot flip it afterwards. `adopt` needs the vote to have
     passed; `adopt` of a proposal carrying state-chain ops also needs a passed resolution about this
     proposal that authorises exactly those ops. `decline`, `defer` and `refer_to_resolution` are recordable
-    on any closed vote, including a failed or no-quorum one. Nothing here executes anything; ops still
-    move only through a resolution and a signing session."""
+    on any closed vote, including a failed or no-quorum one; the last two are interim and may be followed by
+    one adopt or decline. Nothing here executes anything; ops still move only through a resolution and a
+    signing session."""
     bind(v, proposal=pr.hash)
-    if pr.status == "decided":
-        raise HTTPException(409, "a decision is already recorded for this proposal")
-    if pr.status != "closed":
-        raise HTTPException(409, "proposal is not closed")
-    decision = v.payload.get("decision")
+    decision = field_text(v.payload, "decision")
     if decision not in ("adopt", "decline", "defer", "refer_to_resolution"):
         raise HTTPException(400, "decision must be adopt | decline | defer | refer_to_resolution")
+    if pr.status == "decided":
+        # `defer` and `refer_to_resolution` say "not yet": each may be followed by one final adopt or
+        # decline, with the earlier record kept under `history` (XE-1127). adopt and decline are final.
+        if (pr.decision or {}).get("decision") in FINAL or decision not in FINAL:
+            raise HTTPException(409, "a decision is already recorded for this proposal")
+    elif pr.status != "closed":
+        raise HTTPException(409, "proposal is not closed")
     reasons = clean_text(v.payload.get("reasons"), "reasons", max_len=MAX_BODY)
     if len(reasons) < 10:
         raise HTTPException(400, "reasons are required")
@@ -268,8 +295,9 @@ async def decide(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> P
                 raise HTTPException(409, "a proposal with ops is adopted via a passed resolution; give its resolution_id")
             if resolution.ops != pr.ops:
                 raise HTTPException(409, "that resolution does not authorise exactly this proposal's ops")
+    history = [*pr.decision.get("history", []), {k: x for k, x in pr.decision.items() if k != "history"}] if pr.decision else []
     pr.decision = {"decision": decision, "reasons": reasons, "by": v.seat.id, "timestamp": v.timestamp,
-                   "resolution_id": res_id, "outcome": outcome}
+                   "resolution_id": res_id, "outcome": outcome, **({"history": history} if history else {})}
     pr.status = "decided"
     await ctx.events.append(db, "proposal.decided", v.actor, {"proposal": pr.hash, **pr.decision}, ref=f"proposal:{pr.hash}")
     return pr

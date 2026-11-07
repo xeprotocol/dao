@@ -14,6 +14,9 @@ import httpx
 from .encoding import Block
 from .statechain import StateBlock
 
+PAGE = 1000
+MAX_CHAIN_PAGES = 100   # 100,000 blocks: far past any account the harness reads for weight or fees
+
 
 class XeError(RuntimeError):
     def __init__(self, status: int, message: str):
@@ -97,16 +100,19 @@ class XeClient:
         return await self._get(f"/accounts/{address}/chain", offset=offset, limit=limit)
 
     async def full_chain(self, address: str) -> list[dict]:
+        """Every block of an account, paged. The node's `total` ends the walk when it is honest; the page
+        count ends it when it is not, so a node advertising two billion blocks cannot have the caller buffer
+        them (XE-1189). An account past the bound is an error, not a truncated chain."""
         out: list[dict] = []
         offset = 0
-        while True:
-            page = await self.chain(address, offset=offset, limit=1000)
+        for _ in range(MAX_CHAIN_PAGES):
+            page = await self.chain(address, offset=offset, limit=PAGE)
             blocks = page.get("blocks", [])
             out.extend(blocks)
-            if len(blocks) < 1000 or len(out) >= int(page.get("total", 0)):
-                break
+            if len(blocks) < PAGE or len(out) >= int(page.get("total", 0)):
+                return out
             offset += len(blocks)
-        return out
+        raise XeError(413, f"account chain exceeds {MAX_CHAIN_PAGES * PAGE} blocks")
 
     async def keyset_of(self, address: str) -> dict | None:
         try:

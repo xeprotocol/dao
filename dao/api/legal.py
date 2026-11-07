@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
-from xe.client import XeError
-
 from .. import __version__
 from ..log import EventLog
 from ..ratelimit import NODE_READ, enforce_ip
@@ -22,15 +20,13 @@ router = APIRouter(prefix="/v1/legal", tags=["legal"])
 
 
 @router.get("/identifier")
-async def identifier(ctx: Ctx, db: Db):
+async def identifier(request: Request, ctx: Ctx, db: Db):
     """The public identifier of the company's governance surface."""
+    enforce_ip(request, NODE_READ)
     reg = ctx.config.registry
-    try:
-        ks = await ctx.chain.dao_keyset()
-    except XeError as e:
-        ks = {"error": str(e)}
-    onchain = await records.onchain_registry(ctx)
     head = await EventLog.head(db)
+    ks = await records.public_keyset(ctx)
+    onchain = await records.onchain_registry(ctx)
     return {
         "entity": reg.get("entity"),
         "jurisdiction": reg.get("jurisdiction"),
@@ -63,18 +59,19 @@ async def identifier(ctx: Ctx, db: Db):
 
 
 @router.get("/registry")
-async def registry(ctx: Ctx):
+async def registry(request: Request, ctx: Ctx):
     """dao.registry as intended (from config) and as present on the state chain."""
+    enforce_ip(request, NODE_READ)
     return {"intended": records.registry_value(ctx), "onchain": await records.onchain_registry(ctx)}
 
 
 @router.get("/keyset")
-async def keyset(ctx: Ctx):
+async def keyset(request: Request, ctx: Ctx):
     """The live sys.dao_keyset, as read from the node. The company holds no copy of these keys."""
-    try:
-        ks = await ctx.chain.dao_keyset()
-    except XeError as e:
-        return {"error": str(e)}
+    enforce_ip(request, NODE_READ)
+    ks = await records.public_keyset(ctx)
+    if "error" in ks:
+        return {"error": ks["error"]}
     members = {s.public_key: s.id for s in ctx.config.human_seats if s.public_key}
     return {"keyset": ks, "holders": [{"public_key": k, "seat": members.get(k.lower(), "")} for k in ks.get("keys", [])]}
 

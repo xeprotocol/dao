@@ -10,7 +10,10 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.exc import DataError, StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from xe.client import XeError
 
 from . import __version__
 from .api import legal, members, public
@@ -138,6 +141,28 @@ async def validation_error(request: Request, exc: RequestValidationError):
         return JSONResponse({"error": detail, "status": 422}, status_code=422)
     from .ui import render
     return render(request, "error.html", {"status": 422, "detail": detail}, status_code=422)
+
+
+@app.exception_handler(StatementError)
+async def statement_error(request: Request, exc: StatementError):
+    """A parameter the database cannot hold (U+0000 in text, an integer past int64) is the caller's error,
+    whichever read or write path carried it (XE-0967). Anything else from the driver is still ours."""
+    if isinstance(exc, DataError) or isinstance(exc.orig, (OverflowError, ValueError)):
+        return await http_error(request, StarletteHTTPException(400, "a parameter is not representable"))
+    return await unhandled_error(request, exc)
+
+
+@app.exception_handler(XeError)
+async def node_error(request: Request, exc: XeError):
+    """The node refused or failed a read the request needed: a 502 that says so, not a 500 that says nothing."""
+    log.warning("node error on %s %s: %s", request.method, request.url.path, exc)
+    return await http_error(request, StarletteHTTPException(502, "node error"))
+
+
+@app.exception_handler(OverflowError)
+async def overflow_error(request: Request, exc: OverflowError):
+    """The driver raises this bare when an integer parameter does not fit int64; it is the caller's number."""
+    return await http_error(request, StarletteHTTPException(400, "a parameter is not representable"))
 
 
 @app.exception_handler(Exception)

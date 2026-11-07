@@ -75,7 +75,7 @@ class Envelope:
 
 
 def new_envelope(kp: KeyPair, to: str, message: str, difficulty: int = CHAT_POW_DIFFICULTY,
-                 timestamp_ns: int | None = None) -> Envelope:
+                 timestamp_ns: int | None = None, deadline_s: float | None = None) -> Envelope:
     if len(message.encode("utf-8")) > MAX_MESSAGE_BYTES:
         raise ChatError(f"message exceeds {MAX_MESSAGE_BYTES} bytes")
     ts = timestamp_ns if timestamp_ns is not None else time.time_ns()
@@ -84,7 +84,7 @@ def new_envelope(kp: KeyPair, to: str, message: str, difficulty: int = CHAT_POW_
     eid = compute_envelope_id(from_, pub, to, message, ts)
     id_bytes = bytes.fromhex(eid)
     sig = kp.sign_hex(id_bytes)
-    nonce = compute_pow(id_bytes, difficulty) if difficulty > 0 else 0
+    nonce = compute_pow(id_bytes, difficulty, deadline_s) if difficulty > 0 else 0
     return Envelope(id=eid, from_=from_, pub_key=pub, to=to, message=message,
                     timestamp=ts, signature=sig, pow_nonce=nonce)
 

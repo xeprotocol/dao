@@ -13,7 +13,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, Numeric, SmallInteger, String, Text, TypeDecorator,
-    UniqueConstraint, func,
+    UniqueConstraint, func, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -91,6 +91,7 @@ class PauseRecord(Base):
     post_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     posted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")  # active | expired | lifted
+    __table_args__ = (Index("ux_pause_one_active", "status", unique=True, postgresql_where=text("status = 'active'")),)
 
 
 class SigningSession(Base):

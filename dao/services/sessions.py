@@ -18,7 +18,7 @@ import secrets
 import time
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.client import XeError
@@ -28,7 +28,7 @@ from xe.statechain import StateBlock, StateChainError, StateOp, build_block
 from ..auth import Verified
 from ..canonical import canonical_json, sha256_hex
 from ..context import Context
-from ..models import SigningSession
+from ..models import Anchor, SigningSession
 from . import pause
 
 KINDS = {"registry", "anchor", "parameter", "keyset"}
@@ -214,7 +214,18 @@ async def rebuild(ctx: Context, db: AsyncSession, s: SigningSession, actor: str 
         raise HTTPException(409, f"session is {s.status}")
     require_timelock_run(s)
     await require_unpaused(db)
-    if not approvals_met(s, await live_keyset(ctx)):
+    ks = await live_keyset(ctx)
+    if not approvals_met(s, ks):
+        if s.status == "signing":
+            # The keyset moved under a session that was already approved (a rotation landed first): the
+            # approvals it holds no longer meet the live threshold. It goes back to approving rather than
+            # sitting in signing with a block nobody may sign; the new keys approve and it proceeds (XE-0988).
+            s.block, s.block_hash, s.block_signatures, s.status = None, "", [], "approving"
+            await ctx.events.append(db, "session.reapproval_needed", actor, {
+                "session_id": s.id, "ops_digest": s.ops_digest, "approvals": len(s.approvals), "required": ks["threshold"],
+                "live_approvals": sum(1 for a in s.approvals if a["public_key"] in ks["keys"]),
+            }, ref=f"session:{s.id}")
+            return s
         raise HTTPException(409, "the session does not hold enough approvals from the live keyset")
     try:
         tip = await ctx.chain.statechain_tip()
@@ -298,6 +309,7 @@ async def submit(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSe
             return s
         s.status = "failed"
         s.error = str(e)
+        await _ended(db, s)
         await ctx.events.append(db, "session.failed", "harness", {"session_id": s.id, "error": str(e)}, ref=f"session:{s.id}")
         return s
     s.status = "submitted"
@@ -314,8 +326,16 @@ async def cancel(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified,
         raise HTTPException(409, f"session is {s.status}")
     s.status = "cancelled"
     s.error = reason
+    await _ended(db, s)
     await ctx.events.append(db, "session.cancelled", v.actor, {"session_id": s.id, "reason": reason}, ref=f"session:{s.id}")
     return s
+
+
+async def _ended(db: AsyncSession, s: SigningSession) -> None:
+    """A session that ends without reaching the chain leaves no record that says otherwise: the anchor row
+    opened with it goes, so the register and the health check see only anchors that were written (XE-0990)."""
+    if s.kind == "anchor":
+        await db.execute(delete(Anchor).where(Anchor.session_id == s.id))
 
 
 def to_dict(s: SigningSession, public: bool = True) -> dict:

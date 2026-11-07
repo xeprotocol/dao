@@ -25,6 +25,7 @@ from .. import chainops
 from ..context import Context
 from ..models import FeeLedger, Proposal
 from ..signer import SignerError
+from . import pause
 
 log = logging.getLogger("dao.fees")
 
@@ -37,9 +38,9 @@ async def receive_all(ctx: Context, db: AsyncSession) -> int:
     if not ctx.signer.has("fee"):
         return 0
 
-    async def record(b):
+    async def record(b, amount: int):
         await ctx.events.append(db, "fee.received", "harness", {
-            "block": b.hash, "source": b.source, "amount": b.balance, "asset": b.asset,
+            "block": b.hash, "source": b.source, "amount": amount, "asset": b.asset,
         }, ref=f"fee:{b.source}", public=True)
         row = (await db.execute(select(FeeLedger).where(FeeLedger.fee_block_hash == b.source))).scalar_one_or_none()
         if row:
@@ -105,7 +106,7 @@ async def _find_receive(ctx: Context, db: AsyncSession, f: FeeLedger, chain: _Fe
         f.tx_hashes = {**(f.tx_hashes or {}), "receive": got["hash"]}
         f.error = ""
         await ctx.events.append(db, "fee.received", "harness", {
-            "block": got["hash"], "source": f.fee_block_hash, "amount": got.get("balance"), "asset": got.get("asset"),
+            "block": got["hash"], "source": f.fee_block_hash, "amount": f.amount, "asset": got.get("asset"),
             "reconciled": True,
         }, ref=f"fee:{f.fee_block_hash}", public=True)
         await db.commit()
@@ -148,6 +149,10 @@ async def _settle(ctx: Context, db: AsyncSession, f: FeeLedger) -> None:
         await db.commit()
     fee = await _fee_due(db, f)
     while f.state == "settling":
+        if await pause.is_paused(db):
+            # Read here, not only at the start of the job: a pause committed since then stops the burn or
+            # refund before it is sent (XE-1172). The row stays `settling` and is reconciled next pass.
+            return
         as_, nonce = f.tx_hashes["settle_as"], f.tx_hashes["settle_nonce"]
         memo = f"fee {as_} {f.proposal_hash[:12]} {nonce}"
         amount = _phase_amount(f, fee)

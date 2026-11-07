@@ -95,6 +95,67 @@ def test_clean_text_rejects_lone_surrogates_before_the_driver_sees_them():
     scrub(s).encode("utf-8")
 
 
+def test_text_guard_refuses_format_characters_and_normalises_line_separators():
+    """XE-1099: the bidi controls and the rest of Cf are refused everywhere `clean_text`, `field_text` and
+    `scrub` are used; the joiners and emoji variation selectors pass; U+2028/2029 become newlines."""
+    from dao.text import clean_text, field_text, scrub
+    bad = ["\u202e", "\u2066", "\u200b", "\u00ad", "\ufeff", "\U000e0001"]
+    for c in bad:
+        with pytest.raises(HTTPException):
+            clean_text(f"a{c}b", "title", max_len=100)
+        with pytest.raises(HTTPException):
+            field_text({"proposal": f"a{c}b"}, "proposal")
+        assert scrub(f"a{c}b") == "a\ufffdb"
+    ok = "e\u0301 \u0646\u200c\u0627 \U0001f468\u200d\U0001f469 \u2764\ufe0f"
+    assert clean_text(ok, "title", max_len=100) == ok
+    assert clean_text("one\u2028two\u2029three", "body", max_len=100) == "one\ntwo\nthree"
+    assert scrub("one\u2028two") == "one\ntwo"
+
+
+def test_field_text_turns_a_wrong_type_into_a_400_naming_the_field():
+    """XE-0966/XE-1010: every payload field the code lower-cases, compares or looks up goes through one
+    guard, so a list where a hash was expected is a 400, not an AttributeError."""
+    from dao.text import field_text
+    for wrong in ([], {}, 1, True, 0):
+        with pytest.raises(HTTPException) as e:
+            field_text({"proposal": wrong}, "proposal")
+        assert e.value.status_code == 400 and "proposal" in e.value.detail
+    assert field_text({}, "proposal") == ""
+    assert field_text({"proposal": "AB"}, "proposal") == "AB"
+    with pytest.raises(HTTPException):
+        field_text({"proposal": "x" * 300}, "proposal")
+
+
+def test_every_payload_string_site_uses_the_guard():
+    """The rule, enforced on the tree: no service or route reads a payload field and treats it as text
+    without `clean_text` or `field_text`. Equality comparisons (`!=`) are safe for any type and are allowed."""
+    import re
+    bare = re.compile(r"payload\.get\([^)]*\)\s*(or\s*\"\")?\s*\)?\s*\.(lower|strip|upper|encode)|\(v\.payload\.get\([^)]*\) or \"\"\)\.")
+    for path in (ROOT / "dao").rglob("*.py"):
+        for n, line in enumerate(path.read_text().splitlines(), 1):
+            assert not bare.search(line), f"{path.relative_to(ROOT)}:{n} treats a payload field as text without the guard"
+
+
+def test_browser_signer_sorts_keys_by_code_point_like_python():
+    """XE-1186: signer.js and canonical.py are two implementations of one format. Keys that start with an
+    astral-plane character sort after U+E000..U+FFFF by code point (Python) and before them by UTF-16 code
+    unit (JavaScript's default sort); the signer must give Python's order. Runs the signer's own `canon`
+    under node when it is available."""
+    import shutil
+    import subprocess
+    if not shutil.which("node"):
+        pytest.skip("node not available")
+    js = (ROOT / "dao/static/signer.js").read_text()
+    start, end = js.index("  // Python json.dumps(sort_keys=True"), js.index("  async function sha256(")
+    vectors = [
+        {"\ufffd": 1, "\U00010000": 2, "a": [3, {"\U0001f600": "x", "\uffff": "y", "z": "\u00e9"}]},
+        {"b": 1, "a": "\u2028", "\u00e9": None, "": True},
+    ]
+    script = js[start:end] + "\nconst vs = JSON.parse(process.argv[1]);\nfor (const v of vs) process.stdout.write(canon(v) + '\\n');\n"
+    out = subprocess.run(["node", "-e", script, json.dumps(vectors)], capture_output=True, text=True, check=True).stdout
+    assert out.splitlines() == [canonical_json(v).decode("ascii") for v in vectors]
+
+
 def test_rate_limit_buckets_refill_and_forget():
     from dao.ratelimit import Buckets, Limit
     b = Buckets(sweep_every_s=10)
@@ -409,3 +470,96 @@ def _const(value):
     async def f():
         return value
     return f
+
+
+def test_dated_jobs_are_due_once_per_calendar_period(monkeypatch):
+    """XE-1192: a dated job is due when it has not run since its most recent scheduled time, read off the
+    calendar; a 31-day month does not make the monthly job due again on the 4th."""
+    from datetime import datetime, timezone
+    from dao import worker_schedule as ws
+    cfg = SimpleNamespace(config=SimpleNamespace(cadence={"monthly_report_day": 1, "daily_note_hour_utc": 8}))
+    NS = 1_000_000_000
+
+    def at(y, m, d, h=12):
+        return int(datetime(y, m, d, h, tzinfo=timezone.utc).timestamp() * NS)
+
+    runs = []
+    for day in range(1, 32):
+        monkeypatch.setattr(ws.time, "time_ns", lambda d=day: at(2026, 3, d))
+        monkeypatch.setattr(ws, "datetime", _FrozenDatetime.at(datetime(2026, 3, day, 12, tzinfo=timezone.utc)))
+        j = ws.job_table(cfg)["monthly"]
+        if ws.due_at(runs[-1] if runs else None, j["prev"]):
+            runs.append(at(2026, 3, day))
+    assert runs == [at(2026, 3, 1)], "one run in March, on the 1st"
+    monkeypatch.setattr(ws.time, "time_ns", lambda: at(2026, 4, 1))
+    monkeypatch.setattr(ws, "datetime", _FrozenDatetime.at(datetime(2026, 4, 1, 12, tzinfo=timezone.utc)))
+    j = ws.job_table(cfg)["monthly"]
+    assert ws.due_at(runs[-1], j["prev"]) and j["prev"] == datetime(2026, 4, 1, 9, tzinfo=timezone.utc)
+    assert j["at"] == datetime(2026, 5, 1, 9, tzinfo=timezone.utc)
+    # the daily and weekly jobs expose the same shape
+    t = ws.job_table(cfg)
+    assert t["daily"]["at"] - t["daily"]["prev"] == __import__("datetime").timedelta(days=1)
+    assert t["weekly"]["at"] - t["weekly"]["prev"] == __import__("datetime").timedelta(days=7)
+
+
+class _FrozenDatetime:
+    """`datetime` as worker_schedule sees it, with `now()` pinned."""
+    @classmethod
+    def at(cls, when):
+        from datetime import datetime as real
+
+        class Frozen(real):
+            @classmethod
+            def now(cls_, tz=None):
+                return when if tz else when.replace(tzinfo=None)
+        return Frozen
+
+
+def test_node_advertised_difficulty_is_bounded_and_worker_pow_has_a_deadline():
+    """XE-1188 / XE-1195: a difficulty below the harness default (including "0") or asking more than
+    MAX_WORK_FACTOR times the default's work is refused the way a malformed one is, and the default stands;
+    the grind the worker runs carries a deadline."""
+    from xe.pow import (CHAT_POW_DIFFICULTY, DEFAULT_DIFFICULTY, MAX_WORK_FACTOR, WORKER_POW_DEADLINE_S,
+                        compute_pow, expected_work, parse_difficulty)
+    for d in (DEFAULT_DIFFICULTY, CHAT_POW_DIFFICULTY):
+        assert parse_difficulty(f"{d:x}", d) == d
+        harder_ok = (1 << 64) - ((1 << 64) - d) // MAX_WORK_FACTOR
+        assert parse_difficulty(f"{harder_ok:x}", d) == harder_ok
+        for bad in ("0", "1", f"{d - 1:x}", f"{harder_ok + 1:x}", "ffffffffffffffff", "fffffffffffff000"):
+            with pytest.raises(ValueError):
+                parse_difficulty(bad, d)
+        assert parse_difficulty(None, d) == d and parse_difficulty("", d) == d
+    assert expected_work(DEFAULT_DIFFICULTY) == 2 ** 21 and expected_work(CHAT_POW_DIFFICULTY) == 2 ** 18
+    with pytest.raises(TimeoutError):
+        compute_pow(b"\x00" * 32, 0xFFFFFFFFFFFFFFFF, deadline_s=0.05)
+    assert WORKER_POW_DEADLINE_S > 0
+    # the two unattended callers pass it
+    import inspect
+    from dao import chainops
+    from dao.services import inbox
+    assert "WORKER_POW_DEADLINE_S" in inspect.getsource(chainops._pow)
+    assert "WORKER_POW_DEADLINE_S" in inspect.getsource(inbox.flush_outbox)
+
+
+async def test_full_chain_stops_at_the_page_bound_whatever_total_the_node_claims():
+    """XE-1189: the walk ends on a short page or the node's total when honest, and on the page bound when
+    not, with an error rather than a silently truncated chain."""
+    from xe.client import MAX_CHAIN_PAGES, PAGE, XeClient, XeError
+    c = XeClient("http://node")
+    calls = []
+
+    async def lying(address, offset=0, limit=PAGE):
+        calls.append(offset)
+        return {"blocks": [{"hash": str(offset + i)} for i in range(limit)], "total": 2_000_000_000}
+
+    c.chain = lying
+    with pytest.raises(XeError) as e:
+        await c.full_chain("a" * 64)
+    assert e.value.status == 413 and len(calls) == MAX_CHAIN_PAGES
+
+    async def honest(address, offset=0, limit=PAGE):
+        blocks = [{"hash": str(i)} for i in range(offset, min(offset + limit, 2500))]
+        return {"blocks": blocks, "total": 2500}
+
+    c.chain = honest
+    assert len(await c.full_chain("a" * 64)) == 2500

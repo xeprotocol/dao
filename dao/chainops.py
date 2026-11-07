@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable
 from xe.client import XeClient, XeError
 from xe.encoding import Block, sign_block
 from xe.keys import KeyPair
-from xe.pow import compute_pow
+from xe.pow import WORKER_POW_DEADLINE_S, compute_pow
 
 from .context import Context
 
@@ -23,8 +23,8 @@ log = logging.getLogger("dao.chainops")
 
 
 async def _pow(hash_hex: str, difficulty: int) -> int:
-    # PoW is CPU work; keep it off the event loop.
-    return await asyncio.to_thread(compute_pow, bytes.fromhex(hash_hex), difficulty)
+    # PoW is CPU work; keep it off the event loop, and never let it run unbounded (XE-1188).
+    return await asyncio.to_thread(compute_pow, bytes.fromhex(hash_hex), difficulty, WORKER_POW_DEADLINE_S)
 
 
 async def _tip(chain: XeClient, account: str) -> tuple[str, dict[str, int]]:
@@ -54,10 +54,10 @@ async def submit_signed(ctx: Context, b: Block, kp: KeyPair) -> Block:
 
 
 async def receive_pending(ctx: Context, key_name: str, scope: str = "block.receive",
-                          on_made: Callable[[Block], Awaitable[None]] | None = None) -> list[Block]:
+                          on_made: Callable[[Block, int], Awaitable[None]] | None = None) -> list[Block]:
     """Receive every pending send to the account held under `key_name`. Returns the blocks made.
 
-    Each block is reported through `on_made` as soon as the node has it, so the caller can record it before
+    Each block is reported through `on_made(block, amount)` as soon as the node has it, so the caller can record it before
     the next one is attempted; a send that cannot be received is logged and skipped rather than stopping the
     run, since the ones behind it are independent (XE-0488)."""
     kp = ctx.signer.keypair(key_name, scope)
@@ -74,7 +74,7 @@ async def receive_pending(ctx: Context, key_name: str, scope: str = "block.recei
             continue
         made.append(b)
         if on_made is not None:
-            await on_made(b)
+            await on_made(b, int(p["amount"]))
     return made
 
 
@@ -120,7 +120,10 @@ async def burn(ctx: Context, key_name: str, scope: str, amount: int, memo: str =
 # So the snapshot for a proposal is not taken at the moment it opens but an hour and a margin earlier
 # (`snapshot_time`): a block made at real time r is dated r - 1h at the earliest, which is after the snapshot
 # whenever r is after the open. Nothing done once a proposal is visible can move its snapshot: not a new
-# wallet, not a transfer, not a split (XE-0352). Holders see the balance they had an hour before open.
+# wallet, not a transfer, not a split (XE-0352). That is the whole of what the lead guarantees. It is not a
+# holding period: XE borrowed before the open and returned after it weighs at the snapshot like any other
+# balance, and the opener, who picks the moment of opening, can arrange that (XE-1098). What the portal
+# promises is that the weights are fixed before anyone else learns there is a vote.
 #
 # Second, a receive dated before the snapshot whose source send is dated after it is possible on the wire and
 # impossible in fact: the XE cannot be in the receiving wallet before it left the sending one. Counting it
@@ -141,9 +144,11 @@ def snapshot_time(opened_at_ns: int) -> int:
 async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str = "XE") -> dict:
     """Balance of `asset` as of `at_ns`, plus whether the account existed by then.
 
-    XE accounts are chains; each block carries the post-state balance for its asset, so the balance
-    at a time is the balance on the last block of that asset with timestamp <= at_ns, less any receive
-    in that run whose source send is dated after at_ns (see above).
+    XE accounts are chains; each block carries the post-state balance for its asset, so the balance at a
+    time is the balance on the last counted block of that asset with timestamp <= at_ns. A receive whose
+    source send is dated after at_ns (see above) is not counted, for any asset: its amount is carried as
+    `tainted`, which later sends and burns spend first, and what is still tainted at the end is taken off
+    the balance (XE-1003). `snapshot_block` is the last counted block.
     """
     empty = {"exists": False, "balance": 0, "first_block_ts": None, "snapshot_block": "", "excluded_receives": []}
     try:
@@ -155,30 +160,33 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
     if not blocks:
         return empty
     first_ts = int(blocks[0].get("timestamp", 0))
-    bal = 0
-    prev_bal = 0
+    bal = 0        # the asset's on-chain balance after the last block seen
+    tainted = 0    # the part of `bal` that arrived through excluded receives and has not left since
     snap = ""
     excluded: list[str] = []
-    excluded_amount = 0
     counted = 0
     for b in blocks:
         ts = int(b.get("timestamp", 0))
         if ts > at_ns:
             break
-        if b.get("asset") != asset:
-            counted += 1
+        ours = b.get("asset") == asset
+        if (b.get("type") == "receive" and ts > at_ns - CAUSAL_CHECK_NS
+                and not await _send_at_or_before(chain, b.get("source") or "", at_ns)):
+            excluded.append(b.get("hash", ""))
+            if ours:
+                new_bal = int(b.get("balance", 0))
+                tainted += max(new_bal - bal, 0)
+                bal = new_bal
             continue
-        bal = int(b.get("balance", 0))
-        snap = b.get("hash", "")
-        if b.get("type") == "receive" and ts > at_ns - CAUSAL_CHECK_NS:
-            if not await _send_at_or_before(chain, b.get("source") or "", at_ns):
-                excluded.append(b.get("hash", ""))
-                excluded_amount += max(bal - prev_bal, 0)
-                prev_bal = bal
-                continue
-        prev_bal = bal
         counted += 1
-    return {"exists": first_ts <= at_ns and counted > 0, "balance": max(bal - excluded_amount, 0),
+        if not ours:
+            continue
+        new_bal = int(b.get("balance", 0))
+        if new_bal < bal:
+            tainted = max(tainted - (bal - new_bal), 0)
+        bal = new_bal
+        snap = b.get("hash", "")
+    return {"exists": first_ts <= at_ns and counted > 0, "balance": max(bal - tainted, 0),
             "first_block_ts": first_ts, "snapshot_block": snap, "excluded_receives": excluded}
 
 

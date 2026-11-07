@@ -8,13 +8,13 @@ from pathlib import Path
 
 import yaml
 from fastapi import APIRouter, Query, Request
+from fastapi import Path as PathParam
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from markdown_it import MarkdownIt
 from markupsafe import Markup
 
 from xe.amounts import from_micro
-from xe.client import XeError
 
 from . import __version__
 from .chainops import snapshot_time
@@ -22,6 +22,7 @@ from .context import get_context
 from .db import session
 from .log import EventLog, event_to_dict
 from .mirror import build_llms_txt, md_path
+from .ratelimit import NODE_READ, enforce_ip
 from .services import inbox as inbox_svc
 from .services import pause as pause_svc
 from .services import portal, records, resolutions, sessions
@@ -180,7 +181,7 @@ async def decisions_page(request: Request):
     async with session() as db:
         common = await _common(db)
         decided = await portal.list_proposals(db, "decided", 0, 100)
-        closed = await portal.list_proposals(db, "closed", 0, 100)
+        closed = await portal.awaiting_decision(db, 100)
     return render(request, "decisions.html", {**common, "decided": decided, "closed": closed})
 
 
@@ -212,7 +213,7 @@ async def live_page(request: Request):
 
 
 @router.get("/log/{index}", response_class=HTMLResponse)
-async def log_entry(request: Request, index: int):
+async def log_entry(request: Request, index: int = PathParam(ge=0, le=2**63 - 1)):
     async with session() as db:
         common = await _common(db)
         ev = await EventLog.get(db, index)
@@ -233,16 +234,14 @@ async def inbox_page(request: Request):
 
 @router.get("/records", response_class=HTMLResponse)
 async def records_page(request: Request):
+    enforce_ip(request, NODE_READ)
     c = get_context()
     async with session() as db:
         common = await _common(db)
         res = await resolutions.list_resolutions(db)
         anchors = await records.anchors(db, 10)
         hist = await pause_svc.history(db)
-    try:
-        ks = await c.chain.dao_keyset()
-    except XeError as e:
-        ks = {"error": str(e)}
+    ks = await records.public_keyset(c)
     onchain = await records.onchain_registry(c)
     treasury = await records.treasury(c)
     return render(request, "records.html", {
@@ -254,6 +253,7 @@ async def records_page(request: Request):
 
 @router.get("/members", response_class=HTMLResponse)
 async def members_page(request: Request):
+    enforce_ip(request, NODE_READ)
     c = get_context()
     async with session() as db:
         common = await _common(db)
@@ -261,11 +261,8 @@ async def members_page(request: Request):
         sess = await sessions.list_sessions(db)
         msgs = await inbox_svc.list_public(db, 100)
         untriaged = len(await inbox_svc.list_untriaged(db, 100))
-        closed = await portal.list_proposals(db, "closed", 0, 50)
-    try:
-        ks = await c.chain.dao_keyset()
-    except XeError as e:
-        ks = {"error": str(e), "keys": [], "threshold": 0}
+        closed = await portal.awaiting_decision(db, 50)
+    ks = await records.public_keyset(c)
     return render(request, "members.html", {
         **common, "cfg": c.config, "resolutions": res, "sessions": sess, "messages": msgs, "untriaged": untriaged,
         "closed": closed, "keyset": ks, "reserved": sorted(resolutions.RESERVED_MATTERS), "ordinary": sorted(resolutions.ORDINARY_MATTERS),

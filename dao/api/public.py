@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Path, Query, Request
 from fastapi.responses import RedirectResponse
 from sse_starlette.sse import EventSourceResponse
 
@@ -19,6 +19,7 @@ from ..ratelimit import INBOX, PROPOSAL, SNAPSHOT, VOTE, enforce_account, enforc
 from ..services import inbox as inbox_svc
 from ..services import pause as pause_svc
 from ..services import portal, records
+from ..text import field_text
 from ..worker_schedule import next_runs
 from .deps import Ctx, Db
 
@@ -157,7 +158,7 @@ async def cast_vote_flat(request: Request, req: SignedRequest, ctx: Ctx, db: Db)
     v = verify_signed(req, DOMAIN_VOTE)
     enforce_account(VOTE, v.account)
     await claim_signature(db, v)
-    pr = await portal.get(db, v.payload.get("proposal", ""))
+    pr = await portal.get(db, field_text(v.payload, "proposal"))
     row = await portal.vote(ctx, db, pr, v)
     await db.commit()
     return {"account": row.account, "choice": row.choice, "weight": row.weight, "participating": row.participating,
@@ -167,7 +168,7 @@ async def cast_vote_flat(request: Request, req: SignedRequest, ctx: Ctx, db: Db)
 @router.get("/decisions")
 async def decisions(db: Db, limit: int = Query(50, ge=1, le=200)):
     rows = await portal.list_proposals(db, "decided", 0, limit)
-    closed = await portal.list_proposals(db, "closed", 0, limit)
+    closed = await portal.awaiting_decision(db, limit)
     return {"decided": [portal.to_dict(p, include_body=False) for p in rows],
             "awaiting_decision": [portal.to_dict(p, include_body=False) for p in closed]}
 
@@ -252,9 +253,7 @@ async def log_verify(ctx: Ctx, db: Db):
 
 
 @router.get("/log/{index}")
-async def log_get(index: int, db: Db):
-    if index < 0:
-        raise HTTPException(404, "no such event")
+async def log_get(db: Db, index: int = Path(ge=0, le=2**63 - 1)):
     ev = await EventLog.get(db, index)
     if ev is None or not ev.public:
         raise HTTPException(404, "no such event")
@@ -262,7 +261,7 @@ async def log_get(index: int, db: Db):
 
 
 @router.get("/events")
-async def events_stream(request: Request, ctx: Ctx, db: Db, after: int | None = None):
+async def events_stream(request: Request, ctx: Ctx, db: Db, after: int | None = Query(None, ge=0, le=2**63 - 1)):
     """Server-sent events. Each public log entry is sent as `event: entry` (kind inside the data) as it
     lands in the database, whichever process wrote it; `event: ping` every 15 s. Resumes from
     `Last-Event-ID` or `?after=<index>`. Browsers navigating here directly are sent to /live."""
