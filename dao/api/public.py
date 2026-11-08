@@ -15,7 +15,7 @@ from ..auth import SignedRequest, claim_signature, require_pow, require_seat, ve
 from ..canonical import DOMAIN_INBOX_HTTP, DOMAIN_MEMBER_ACTION, DOMAIN_PROPOSAL, DOMAIN_VOTE
 from ..db import session
 from ..log import EventLog, event_to_dict
-from ..ratelimit import INBOX, NODE_READ, PROPOSAL, SNAPSHOT, VOTE, enforce_account, enforce_ip
+from ..ratelimit import INBOX, NODE_READ, PROPOSAL, SNAPSHOT, STREAMS, VOTE, enforce_account, enforce_ip
 from ..services import inbox as inbox_svc
 from ..services import pause as pause_svc
 from ..services import portal, records
@@ -269,14 +269,20 @@ async def events_stream(request: Request, ctx: Ctx, after: int | None = Query(No
     The one long-lived response: it takes no request-scoped session (that would pin a pooled connection
     for as long as the stream is open, and twenty streams would hold the whole pool, XE-1237). Every read,
     including the first, is its own short session; between polls the stream holds no connection. Opening
-    a stream spends a node-read token so one address cannot open them without bound."""
+    a stream spends a node-read token, and an address holds a few at most (`STREAMS`), so streams cannot
+    be opened or accumulated without bound."""
     accept = request.headers.get("accept", "")
     if "text/html" in accept and "text/event-stream" not in accept:
         return RedirectResponse("/live", status_code=302)
     enforce_ip(request, NODE_READ)
+    holder = STREAMS.take(request)
 
-    async with session() as s:
-        head = await EventLog.head(s)
+    try:
+        async with session() as s:
+            head = await EventLog.head(s)
+    except BaseException:
+        STREAMS.release(holder)
+        raise
     resume = request.headers.get("last-event-id")
     last_index = int(resume) if resume and resume.lstrip("-").isdigit() else (after if after is not None else head.index)
     wake: asyncio.Queue = asyncio.Queue(maxsize=1000)
@@ -304,6 +310,7 @@ async def events_stream(request: Request, ctx: Ctx, after: int | None = Query(No
                     pass
         finally:
             ctx.events.unsubscribe(wake)
+            STREAMS.release(holder)
 
     return EventSourceResponse(gen())
 

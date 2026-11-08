@@ -581,3 +581,74 @@ def test_the_streaming_handler_holds_no_request_scoped_session():
     assert set(streaming) == {"events_stream"}, streaming
     for name, params in streaming.items():
         assert "Db" not in params and "db" not in inspect.signature(getattr(public, name)).parameters, name
+
+
+async def test_snapshot_node_reads_are_bounded_and_the_bound_only_lowers_the_weight():
+    """XE-1460: one read per distinct source send, at most MAX_CAUSAL_LOOKUPS of them, and receives past the
+    bound are excluded, never counted."""
+    from dao.chainops import CAUSAL_LOOKUP_CONCURRENCY, MAX_CAUSAL_LOOKUPS, account_snapshot
+    T = 100 * H
+    n = MAX_CAUSAL_LOOKUPS * 4
+    early = {"timestamp": T - 3 * H}
+    # a dense account: n receives of 1 in the two-hour window, every one from a distinct, genuinely early send,
+    # then the same n receives again from the same sends (repeats cost nothing)
+    recvs = [{"type": "receive", "asset": "XE", "balance": i + 1, "timestamp": T - H + i, "hash": f"r{i}", "source": f"s{i % n}"}
+             for i in range(2 * n)]
+    chain = _Lattice({"D": recvs}, {f"s{i}": early for i in range(n)})
+    in_flight = {"now": 0, "max": 0}
+    real = chain.block
+
+    async def counted(h):
+        in_flight["now"] += 1
+        in_flight["max"] = max(in_flight["max"], in_flight["now"])
+        try:
+            return await real(h)
+        finally:
+            in_flight["now"] -= 1
+    chain.block = counted
+    d = await account_snapshot(chain, "D", T)
+    assert chain.lookups == MAX_CAUSAL_LOOKUPS and in_flight["max"] <= CAUSAL_LOOKUP_CONCURRENCY
+    assert d["lookups_capped"] and len(d["excluded_receives"]) == 2 * n - 2 * MAX_CAUSAL_LOOKUPS
+    # the true balance is 2n; what is counted is at most that, and exactly the receives whose sends were checked
+    assert d["balance"] == 2 * MAX_CAUSAL_LOOKUPS <= 2 * n
+    # a sparse account is unaffected: every send looked up once, nothing capped
+    chain2 = _Lattice({"S": recvs[:3]}, {f"s{i}": early for i in range(3)})
+    s = await account_snapshot(chain2, "S", T)
+    assert chain2.lookups == 3 and not s["lookups_capped"] and s["balance"] == 3 and s["excluded_receives"] == []
+
+
+def test_agents_tip_a_human_decision_and_never_make_one():
+    """XE-1459: agent weight is bounded by the weight humans decided with, not by the total cast."""
+    agent = _vote(100_000_000_000, "for", participating=False, is_agent=True)
+    # humans abstain: quorum is met, nothing is decided, the agents do not decide it
+    t = tally(_proposal(), [_vote(1_000_000, "abstain") for _ in range(20)] + [agent])
+    assert t["quorum_met"] and t["weight"]["for"] == 0 and t["outcome"] == "failed"
+    # humans vote dust against: the agents are bounded against that dust, not against their own bloc
+    t = tally(_proposal(), [_vote(1_000_000, "against") for _ in range(20)] + [agent])
+    assert t["weight"]["for"] <= int(0.01 * 20_000_000) and t["outcome"] == "failed"
+    # no humans at all
+    t = tally(_proposal(quorum=0), [agent])
+    assert t["weight"]["for"] == 0 and t["outcome"] == "failed"
+    # contested control: a close human vote, the agents tip it within the cap
+    votes = [_vote(1_000_000, "for") for _ in range(10)] + [_vote(1_000_000, "against") for _ in range(10)] + [agent]
+    t = tally(_proposal(), votes)
+    assert 0 < t["weight"]["for"] - 10_000_000 <= int(0.01 * 20_000_000) and t["outcome"] == "passed"
+
+
+def test_held_streams_are_capped_per_address_and_in_total():
+    from fastapi import HTTPException
+
+    from dao.ratelimit import Held
+    held = Held("streams", per_ip=2, total=3)
+    req = lambda ip: SimpleNamespace(client=SimpleNamespace(host=ip))  # noqa: E731
+    a1, a2 = held.take(req("a")), held.take(req("a"))
+    with pytest.raises(HTTPException) as e:
+        held.take(req("a"))
+    assert e.value.status_code == 429
+    b1 = held.take(req("b"))
+    with pytest.raises(HTTPException):
+        held.take(req("c"))                      # total reached
+    held.release(a1)
+    held.take(req("c"))                          # a slot freed anywhere is available to anyone under their own cap
+    held.release(a2), held.release(b1)
+    assert held._n == 1 and held._by_ip == {"c": 1}

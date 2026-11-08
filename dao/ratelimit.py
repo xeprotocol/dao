@@ -84,6 +84,36 @@ def enforce_ip(request: Request, cls: RouteClass) -> None:
     _refuse(_buckets.take(f"ip:{cls.name}:{client_ip(request)}", cls.ip))
 
 
+class Held:
+    """A cap on what one address holds open at once, for the long-lived responses a token bucket does not
+    bound: a bucket limits how often a stream is opened, not how many are held (XE-1237 sibling sweep).
+    `take` raises 429 past the cap; the caller releases in `finally`."""
+
+    def __init__(self, name: str, per_ip: int, total: int):
+        self.name, self.per_ip, self.total = name, per_ip, total
+        self._by_ip: dict[str, int] = {}
+        self._n = 0
+
+    def take(self, request: Request) -> str:
+        ip = client_ip(request)
+        if self._n >= self.total or self._by_ip.get(ip, 0) >= self.per_ip:
+            raise HTTPException(429, f"too many open {self.name}; close one first", headers={"Retry-After": "5"})
+        self._by_ip[ip] = self._by_ip.get(ip, 0) + 1
+        self._n += 1
+        return ip
+
+    def release(self, ip: str) -> None:
+        self._n -= 1
+        left = self._by_ip.get(ip, 0) - 1
+        if left > 0:
+            self._by_ip[ip] = left
+        else:
+            self._by_ip.pop(ip, None)
+
+
+STREAMS = Held("streams", per_ip=4, total=256)
+
+
 def enforce_account(cls: RouteClass, account: str) -> None:
     """One token from the signing account's bucket for this class, once the signature has named it. The
     address is not charged again."""

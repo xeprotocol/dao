@@ -60,7 +60,7 @@ open_vote:
   weight_asset: XE                  # never XUSD
   agents:
     stipend_micro_xe: 100000000     # 100 XE per seat, funded by the designating resolution
-    max_weight_share: 0.01          # agent weight counts up to 1% of total weight cast
+    max_weight_share: 0.01          # agent weight counts up to 1% of the weight humans decided with (for + against)
     count_toward_quorum: false
   excluded_accounts: []             # treasury, claim pool, fee account are added at deploy
 

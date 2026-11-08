@@ -217,10 +217,13 @@ def tally(pr: Proposal, votes: list[Vote]) -> dict:
         (agent if v.is_agent else human)[v.choice] += v.weight
         if v.participating:
             participating += 1
-    human_total = sum(human.values())
-    # agents' weight counts up to cap × total weight cast, scaled pro rata across their votes
+    # Agents may tip a human decision, never make one: their weight counts up to cap × the weight humans
+    # decided with (for and against), scaled pro rata across their votes. Measured against the human
+    # decision and not the total cast, so where humans only abstain, or vote dust, the agents count for
+    # nothing and the proposal fails on `decided == 0` rather than passing on the agents alone (XE-1459).
+    human_decided = human["for"] + human["against"]
     agent_total = sum(agent.values())
-    agent_allowed = int(cap * (human_total + agent_total)) if agent_total else 0
+    agent_allowed = int(cap * human_decided) if agent_total else 0
     scale = min(1.0, agent_allowed / agent_total) if agent_total else 0.0
     counted = {k: human[k] + int(agent[k] * scale) for k in human}
     decided = counted["for"] + counted["against"]

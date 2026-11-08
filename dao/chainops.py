@@ -130,10 +130,17 @@ async def burn(ctx: Context, key_name: str, scope: str, amount: int, memo: str =
 # would let one balance vote from two wallets (send dated late, receive dated early), as many times as there
 # are wallets. A receive only counts when its source send is also at or before the snapshot. Only receives
 # dated within two hours of the snapshot can be affected, so only those are looked up.
+#
+# Third, a snapshot costs a bounded number of node reads whatever the chain looks like (XE-1460): each
+# source send is looked up once, at most `CAUSAL_LOOKUP_CONCURRENCY` at a time, and after
+# `MAX_CAUSAL_LOOKUPS` distinct sends the remaining receives in the window are excluded without a lookup.
+# Excluding can only lower the weight, so a chain built to be expensive is read cheaply and conservatively.
 TIMESTAMP_WINDOW_NS = 3600 * 1_000_000_000
 SNAPSHOT_MARGIN_NS = 5 * 60 * 1_000_000_000
 SNAPSHOT_LEAD_NS = TIMESTAMP_WINDOW_NS + SNAPSHOT_MARGIN_NS
 CAUSAL_CHECK_NS = 2 * TIMESTAMP_WINDOW_NS
+MAX_CAUSAL_LOOKUPS = 32
+CAUSAL_LOOKUP_CONCURRENCY = 8
 
 
 def snapshot_time(opened_at_ns: int) -> int:
@@ -148,9 +155,11 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
     time is the balance on the last counted block of that asset with timestamp <= at_ns. A receive whose
     source send is dated after at_ns (see above) is not counted, for any asset: its amount is carried as
     `tainted`, which later sends and burns spend first, and what is still tainted at the end is taken off
-    the balance (XE-1003). `snapshot_block` is the last counted block.
+    the balance (XE-1003). `snapshot_block` is the last counted block. Node reads are bounded (XE-1460,
+    see above); `lookups_capped` says whether the bound was hit.
     """
-    empty = {"exists": False, "balance": 0, "first_block_ts": None, "snapshot_block": "", "excluded_receives": []}
+    empty = {"exists": False, "balance": 0, "first_block_ts": None, "snapshot_block": "", "excluded_receives": [],
+             "lookups_capped": False}
     try:
         blocks = await chain.full_chain(account)
     except XeError as e:
@@ -160,6 +169,11 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
     if not blocks:
         return empty
     first_ts = int(blocks[0].get("timestamp", 0))
+    window = [b for b in blocks if int(b.get("timestamp", 0)) <= at_ns and b.get("type") == "receive"
+              and int(b.get("timestamp", 0)) > at_ns - CAUSAL_CHECK_NS]
+    sources = list(dict.fromkeys(b.get("source") or "" for b in window))   # distinct, in chain order
+    capped = len(sources) > MAX_CAUSAL_LOOKUPS
+    causal = await _sends_at_or_before(chain, sources[:MAX_CAUSAL_LOOKUPS], at_ns)
     bal = 0        # the asset's on-chain balance after the last block seen
     tainted = 0    # the part of `bal` that arrived through excluded receives and has not left since
     snap = ""
@@ -170,8 +184,7 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
         if ts > at_ns:
             break
         ours = b.get("asset") == asset
-        if (b.get("type") == "receive" and ts > at_ns - CAUSAL_CHECK_NS
-                and not await _send_at_or_before(chain, b.get("source") or "", at_ns)):
+        if b.get("type") == "receive" and ts > at_ns - CAUSAL_CHECK_NS and not causal.get(b.get("source") or "", False):
             excluded.append(b.get("hash", ""))
             if ours:
                 new_bal = int(b.get("balance", 0))
@@ -187,20 +200,28 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
         bal = new_bal
         snap = b.get("hash", "")
     return {"exists": first_ts <= at_ns and counted > 0, "balance": max(bal - tainted, 0),
-            "first_block_ts": first_ts, "snapshot_block": snap, "excluded_receives": excluded}
+            "first_block_ts": first_ts, "snapshot_block": snap, "excluded_receives": excluded, "lookups_capped": capped}
 
 
-async def _send_at_or_before(chain: XeClient, send_hash: str, at_ns: int) -> bool:
-    """True when the send a receive points at is on the chain and dated at or before `at_ns`."""
-    if not send_hash:
-        return False
-    try:
-        src = await chain.block(send_hash)
-    except XeError as e:
-        if e.status == 404:
+async def _sends_at_or_before(chain: XeClient, send_hashes: list[str], at_ns: int) -> dict[str, bool]:
+    """For each source send: True when it is on the chain and dated at or before `at_ns`. One read per
+    distinct hash, a bounded number in flight; a hash not in the result is not causal."""
+    gate = asyncio.Semaphore(CAUSAL_LOOKUP_CONCURRENCY)
+
+    async def one(h: str) -> bool:
+        if not h:
             return False
-        raise
-    return int(src.get("timestamp", 0)) <= at_ns
+        async with gate:
+            try:
+                src = await chain.block(h)
+            except XeError as e:
+                if e.status == 404:
+                    return False
+                raise
+        return int(src.get("timestamp", 0)) <= at_ns
+
+    found = await asyncio.gather(*(one(h) for h in send_hashes))
+    return dict(zip(send_hashes, found))
 
 
 async def account_pub_key(chain: XeClient, account: str) -> str:
