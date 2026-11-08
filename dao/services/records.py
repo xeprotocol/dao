@@ -14,7 +14,7 @@ from xe.client import XeError
 from ..context import Context
 from ..db import serialize
 from ..log import EventLog
-from ..models import Anchor, HealthCheck, SigningSession, TreasurySnapshot
+from ..models import Anchor, Event, HealthCheck, SigningSession, TreasurySnapshot
 from . import sessions
 
 
@@ -37,8 +37,8 @@ def registry_value(ctx: Context) -> dict:
         "licence": r.get("licence", ""),
         "charter_sha256": ctx.config.charter_hash,
         "accounts": {k: v for k, v in {
-            "dao": ctx.signer.address("dao") if ctx.signer.has("dao") else ctx.config.accounts.get("dao", ""),
-            "fee": ctx.signer.address("fee") if ctx.signer.has("fee") else ctx.config.accounts.get("fee", ""),
+            "dao": ctx.config.accounts.get("dao", ""),
+            "fee": ctx.config.accounts.get("fee", ""),
             "treasury": ctx.config.accounts.get("treasury", ""),
         }.items() if v},
         "log_signer": ctx.signer.public_key("harness") if ctx.signer.has("harness") else "",
@@ -142,8 +142,8 @@ async def treasury(ctx: Context) -> dict:
 async def _treasury(ctx: Context) -> dict:
     accts = {
         "treasury": ctx.config.accounts.get("treasury", ""),
-        "dao": ctx.signer.address("dao") if ctx.signer.has("dao") else ctx.config.accounts.get("dao", ""),
-        "fee": ctx.signer.address("fee") if ctx.signer.has("fee") else ctx.config.accounts.get("fee", ""),
+        "dao": ctx.config.accounts.get("dao", ""),
+        "fee": ctx.config.accounts.get("fee", ""),
     }
     out = {}
     for name, addr in accts.items():
@@ -261,10 +261,11 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
     if not ctx.signer.has("harness"):
         detail["signer_error"] = "no harness key: events cannot be signed"
 
-    try:   # last anchor age
+    try:   # last anchor age: measured from the last written anchor, or from the DAO's start if there is none (XE-1618)
         a = await latest_anchor(db, written=True)
         detail["last_anchor"] = {"n": a.n, "age_s": round(now / 1e9 - a.created_at.timestamp())} if a else None
-        if a and detail["last_anchor"]["age_s"] > ANCHOR_OVERDUE_S:
+        unanchored_s = detail["last_anchor"]["age_s"] if a else (now - (await started_at(db) or now)) / 1e9
+        if unanchored_s > ANCHOR_OVERDUE_S:
             detail["anchor_overdue"] = True
             ok = False
     except Exception as e:
@@ -315,16 +316,25 @@ async def last_health(db: AsyncSession) -> dict | None:
     return row.detail if row else None
 
 
+async def started_at(db: AsyncSession) -> int | None:
+    """When the DAO started: the first event in its log, in ns. The clock every "since the beginning"
+    measure runs from, so a leg that has no rows of its own (no anchor written, no health check recorded)
+    is measured against the DAO's age rather than against nothing (XE-1618, XE-1620)."""
+    first = (await db.execute(select(func.min(Event.ts)))).scalar_one()
+    return int(first) if first is not None else None
+
+
 async def uptime_30d(ctx: Context, db: AsyncSession) -> dict:
     """Checks that should have run but did not count as failures, so a stopped worker lowers the figure
-    instead of freezing it (XE-0908)."""
+    instead of freezing it (XE-0908). Expected checks run from the DAO's start, not from the first check
+    the worker happened to record, so a worker that started late or never does not score full (XE-1620)."""
     now = time.time_ns()
     since = now - WINDOW_30D_NS
     total = int((await db.execute(select(func.count()).select_from(HealthCheck).where(HealthCheck.ts >= since))).scalar_one())
     good = int((await db.execute(select(func.count()).select_from(HealthCheck).where(HealthCheck.ts >= since, HealthCheck.ok.is_(True)))).scalar_one())
-    first = (await db.execute(select(func.min(HealthCheck.ts)))).scalar_one()
+    first = await started_at(db)
     if first is None:
         return {"checks": 0, "ok": 0, "expected": 0, "fraction": None}
-    window_s = min(WINDOW_30D_NS, now - int(first)) / 1e9
+    window_s = min(WINDOW_30D_NS, now - first) / 1e9
     expected = max(total, int(window_s // cadence_s(ctx)))
     return {"checks": total, "ok": good, "expected": expected, "fraction": (good / expected) if expected else None}

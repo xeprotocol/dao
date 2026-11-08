@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +85,7 @@ class Config:
     kill_list: dict
     hashes: dict[str, str]
     prompts: dict[str, str]   # seat id (or "_preamble") -> markdown; config only, nothing calls a model in v1
+    signer_accounts: dict[str, str] = field(default_factory=dict)   # name -> address, from the loaded keyfile
 
     # ---- seats ----------------------------------------------------------------------------
 
@@ -148,7 +149,12 @@ class Config:
 
     @property
     def accounts(self) -> dict[str, str]:
-        return {k: (v or "").lower() for k, v in (self.schedule_c.get("accounts") or {}).items()}
+        """The company's accounts by name. Schedule C may name them; the signer is authoritative for the
+        ones it holds keys for (`dao`, `fee`), so a deployment that left the file blank still knows them
+        and every reader of this property (fee checks, inbox, registers, the vote exclusion) agrees (XE-1479)."""
+        out = {k: (v or "").lower() for k, v in (self.schedule_c.get("accounts") or {}).items()}
+        out.update({k: v.lower() for k, v in self.signer_accounts.items() if v})
+        return out
 
     @property
     def mode(self) -> str:
@@ -173,13 +179,14 @@ class Config:
         return self.schedule_b.get("cadence", {})
 
     def excluded_accounts(self) -> set[str]:
+        """Accounts whose vote weighs nothing: the company's own (treasury, fee, dao) and any Schedule B
+        names. Agent seats are not here: their weight is bounded by `agents.max_weight_share` in the tally
+        and their participation by `exclude_agent_accounts`; zeroing them would make both dead (XE-1479)."""
         ex = {a.lower() for a in self.open_vote.get("excluded_accounts", []) if a}
         for name in ("treasury", "fee", "dao"):
             a = self.accounts.get(name)
             if a:
                 ex.add(a)
-        if self.open_vote.get("participating_wallet", {}).get("exclude_agent_accounts", True):
-            ex |= self.agent_accounts
         return ex
 
     def pinned_rules(self) -> dict:

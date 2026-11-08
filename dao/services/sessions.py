@@ -18,7 +18,7 @@ import secrets
 import time
 
 from fastapi import HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.client import XeError
@@ -162,10 +162,30 @@ async def get(db: AsyncSession, session_id: str, *, lock: bool = False) -> Signi
     return s
 
 
-async def list_sessions(db: AsyncSession, status: str | None = None, limit: int = 100) -> list[SigningSession]:
-    q = select(SigningSession).order_by(SigningSession.created_at.desc()).limit(limit)
+OPEN = ("approving", "signing")
+
+
+async def list_sessions(db: AsyncSession, status: str | None = None, limit: int = 100, offset: int = 0) -> list[SigningSession]:
+    """A page of sessions, newest first, for listings. Not for deciding whether something is pending: a
+    page cannot see past its own end, and sessions are never deleted (XE-1561). Ask `open_sessions`."""
+    q = select(SigningSession).order_by(SigningSession.created_at.desc()).offset(offset).limit(limit)
     if status:
         q = q.where(SigningSession.status == status)
+    return list((await db.execute(q)).scalars().all())
+
+
+async def count_sessions(db: AsyncSession, status: str | None = None) -> int:
+    q = select(func.count()).select_from(SigningSession)
+    if status:
+        q = q.where(SigningSession.status == status)
+    return int((await db.execute(q)).scalar_one())
+
+
+async def open_sessions(db: AsyncSession, kind: str | None = None) -> list[SigningSession]:
+    """Every session still approving or signing, unpaged, oldest first; optionally of one kind."""
+    q = select(SigningSession).where(SigningSession.status.in_(OPEN)).order_by(SigningSession.created_at.asc())
+    if kind:
+        q = q.where(SigningSession.kind == kind)
     return list((await db.execute(q)).scalars().all())
 
 
@@ -216,6 +236,9 @@ async def rebuild(ctx: Context, db: AsyncSession, s: SigningSession, actor: str 
     counted against the keyset as it is now, and not before the timelock has run."""
     if s.status not in ("approving", "signing"):
         raise HTTPException(409, f"session is {s.status}")
+    if s.status == "signing" and await landed(ctx, s):
+        # The tip moved because this block is the tip: rebuilding would write the same ops twice (XE-1511).
+        return await _submitted(ctx, db, s)
     require_timelock_run(s)
     await require_unpaused(db)
     ks = await live_keyset(ctx)
@@ -297,6 +320,33 @@ async def is_stale(ctx: Context, s: SigningSession) -> bool:
     return tip.get("hash") != s.block["prev_hash"]
 
 
+async def landed(ctx: Context, s: SigningSession) -> bool:
+    """Whether the session's block is on the chain at its index. The chain is the record of what happened;
+    the node's answer to a submit is not: it can refuse after it has applied the block (a gossip publish
+    failing after AddBlock), and a session marked failed on that answer would say a rotation, a parameter
+    change or an anchor did not happen when it did, with `failed` terminal and the anchor row gone
+    (XE-1511). Raises if the chain cannot be read; the caller leaves the session as it is."""
+    if not s.block:
+        return False
+    try:
+        got = await ctx.chain.statechain_block(int(s.block["index"]))
+    except XeError as e:
+        if e.status == 404:
+            return False
+        raise
+    return bool(got) and got.get("hash") == s.block_hash
+
+
+async def _submitted(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSession:
+    s.status = "submitted"
+    s.submitted_index = int(s.block["index"])
+    s.submitted_hash = s.block_hash
+    await ctx.events.append(db, "session.submitted", "harness", {
+        "session_id": s.id, "kind": s.kind, "index": s.submitted_index, "hash": s.submitted_hash, "ops": s.ops,
+    }, ref=f"session:{s.id}")
+    return s
+
+
 async def submit(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSession:
     require_timelock_run(s)
     await require_unpaused(db)
@@ -304,6 +354,16 @@ async def submit(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSe
     try:
         await ctx.chain.submit_statechain_block(blk)
     except XeError as e:
+        # Before believing a refusal, ask the chain. If the block is there, it was accepted. If the chain
+        # cannot be read, the session stays `signing` with the error on record and the next pass asks again.
+        try:
+            if await landed(ctx, s):
+                return await _submitted(ctx, db, s)
+        except XeError as read_err:
+            s.error = f"submit: {e}; could not confirm against the chain: {read_err}"
+            await ctx.events.append(db, "session.submit_unconfirmed", "harness",
+                                    {"session_id": s.id, "error": s.error[:300]}, ref=f"session:{s.id}")
+            return s
         msg = str(e).lower()
         if any(w in msg for w in ("prev", "index", "tip", "stale", "not the next")):
             await ctx.events.append(db, "session.tip_moved", "harness", {
@@ -316,13 +376,7 @@ async def submit(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSe
         await _ended(db, s)
         await ctx.events.append(db, "session.failed", "harness", {"session_id": s.id, "error": str(e)}, ref=f"session:{s.id}")
         return s
-    s.status = "submitted"
-    s.submitted_index = blk.index
-    s.submitted_hash = blk.hash
-    await ctx.events.append(db, "session.submitted", "harness", {
-        "session_id": s.id, "kind": s.kind, "index": blk.index, "hash": blk.hash, "ops": s.ops,
-    }, ref=f"session:{s.id}")
-    return s
+    return await _submitted(ctx, db, s)
 
 
 async def cancel(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified, reason: str) -> SigningSession:

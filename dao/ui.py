@@ -260,7 +260,7 @@ async def members_page(request: Request):
         res = await resolutions.list_resolutions(db)
         sess = await sessions.list_sessions(db)
         msgs = await inbox_svc.list_public(db, 100)
-        untriaged = len(await inbox_svc.list_untriaged(db, 100))
+        untriaged = await inbox_svc.count_untriaged(db)
         closed = await portal.awaiting_decision(db, 50)
     ks = await records.public_keyset(c)
     return render(request, "members.html", {

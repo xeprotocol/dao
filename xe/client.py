@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, AsyncIterator
+from urllib.parse import quote
 
 import httpx
 
@@ -16,6 +17,13 @@ from .statechain import StateBlock
 
 PAGE = 1000
 MAX_CHAIN_PAGES = 100   # 100,000 blocks: far past any account the harness reads for weight or fees
+
+
+def _seg(value: Any) -> str:
+    """One path segment. A caller-supplied key, hash or address is data, never structure: `?`, `#`, `/`
+    and the rest are percent-encoded so the node answers for the resource named, or 404s, and never for
+    a different one (XE-1489)."""
+    return quote(str(value), safe="")
 
 
 class XeError(RuntimeError):
@@ -94,10 +102,10 @@ class XeClient:
     # ---- accounts ------------------------------------------------------------------------
 
     async def balance(self, address: str) -> dict:
-        return await self._get(f"/accounts/{address}/balance")
+        return await self._get(f"/accounts/{_seg(address)}/balance")
 
     async def chain(self, address: str, offset: int = 0, limit: int = 1000) -> dict:
-        return await self._get(f"/accounts/{address}/chain", offset=offset, limit=limit)
+        return await self._get(f"/accounts/{_seg(address)}/chain", offset=offset, limit=limit)
 
     async def full_chain(self, address: str) -> list[dict]:
         """Every block of an account, paged. The node's `total` ends the walk when it is honest; the page
@@ -116,7 +124,7 @@ class XeClient:
 
     async def keyset_of(self, address: str) -> dict | None:
         try:
-            return await self._get(f"/accounts/{address}/keyset")
+            return await self._get(f"/accounts/{_seg(address)}/keyset")
         except XeError as e:
             if e.status == 404:
                 return None
@@ -128,7 +136,7 @@ class XeClient:
     async def pending_for(self, address: str) -> list[dict]:
         """Pending sends to `address`, normalised to lower-case keys:
         {send_hash, source, destination, amount, asset, timestamp}."""
-        res = await self._get(f"/pending/{address}")
+        res = await self._get(f"/pending/{_seg(address)}")
         entries = res.get("pending", []) if isinstance(res, dict) else (res or [])
         out = []
         for p in entries or []:
@@ -152,13 +160,13 @@ class XeClient:
         return {k: int(v) for k, v in (res.get("balances") or {}).items()}
 
     async def block(self, block_hash: str) -> dict:
-        return await self._get(f"/blocks/{block_hash}")
+        return await self._get(f"/blocks/{_seg(block_hash)}")
 
     async def recent_blocks(self, limit: int = 100, since_ns: int | None = None) -> list[dict]:
         return await self._get("/blocks/recent", limit=limit, since=since_ns) or []
 
     async def submit_block(self, b: Block) -> Any:
-        return await self._post_json(f"/blocks/{b.type}", b.to_json())
+        return await self._post_json(f"/blocks/{_seg(b.type)}", b.to_json())
 
     # ---- state chain ---------------------------------------------------------------------
 
@@ -169,7 +177,7 @@ class XeClient:
         return await self._get("/statechain/blocks", start=start, limit=limit)
 
     async def statechain_block(self, index: int) -> dict:
-        return await self._get(f"/statechain/blocks/{index}")
+        return await self._get(f"/statechain/blocks/{_seg(index)}")
 
     async def statechain_kv(self, prefix: str | None = None, offset: int = 0, limit: int = 1000) -> dict:
         return await self._get("/statechain/kv", prefix=prefix, offset=offset, limit=limit) or {}
@@ -177,7 +185,7 @@ class XeClient:
     async def statechain_key(self, key: str) -> Any:
         """Returns the value, or None if the key is not set."""
         try:
-            res = await self._get(f"/statechain/kv/{key}")
+            res = await self._get(f"/statechain/kv/{_seg(key)}")
         except XeError as e:
             if e.status == 404:
                 return None
@@ -196,7 +204,7 @@ class XeClient:
 
     async def directory(self, account: str) -> dict | None:
         try:
-            return await self._get(f"/directory/{account}")
+            return await self._get(f"/directory/{_seg(account)}")
         except XeError as e:
             if e.status == 404:
                 return None

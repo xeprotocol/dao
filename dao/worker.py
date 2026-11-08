@@ -182,12 +182,11 @@ class Worker:
     async def job_weekly(self):
         async with session() as db:
             up = await records.uptime_30d(self.ctx, db)
-            open_sessions = await sessions.list_sessions(db, "signing")
-            approving = await sessions.list_sessions(db, "approving")
+            pending = await sessions.open_sessions(db)
             await self.ctx.events.append(db, "note.weekly", "harness", {
                 "week_of": datetime.now(timezone.utc).date().isoformat(), "uptime_30d": up,
-                "sessions_awaiting_signature": [s.id for s in open_sessions],
-                "sessions_awaiting_approval": [s.id for s in approving],
+                "sessions_awaiting_signature": [s.id for s in pending if s.status == "signing"],
+                "sessions_awaiting_approval": [s.id for s in pending if s.status == "approving"],
                 "proposals": await portal.counts(db),
             })
             await mark_run(db, "weekly")
@@ -197,7 +196,7 @@ class Worker:
         async with session() as db:
             if await pause.is_paused(db):
                 return
-            pending = [s for s in await sessions.list_sessions(db) if s.kind == "anchor" and s.status in ("approving", "signing")]
+            pending = await sessions.open_sessions(db, kind="anchor")
             if pending:
                 log.info("anchor session %s still open; not opening another", pending[0].id)
             else:

@@ -8,8 +8,10 @@ quorum. Nothing here executes anything: a passed proposal becomes a decision ite
 
 from __future__ import annotations
 
+import logging
 import re
 import time
+from fractions import Fraction
 
 from fastapi import HTTPException
 from sqlalchemy import and_, func, or_, select
@@ -19,7 +21,7 @@ from xe.client import XeError
 
 from ..auth import Verified, bind
 from ..canonical import DOMAIN_PROPOSAL, canonical_json, sha256_hex
-from ..chainops import account_snapshot, snapshot_time
+from ..chainops import SNAPSHOT_RULE, account_snapshot, snapshot_time
 from ..context import Context
 from ..db import serialize
 from ..models import FeeLedger, Proposal, Resolution, Vote
@@ -29,13 +31,12 @@ from . import sessions
 D = 24 * 3600 * 1_000_000_000
 MAX_TITLE = 160
 MAX_BODY = 20_000
+log = logging.getLogger("dao.portal")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 FINAL = ("adopt", "decline")
 
 
 def fee_account(ctx: Context) -> str:
-    if ctx.signer.has("fee"):
-        return ctx.signer.address("fee")
     return ctx.config.accounts.get("fee", "")
 
 
@@ -147,6 +148,53 @@ def _open(pr: Proposal) -> None:
         raise HTTPException(409, "voting is closed")
 
 
+async def eligibility(ctx: Context, pr: Proposal, account: str, is_agent: bool) -> tuple[dict, list[str], bool, int]:
+    """What an account's vote on this proposal is worth: its snapshot, why it does not participate (if it
+    does not), whether it participates, its weight. Derived from the proposal's pinned rules and snapshot
+    time, at cast and again at close for any row derived under a different snapshot (XE-1617)."""
+    rules = pr.rules
+    pw = rules.get("participating_wallet", {})
+    snap = await account_snapshot(ctx.chain, account, snapshot_time(pr.opened_at), rules.get("weight_asset", "XE"))
+    excluded = account in set(rules.get("excluded_accounts", []))
+    reasons = []
+    if excluded:
+        reasons.append("excluded account")
+    if pw.get("must_exist_before_open", True) and not snap["exists"]:
+        reasons.append("account did not exist at the snapshot, an hour before the proposal opened")
+    if snap["balance"] < int(pw.get("min_balance_micro_xe", 0)):
+        reasons.append("balance below the participation minimum at snapshot")
+    if is_agent and (pw.get("exclude_agent_accounts", True) or not rules.get("agents", {}).get("count_toward_quorum", False)):
+        reasons.append("agent accounts do not count toward quorum")
+    return snap, reasons, not reasons, (0 if excluded else int(snap["balance"]))
+
+
+def _current(pr: Proposal, row: Vote) -> bool:
+    """Whether the row's stored weight was derived under the proposal's snapshot as it is now defined."""
+    snap = (row.eligibility or {}).get("snapshot") or {}
+    return snap.get("at") == snapshot_time(pr.opened_at) and snap.get("rule") == SNAPSHOT_RULE
+
+
+async def rederive_stale(ctx: Context, db: AsyncSession, pr: Proposal) -> list[Vote]:
+    """Rows written under an earlier snapshot time or rule carry a weight the proposal no longer means.
+    Each is re-derived from the chain before the tally reads it; the vote itself (choice, signature,
+    time) stands. A node error leaves the row as it is and raises, so the close waits for the next pass
+    rather than closing on stale weight (XE-1617)."""
+    stale = []
+    for row in await votes_for(db, pr.hash):
+        if _current(pr, row):
+            continue
+        snap, reasons, participating, weight = await eligibility(ctx, pr, row.account, row.is_agent)
+        changed = (row.weight, row.participating) != (weight, participating)
+        row.weight, row.participating = weight, participating
+        row.eligibility = {"snapshot": snap, "not_participating_because": reasons}
+        if changed:
+            await ctx.events.append(db, "vote.rederived", "harness", {
+                "proposal": pr.hash, "account": row.account, "weight": weight, "participating": participating,
+            }, ref=f"proposal:{pr.hash}")
+        stale.append(row)
+    return stale
+
+
 async def vote(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Vote:
     """payload = {proposal, choice, reason?}. One vote per account; a later vote replaces an earlier one.
 
@@ -160,22 +208,8 @@ async def vote(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Vot
         raise HTTPException(400, "choice must be for | against | abstain")
     if field_text(v.payload, "proposal").lower() != pr.hash:
         raise HTTPException(400, "signed payload names a different proposal")
-    rules = pr.rules
-    pw = rules.get("participating_wallet", {})
-    snap = await account_snapshot(ctx.chain, v.account, snapshot_time(pr.opened_at), rules.get("weight_asset", "XE"))
     is_agent = v.account in ctx.config.agent_accounts
-    excluded = v.account in set(rules.get("excluded_accounts", []))
-    reasons = []
-    if excluded:
-        reasons.append("excluded account")
-    if pw.get("must_exist_before_open", True) and not snap["exists"]:
-        reasons.append("account did not exist at the snapshot, an hour before the proposal opened")
-    if snap["balance"] < int(pw.get("min_balance_micro_xe", 0)):
-        reasons.append("balance below the participation minimum at snapshot")
-    if is_agent and not rules.get("agents", {}).get("count_toward_quorum", False):
-        reasons.append("agent accounts do not count toward quorum")
-    participating = not reasons
-    weight = 0 if excluded else int(snap["balance"])
+    snap, reasons, participating, weight = await eligibility(ctx, pr, v.account, is_agent)
     reason = clean_text(v.payload.get("reason"), "reason", max_len=2000, required=False)
     pr = await get(db, pr.hash, lock=True)
     _open(pr)
@@ -206,6 +240,19 @@ async def votes_for(db: AsyncSession, h: str) -> list[Vote]:
     return list((await db.execute(select(Vote).where(Vote.proposal_hash == h).order_by(Vote.timestamp.asc()))).scalars().all())
 
 
+def _share(parts: dict[str, int], total: int) -> dict[str, int]:
+    """Split `total` across `parts` pro rata in whole units, largest remainders first, so the shares sum
+    to `total` exactly: no micro-XE is lost to truncation, and an allowance of one is one (XE-1493)."""
+    whole = sum(parts.values())
+    if not whole or not total:
+        return {k: 0 for k in parts}
+    exact = {k: Fraction(v * total, whole) for k, v in parts.items()}
+    out = {k: int(x) for k, x in exact.items()}
+    for k in sorted(parts, key=lambda k: (exact[k] - out[k], parts[k]), reverse=True)[: total - sum(out.values())]:
+        out[k] += 1
+    return out
+
+
 def tally(pr: Proposal, votes: list[Vote]) -> dict:
     rules = pr.rules
     agents = rules.get("agents", {})
@@ -223,9 +270,10 @@ def tally(pr: Proposal, votes: list[Vote]) -> dict:
     # nothing and the proposal fails on `decided == 0` rather than passing on the agents alone (XE-1459).
     human_decided = human["for"] + human["against"]
     agent_total = sum(agent.values())
-    agent_allowed = int(cap * human_decided) if agent_total else 0
-    scale = min(1.0, agent_allowed / agent_total) if agent_total else 0.0
-    counted = {k: human[k] + int(agent[k] * scale) for k in human}
+    agent_allowed = min(agent_total, int(Fraction(str(cap)) * human_decided)) if agent_total else 0
+    agent_counted = _share(agent, agent_allowed)
+    counted = {k: human[k] + agent_counted[k] for k in human}
+    scale = (agent_allowed / agent_total) if agent_total else 0.0
     decided = counted["for"] + counted["against"]
     quorum = int(rules.get("quorum_wallets", 20))
     quorum_met = participating >= quorum
@@ -244,7 +292,14 @@ async def close_due(ctx: Context, db: AsyncSession) -> list[Proposal]:
     now = time.time_ns()
     due = list((await db.execute(select(Proposal).where(Proposal.status == "open", Proposal.closes_at <= now)
                                  .with_for_update(skip_locked=True))).scalars().all())
+    closed = []
     for pr in due:
+        try:
+            await rederive_stale(ctx, db, pr)
+        except XeError as e:   # stale weight is not tallied; this proposal closes on a later pass
+            log.warning("proposal %s: could not re-derive stale votes: %s", pr.hash[:12], e)
+            continue
+        closed.append(pr)
         res = tally(pr, await votes_for(db, pr.hash))
         pr.result = res
         pr.status = "closed"
@@ -253,7 +308,7 @@ async def close_due(ctx: Context, db: AsyncSession) -> list[Proposal]:
         if fee and fee.state == "seen":
             action = pr.rules.get("fee_on_quorum", "refund") if res["quorum_met"] else pr.rules.get("fee_below_quorum", "burn")
             fee.state = f"due_{action}"
-    return due
+    return closed
 
 
 async def _decision_resolution(db: AsyncSession, pr: Proposal, res_id: str) -> Resolution:

@@ -42,7 +42,12 @@ async def db():
 
 class FakeChain:
     def __init__(self, blocks=None, chains=None):
-        self.blocks, self.chains = blocks or {}, chains or {}
+        self.blocks, self.chains, self.state_blocks = blocks or {}, chains or {}, {}
+
+    async def statechain_block(self, index):
+        if index not in self.state_blocks:
+            raise XeError(404, "not found")
+        return self.state_blocks[index]
 
     async def block(self, h):
         if h not in self.blocks:
@@ -1066,7 +1071,7 @@ async def test_cancelled_or_failed_anchor_session_removes_its_anchor_row(db):
 
 # ---- XE-1003: the snapshot carries tainted XE forward and spends it first ------------------------
 
-async def test_snapshot_taint_is_spent_by_later_sends_and_other_assets_are_causally_checked(db):
+async def test_snapshot_taint_is_spent_by_later_sends_and_other_assets_are_not_looked_up(db):
     from dao.chainops import CAUSAL_CHECK_NS, account_snapshot
     at = 10 ** 15
     blocks = {"late": {"timestamp": at + 1}, "early": {"timestamp": at - 10}}
@@ -1082,8 +1087,15 @@ async def test_snapshot_taint_is_spent_by_later_sends_and_other_assets_are_causa
     v = await account_snapshot(chain, "v", at)
     # 500 clean; +1000 tainted; the 1000 send spends the taint; +200 clean; +1000 tainted again
     assert v["balance"] == 700 and v["excluded_receives"] == ["b1", "b4"] and v["snapshot_block"] == "b3" and v["exists"]
+    # a receive of another asset carries no weight and costs no lookup: the wallet exists, holds no XE (XE-1589)
+    looked = []
+
+    async def counting(h):
+        looked.append(h)
+        return blocks[h]
+    chain.block = counting
     w = await account_snapshot(chain, "w", at)
-    assert not w["exists"] and w["snapshot_block"] == "" and w["excluded_receives"] == ["c0"]
+    assert w["exists"] and w["balance"] == 0 and w["excluded_receives"] == [] and looked == []
 
 
 # ---- XE-1290 / XE-1435: values computed then inserted are serialised; a unique collision is a 409 ---------
@@ -1251,3 +1263,160 @@ async def test_an_envelope_that_fails_verification_is_kept_but_never_public(db):
     assert public == {good.id: True, forged.id: False}
     # members still see it, marked
     assert {m.id: m.verified for m in await inbox.list_messages(db)} == {good.id: True, forged.id: False}
+
+
+# ---- XE-1487: a delivered reply is committed before the next is built ------------------------------------
+
+async def test_each_outbox_row_is_committed_as_it_is_sent(db, monkeypatch):
+    from dao.models import OutboxMessage
+    ctx = _ctx()
+    ctx.signer = FakeSigner(("harness", "fee", "dao"))
+    for i in range(3):
+        db.add(OutboxMessage(id=f"o{i}", to_account="d" * 64, body="hi", status="queued", in_reply_to="m", from_seat="cto",
+                             envelope={}, error=""))
+    await db.commit()
+    on_disk = []
+    sm = async_sessionmaker(db.bind, expire_on_commit=False)
+
+    async def send(env):
+        # what another connection sees at the moment each envelope goes out: every earlier row already `sent`
+        async with sm() as other:
+            rows = (await other.execute(select(OutboxMessage.status).where(OutboxMessage.status == "sent"))).scalars().all()
+        on_disk.append(len(rows))
+        if len(on_disk) == 2:
+            raise RuntimeError("channel closed")
+    ctx.chain.chat_send = send
+    monkeypatch.setattr(inbox, "new_envelope", lambda kp, to, body, *a: SimpleNamespace(id="e", to_json=lambda: {"to": to}))
+    assert await inbox.flush_outbox(ctx, db) == 2
+    assert on_disk == [0, 1, 1], "each delivered row was committed before the next envelope was built"
+    rows = {o.id: o for o in (await db.execute(select(OutboxMessage))).scalars().all()}
+    assert rows["o0"].status == "sent" and rows["o2"].status == "sent"
+    assert rows["o1"].status == "queued" and "channel closed" in rows["o1"].error
+
+
+# ---- XE-1511: a session whose block is on the chain is submitted, whatever the node said ------------------
+
+async def _signing(db, sid, index=1, n=1):
+    s = SigningSession(id=sid, kind="anchor", title="A", ops=[{"action": "set", "key": "dao.anchor.1", "value": "1"}],
+                       ops_digest="f" * 64, status="signing", approvals=[{"public_key": "k1"}, {"public_key": "k2"}],
+                       required_approvals=2, block={"index": index, "prev_hash": "0" * 64, "timestamp": 0, "hash": "h" * 64},
+                       block_hash="h" * 64, block_signatures=[{"public_key": "k1", "signature": "s"}, {"public_key": "k2", "signature": "s"}],
+                       rebuilds=0, not_before=None)
+    db.add(s)
+    db.add(Anchor(n=n, event_index=0, head_hash="0" * 64, session_id=sid))
+    await db.flush()
+    return s
+
+
+async def test_a_refused_submit_whose_block_landed_is_submitted_and_a_rebuild_never_rewrites_it(db):
+    from dao.services import records
+    ctx = _ctx()
+
+    async def refuse(blk):
+        raise XeError(400, "block rejected: publish: context canceled")
+    ctx.chain.submit_statechain_block = refuse
+    # 1. the node refused, and the chain does not have the block: failed, as before, and the anchor row goes
+    s1 = await _signing(db, "s1")
+    await sessions.submit(ctx, db, s1)
+    assert s1.status == "failed" and await records.latest_anchor(db) is None
+    # 2. the node refused, but the chain has the block at its index: submitted, the anchor row stays
+    s2 = await _signing(db, "s2")
+    ctx.chain.state_blocks[1] = {"index": 1, "hash": "h" * 64}
+    await sessions.submit(ctx, db, s2)
+    assert s2.status == "submitted" and s2.submitted_index == 1 and s2.submitted_hash == "h" * 64
+    assert (await records.latest_anchor(db)).session_id == "s2"
+    # 3. the node refused and the chain cannot be read: the session stays signing with the error on record
+    s3 = await _signing(db, "s3", index=2, n=2)
+
+    async def down(i):
+        raise XeError(503, "node down")
+    ctx.chain.statechain_block = down
+    await sessions.submit(ctx, db, s3)
+    assert s3.status == "signing" and "could not confirm" in s3.error
+    assert (await db.execute(select(Event).where(Event.kind == "session.submit_unconfirmed"))).scalars().first() is not None
+    # 4. the tip moved because this block is the tip: a rebuild marks it submitted rather than building the ops again
+    ctx.chain.statechain_block = FakeChain.statechain_block.__get__(ctx.chain)
+    ctx.chain.state_blocks[2] = {"index": 2, "hash": "h" * 64}
+    await sessions.rebuild(ctx, db, s3)
+    assert s3.status == "submitted" and s3.submitted_index == 2
+
+
+# ---- XE-1561 / XE-1565: pending work is asked of the table, not of a page -----------------------------------
+
+async def test_pending_sessions_and_untriaged_messages_are_found_past_any_page(db):
+    now = time.time_ns()
+    old = SigningSession(id="anchor-old", kind="anchor", title="A", ops=[], ops_digest="f" * 64, status="approving", approvals=[],
+                         required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0, not_before=None)
+    db.add(old)
+    await db.flush()
+    for i in range(120):
+        db.add(SigningSession(id=f"r{i}", kind="registry", title="R", ops=[], ops_digest="f" * 64, status="cancelled", approvals=[],
+                              required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0, not_before=None))
+    for i in range(120):
+        db.add(InboxMessage(id=f"m{i}", channel="http", from_account="a" * 64, to_account="d" * 64, pub_key="p" * 64, body="x",
+                            timestamp=now + i, signature="s", pow_nonce=0, verified=True, status="new"))
+    await db.commit()
+    page = await sessions.list_sessions(db)
+    assert len(page) == 100 and "anchor-old" not in {s.id for s in page}, "the page cannot see it"
+    assert [s.id for s in await sessions.open_sessions(db, kind="anchor")] == ["anchor-old"]
+    assert await sessions.count_sessions(db) == 121 and await sessions.count_sessions(db, "approving") == 1
+    # the untriaged queue: oldest first, counted in full, pageable
+    first = await inbox.list_untriaged(db, 100)
+    assert [m.id for m in first[:3]] == ["m0", "m1", "m2"] and len(first) == 100
+    assert [m.id for m in await inbox.list_untriaged(db, 100, offset=100)] == [f"m{i}" for i in range(100, 120)]
+    assert await inbox.count_untriaged(db) == 120
+
+
+# ---- XE-1617: a vote row derived under another snapshot is re-derived before it is tallied ------------------
+
+async def test_stale_vote_rows_are_rederived_at_close(db):
+    from dao.chainops import SNAPSHOT_RULE, snapshot_time
+    ctx = _ctx()
+    now = time.time_ns()
+    pr = Proposal(hash="5" * 64, title="t", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64,
+                  author_signature="s", author_timestamp=now, fee_block_hash="5" * 64, status="open", opened_at=now - D,
+                  closes_at=now - 1, rules=ctx.config.pinned_rules(), analysis=[])
+    db.add(pr)
+    at = snapshot_time(pr.opened_at)
+    # a wallet funded after the pinned snapshot, recorded under the old rule (snapshot at opened_at) as participating
+    ctx.chain.chains["late"] = [{"timestamp": at + 1000, "asset": "XE", "balance": 1_000_000, "hash": "l0", "type": "open"}]
+    ctx.chain.chains["early"] = [{"timestamp": at - 1000, "asset": "XE", "balance": 2_000_000, "hash": "e0", "type": "open"}]
+    for acct, weight, snap in (("late", 1_000_000, {"at": pr.opened_at, "rule": 1}), ("early", 2_000_000, {"at": at, "rule": SNAPSHOT_RULE})):
+        db.add(Vote(proposal_hash=pr.hash, account=acct, pub_key="p" * 64, choice="for", reason="", timestamp=now, signature=os.urandom(8).hex(),
+                    weight=weight, participating=True, is_agent=False, eligibility={"snapshot": snap, "not_participating_because": []}))
+    await db.commit()
+    closed = await portal.close_due(ctx, db)
+    assert [p.hash for p in closed] == [pr.hash]
+    rows = {v.account: v for v in await portal.votes_for(db, pr.hash)}
+    assert not rows["late"].participating and rows["late"].weight == 0, "re-derived under the proposal's snapshot"
+    assert rows["early"].participating and rows["early"].weight == 2_000_000 and rows["early"].eligibility["snapshot"]["rule"] == SNAPSHOT_RULE
+    assert pr.result["participating_wallets"] == 1 and pr.result["weight"]["for"] == 2_000_000
+    assert (await db.execute(select(Event).where(Event.kind == "vote.rederived"))).scalars().one().payload["account"] == "late"
+    # a node fault during re-derivation leaves the proposal open for the next pass
+    pr2 = Proposal(hash="6" * 64, title="t", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64,
+                   author_signature="s", author_timestamp=now, fee_block_hash="6" * 64, status="open", opened_at=now - D,
+                   closes_at=now - 1, rules=ctx.config.pinned_rules(), analysis=[])
+    db.add(pr2)
+    db.add(Vote(proposal_hash=pr2.hash, account="late", pub_key="p" * 64, choice="for", reason="", timestamp=now, signature=os.urandom(8).hex(),
+                weight=1, participating=True, is_agent=False, eligibility={}))
+    await db.commit()
+
+    async def boom(a):
+        raise XeError(503, "down")
+    ctx.chain.full_chain = boom
+    assert await portal.close_due(ctx, db) == [] and pr2.status == "open"
+
+
+# ---- XE-1618 / XE-1620: health legs measure from the DAO's start ------------------------------------------
+
+async def test_health_measures_an_unanchored_dao_and_a_late_worker_from_the_first_event(db):
+    from dao.services import records
+    ctx, state = _health_ctx()
+    # the DAO's first event is 20 days old; no anchor was ever written; no health check was ever recorded
+    first = await ctx.events.append(db, "worker.started", "harness", {}, ts=time.time_ns() - 20 * D)
+    await db.commit()
+    assert await records.started_at(db) == first.ts
+    up = await records.uptime_30d(ctx, db)
+    assert up["checks"] == 0 and up["expected"] == 20 * 24 * 6 and up["fraction"] == 0.0
+    d = await _check(ctx, db)
+    assert d["last_anchor"] is None and d["anchor_overdue"] and not d["ok"]

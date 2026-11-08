@@ -615,6 +615,20 @@ async def test_snapshot_node_reads_are_bounded_and_the_bound_only_lowers_the_wei
     chain2 = _Lattice({"S": recvs[:3]}, {f"s{i}": early for i in range(3)})
     s = await account_snapshot(chain2, "S", T)
     assert chain2.lookups == 3 and not s["lookups_capped"] and s["balance"] == 3 and s["excluded_receives"] == []
+    # XE-1548 / XE-1589: the budget goes to the largest receives, whatever their order, and foreign-asset
+    # receives spend none of it. A stranger floods the window with 100 dust XE receives and 100 XUSD receives
+    # after the voter's one material receive; the material receive is checked and counted, the dust is what
+    # the cap drops.
+    dust_xe = [{"type": "receive", "asset": "XE", "balance": 1_000_000 + i + 1, "timestamp": T - H + 10 + i, "hash": f"d{i}", "source": f"ds{i}"}
+               for i in range(100)]
+    dust_xusd = [{"type": "receive", "asset": "XUSD", "balance": i + 1, "timestamp": T - H + 200 + i, "hash": f"u{i}", "source": f"us{i}"}
+                 for i in range(100)]
+    material = {"type": "receive", "asset": "XE", "balance": 1_000_000, "timestamp": T - H + 1, "hash": "m", "source": "ms"}
+    chain3 = _Lattice({"V": [material, *dust_xe, *dust_xusd]}, {"ms": early, **{f"ds{i}": early for i in range(100)}})
+    v = await account_snapshot(chain3, "V", T)
+    assert chain3.lookups == MAX_CAUSAL_LOOKUPS and v["lookups_capped"]
+    assert "m" not in v["excluded_receives"] and not any(h.startswith("u") for h in v["excluded_receives"])
+    assert v["balance"] == 1_000_000 + (MAX_CAUSAL_LOOKUPS - 1)   # the material receive and 31 dust; 69 dust dropped
 
 
 def test_agents_tip_a_human_decision_and_never_make_one():
@@ -652,3 +666,71 @@ def test_held_streams_are_capped_per_address_and_in_total():
     held.take(req("c"))                          # a slot freed anywhere is available to anyone under their own cap
     held.release(a2), held.release(b1)
     assert held._n == 1 and held._by_ip == {"c": 1}
+
+
+# ---- XE-1479: the company's accounts come from the signer; agents are bounded, not zeroed -----------------
+
+def test_company_accounts_come_from_the_signer_and_agent_seats_are_not_zeroed():
+    cfg = load_config(ROOT / "config")
+    agent = "a" * 64
+    cfg.schedule_c["agent_seats"] = [{"id": "x", "role": "r", "account": agent}]
+    cfg.schedule_c["accounts"] = {"dao": "", "fee": "", "treasury": "t" * 64}
+    cfg.signer_accounts = {"dao": "D" * 64, "fee": "F" * 64}
+    assert cfg.accounts["dao"] == "d" * 64 and cfg.accounts["fee"] == "f" * 64 and cfg.accounts["treasury"] == "t" * 64
+    ex = cfg.excluded_accounts()
+    assert {"d" * 64, "f" * 64, "t" * 64} <= ex, "the company's own accounts weigh nothing"
+    assert agent not in ex, "an agent seat's weight is bounded by the tally cap, not zeroed"
+    assert agent in cfg.agent_accounts
+    # the pinned rules a proposal carries agree with the property
+    assert set(cfg.pinned_rules()["excluded_accounts"]) == ex
+    # schedule C naming a different address for an account the signer holds does not win: the key is the fact
+    cfg.schedule_c["accounts"]["fee"] = "9" * 64
+    assert cfg.accounts["fee"] == "f" * 64
+
+
+# ---- XE-1493: the agent cap is shared by largest remainder; no micro-XE is lost or invented --------------
+
+def test_agent_cap_is_shared_without_losing_or_inventing_weight():
+    from dao.services.portal import _share
+    for parts, total in (({"for": 1, "against": 1, "abstain": 1}, 2), ({"for": 7, "against": 3, "abstain": 0}, 1),
+                         ({"for": 333, "against": 333, "abstain": 334}, 100), ({"for": 5, "against": 0, "abstain": 0}, 5),
+                         ({"for": 0, "against": 0, "abstain": 0}, 0)):
+        out = _share(parts, total)
+        assert sum(out.values()) == total and set(out) == set(parts), (parts, total, out)
+        assert all(0 <= out[k] <= parts[k] for k in parts), (parts, total, out)
+        assert all(out[k] == 0 for k in parts if parts[k] == 0)
+    # the tally: 20 humans decide with 20 XE; agents cast 100 XE across for and against. 1% of 20 XE = 0.2 XE,
+    # all of it counted, split between the agent choices in proportion
+    votes = [_vote(1_000_000, "against") for _ in range(20)]
+    votes += [_vote(75_000_000, "for", participating=False, is_agent=True), _vote(25_000_000, "against", participating=False, is_agent=True)]
+    t = tally(_proposal(quorum=20), votes)
+    assert t["weight"]["for"] + t["weight"]["against"] == 20_000_000 + 200_000
+    assert t["weight"]["for"] == 150_000 and t["weight"]["against"] == 20_050_000
+    # an agent alone, with no human decision, counts nothing
+    t = tally(_proposal(quorum=1), [_vote(1_000_000, "abstain"), _vote(10, "for", participating=False, is_agent=True)])
+    assert t["weight"]["for"] == 0 and t["weight_agent_raw"]["for"] == 10
+
+
+# ---- XE-1504: a statechain key is matched end to end, as the node's RE2 matches it ------------------------
+
+def test_statechain_key_pattern_has_no_trailing_newline_exception():
+    from xe.statechain import StateChainError, StateOp
+    StateOp.set("dao.ok-1_2", 1).validate()
+    for bad in ("dao.x\n", "dao.x\n\n", "\ndao.x", "dao.X", "dao x", "", "a" * 300):
+        with pytest.raises(StateChainError):
+            StateOp.set(bad, 1).validate()
+    with pytest.raises(StateChainError):
+        StateOp.delete("k\n").validate()
+
+
+# ---- XE-1489: caller-supplied values are data in a node URL, never path or query -------------------------
+
+def test_every_client_path_segment_is_percent_encoded():
+    import re
+    from xe.client import _seg
+    src = Path("xe/client.py").read_text()
+    raw = [m for m in re.findall(r'f"/[^"]*"', src) if re.search(r"\{(?!_seg\()", m)]
+    assert raw == [], f"path interpolation without _seg: {raw}"
+    assert _seg("dao.anchor.1") == "dao.anchor.1" and _seg(7) == "7"
+    assert _seg("x/../y") == "x%2F..%2Fy" and _seg("k?limit=1") == "k%3Flimit%3D1" and _seg("a#b") == "a%23b"
+    assert _seg("a b\n") == "a%20b%0A"

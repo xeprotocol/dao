@@ -135,12 +135,20 @@ async def burn(ctx: Context, key_name: str, scope: str, amount: int, memo: str =
 # source send is looked up once, at most `CAUSAL_LOOKUP_CONCURRENCY` at a time, and after
 # `MAX_CAUSAL_LOOKUPS` distinct sends the remaining receives in the window are excluded without a lookup.
 # Excluding can only lower the weight, so a chain built to be expensive is read cheaply and conservatively.
+# The budget is spent where the weight is: only receives of the weight asset are checked (a receive of
+# another asset carries no weight, so its causality is nobody's concern here), largest amount first, so
+# what the cap drops is dust. A voter's material receive is looked up ahead of thirty dust receives, their
+# own or a stranger's, and a flood of foreign-asset dust spends nothing (XE-1548, XE-1589).
 TIMESTAMP_WINDOW_NS = 3600 * 1_000_000_000
 SNAPSHOT_MARGIN_NS = 5 * 60 * 1_000_000_000
 SNAPSHOT_LEAD_NS = TIMESTAMP_WINDOW_NS + SNAPSHOT_MARGIN_NS
 CAUSAL_CHECK_NS = 2 * TIMESTAMP_WINDOW_NS
 MAX_CAUSAL_LOOKUPS = 32
 CAUSAL_LOOKUP_CONCURRENCY = 8
+# Bumped whenever the figure this function derives for the same chain and `at` can change. A vote row
+# stores the result it was derived from; at close, rows derived under another `at` or rule are re-derived
+# before they are tallied (XE-1617).
+SNAPSHOT_RULE = 3
 
 
 def snapshot_time(opened_at_ns: int) -> int:
@@ -152,14 +160,16 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
     """Balance of `asset` as of `at_ns`, plus whether the account existed by then.
 
     XE accounts are chains; each block carries the post-state balance for its asset, so the balance at a
-    time is the balance on the last counted block of that asset with timestamp <= at_ns. A receive whose
-    source send is dated after at_ns (see above) is not counted, for any asset: its amount is carried as
+    time is the balance on the last counted block of that asset with timestamp <= at_ns. A receive of that
+    asset whose source send is dated after at_ns (see above) is not counted: its amount is carried as
     `tainted`, which later sends and burns spend first, and what is still tainted at the end is taken off
-    the balance (XE-1003). `snapshot_block` is the last counted block. Node reads are bounded (XE-1460,
-    see above); `lookups_capped` says whether the bound was hit.
+    the balance (XE-1003). `snapshot_block` is the last counted block. Node reads are bounded and spent
+    largest receive first (XE-1460, XE-1548, XE-1589, see above); `lookups_capped` says whether the bound
+    was hit. `at` and `rule` record what the figure was derived under, so a stored result can be told
+    from one derived under a different rule (XE-1617).
     """
     empty = {"exists": False, "balance": 0, "first_block_ts": None, "snapshot_block": "", "excluded_receives": [],
-             "lookups_capped": False}
+             "lookups_capped": False, "at": at_ns, "rule": SNAPSHOT_RULE}
     try:
         blocks = await chain.full_chain(account)
     except XeError as e:
@@ -169,9 +179,21 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
     if not blocks:
         return empty
     first_ts = int(blocks[0].get("timestamp", 0))
-    window = [b for b in blocks if int(b.get("timestamp", 0)) <= at_ns and b.get("type") == "receive"
-              and int(b.get("timestamp", 0)) > at_ns - CAUSAL_CHECK_NS]
-    sources = list(dict.fromkeys(b.get("source") or "" for b in window))   # distinct, in chain order
+    window: list[tuple[int, str]] = []   # (amount, source) for each windowed receive of our asset
+    prev = 0
+    for b in blocks:
+        if int(b.get("timestamp", 0)) > at_ns:
+            break
+        if b.get("asset") != asset:
+            continue
+        new_bal = int(b.get("balance", 0))
+        if b.get("type") == "receive" and int(b.get("timestamp", 0)) > at_ns - CAUSAL_CHECK_NS:
+            window.append((max(new_bal - prev, 0), b.get("source") or ""))
+        prev = new_bal
+    by_amount: dict[str, int] = {}
+    for amount, src in window:
+        by_amount[src] = by_amount.get(src, 0) + amount
+    sources = sorted(by_amount, key=lambda s_: -by_amount[s_])
     capped = len(sources) > MAX_CAUSAL_LOOKUPS
     causal = await _sends_at_or_before(chain, sources[:MAX_CAUSAL_LOOKUPS], at_ns)
     bal = 0        # the asset's on-chain balance after the last block seen
@@ -184,12 +206,11 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
         if ts > at_ns:
             break
         ours = b.get("asset") == asset
-        if b.get("type") == "receive" and ts > at_ns - CAUSAL_CHECK_NS and not causal.get(b.get("source") or "", False):
+        if ours and b.get("type") == "receive" and ts > at_ns - CAUSAL_CHECK_NS and not causal.get(b.get("source") or "", False):
             excluded.append(b.get("hash", ""))
-            if ours:
-                new_bal = int(b.get("balance", 0))
-                tainted += max(new_bal - bal, 0)
-                bal = new_bal
+            new_bal = int(b.get("balance", 0))
+            tainted += max(new_bal - bal, 0)
+            bal = new_bal
             continue
         counted += 1
         if not ours:
@@ -200,7 +221,8 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
         bal = new_bal
         snap = b.get("hash", "")
     return {"exists": first_ts <= at_ns and counted > 0, "balance": max(bal - tainted, 0),
-            "first_block_ts": first_ts, "snapshot_block": snap, "excluded_receives": excluded, "lookups_capped": capped}
+            "first_block_ts": first_ts, "snapshot_block": snap, "excluded_receives": excluded, "lookups_capped": capped,
+            "at": at_ns, "rule": SNAPSHOT_RULE}
 
 
 async def _sends_at_or_before(chain: XeClient, send_hashes: list[str], at_ns: int) -> dict[str, bool]:

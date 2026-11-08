@@ -6,7 +6,7 @@ of public records (sessions appear on /records and in the log); `whoami` is a ke
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from ..auth import SignedRequest, bind, require_seat, verify_and_claim
 from ..canonical import DOMAIN_MEMBER_ACTION, DOMAIN_OPS_APPROVAL, DOMAIN_RESOLUTION
@@ -62,8 +62,10 @@ async def withdraw_resolution(res_id: str, req: SignedRequest, ctx: Ctx, db: Db)
 # ---- signing sessions (state chain) -----------------------------------------------------------
 
 @router.get("/sessions")
-async def list_sessions(db: Db, status: str | None = None):
-    return {"sessions": [sessions.to_dict(s) for s in await sessions.list_sessions(db, status)]}
+async def list_sessions(db: Db, status: str | None = None, offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=200)):
+    rows = await sessions.list_sessions(db, status, limit=limit, offset=offset)
+    return {"sessions": [sessions.to_dict(s) for s in rows], "total": await sessions.count_sessions(db, status),
+            "offset": offset, "limit": limit}
 
 
 @router.get("/sessions/{sid}")
@@ -200,9 +202,13 @@ async def inbox_untriaged(req: SignedRequest, ctx: Ctx, db: Db):
     """HTTP messages no member has looked at yet. Signed by a seat holder: these are the one part of the
     inbox the public surfaces hold back (XE-0195), so reading them is a seat action like answering them."""
     bind(require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config), action="list_untriaged")
-    rows = await inbox_svc.list_untriaged(db, 100)
+    offset = req.payload.get("offset", 0)
+    if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= 2**31:
+        raise HTTPException(400, "offset must be a non-negative integer")
+    rows = await inbox_svc.list_untriaged(db, 100, offset)
+    total = await inbox_svc.count_untriaged(db)
     await db.commit()   # the signature claim is a write even though the action is a read (XE-0647)
-    return {"messages": [inbox_svc.to_dict(m) for m in rows]}
+    return {"messages": [inbox_svc.to_dict(m) for m in rows], "total": total, "offset": offset, "limit": 100}
 
 
 @router.post("/inbox/{mid}/reply", status_code=201)

@@ -17,7 +17,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.chat import ChatError, Envelope, new_envelope, verify_envelope
@@ -40,8 +40,6 @@ AUTO_ACK = ("Received by the XE DAO and recorded in the public log. A person rea
 
 
 def dao_account(ctx: Context) -> str:
-    if ctx.signer.has("dao"):
-        return ctx.signer.address("dao")
     return ctx.config.accounts.get("dao", "")
 
 
@@ -140,7 +138,10 @@ async def set_status(ctx: Context, db: AsyncSession, m: InboxMessage, v: Verifie
 
 
 async def flush_outbox(ctx: Context, db: AsyncSession) -> int:
-    """Worker: send queued replies from the DAO account over chat. PoW off the loop."""
+    """Worker: send queued replies from the DAO account over chat. PoW off the loop. Each row is marked and
+    committed as soon as its envelope has gone out, before the next is built: a crash or a pause landing
+    mid-batch cannot roll a delivered reply back to `queued` and send it twice (XE-1487, the rule from
+    XE-0486 on the fee path)."""
     if not ctx.signer.has("dao") or await pause.is_paused(db):
         return 0
     rows = list((await db.execute(select(OutboxMessage).where(OutboxMessage.status == "queued").limit(10))).scalars().all())
@@ -152,6 +153,7 @@ async def flush_outbox(ctx: Context, db: AsyncSession) -> int:
             o.status = "failed"
             await ctx.events.append(db, "outbox.failed", "harness", {"id": o.id, "to": o.to_account, "error": o.error[:300]},
                                     ref=f"inbox:{o.in_reply_to}")
+            await db.commit()
             continue
         try:
             kp = ctx.signer.keypair("dao", "chat.send")
@@ -169,6 +171,7 @@ async def flush_outbox(ctx: Context, db: AsyncSession) -> int:
         except (SignerError, ChatError, Exception) as e:
             o.error = str(e)[:500]
             log.warning("outbox send failed %s: %s", o.id, e)
+        await db.commit()
     return n
 
 
@@ -218,11 +221,18 @@ async def list_public(db: AsyncSession, limit: int = 100) -> list[InboxMessage]:
     return list((await db.execute(q)).scalars().all())
 
 
-async def list_untriaged(db: AsyncSession, limit: int = 100) -> list[InboxMessage]:
-    """For a seat holder, over a signed request: HTTP messages nobody has looked at yet."""
-    q = (select(InboxMessage).where(InboxMessage.channel == "http", InboxMessage.status == "new")
-         .order_by(InboxMessage.timestamp.desc()).limit(limit))
+_UNTRIAGED = (InboxMessage.channel == "http", InboxMessage.status == "new")
+
+
+async def list_untriaged(db: AsyncSession, limit: int = 100, offset: int = 0) -> list[InboxMessage]:
+    """For a seat holder, over a signed request: HTTP messages nobody has looked at yet, oldest first, so
+    the one that has waited longest is on the first page however many arrive after it (XE-1565)."""
+    q = select(InboxMessage).where(*_UNTRIAGED).order_by(InboxMessage.timestamp.asc()).offset(offset).limit(limit)
     return list((await db.execute(q)).scalars().all())
+
+
+async def count_untriaged(db: AsyncSession) -> int:
+    return int((await db.execute(select(func.count()).select_from(InboxMessage).where(*_UNTRIAGED))).scalar_one())
 
 
 async def get_public(db: AsyncSession, mid: str) -> InboxMessage:

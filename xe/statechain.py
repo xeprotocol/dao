@@ -86,7 +86,7 @@ class StateOp:
     def validate(self) -> None:
         if self.action not in ACTION_BYTES:
             raise StateChainError(f"unknown action {self.action!r}")
-        if not (1 <= len(self.key) <= MAX_KEY_LENGTH) or not KEY_RE.match(self.key):
+        if not (1 <= len(self.key) <= MAX_KEY_LENGTH) or not KEY_RE.fullmatch(self.key):   # RE2 `$` is end-of-text (XE-1504)
             raise StateChainError(f"invalid key {self.key!r}")
         if self.action == ACTION_SET:
             if not self.value:

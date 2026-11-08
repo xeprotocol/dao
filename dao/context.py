@@ -93,6 +93,7 @@ def build_context() -> Context:
         raise SystemExit(f"signer unavailable: {e}; the harness does not run without its keys") from e
     if not signer.has("harness"):
         raise SystemExit(f"{settings.signer_keyfile} has no 'harness' key; the log cannot be signed")
+    config.signer_accounts = {n: signer.address(n) for n in ("dao", "fee") if signer.has(n)}
     chain = XeClient(settings.xe_node_url)
     events = EventLog(signer)
     return Context(settings=settings, config=config, signer=signer, chain=chain, events=events)
