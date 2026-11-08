@@ -49,14 +49,14 @@ class Worker:
 
     async def job_directory(self):
         """Keep the DAO's directory entry alive: a fresh signed registration every 20 minutes against the
-        node's 30-minute TTL. A chain write under the company key, so it stops while paused like every
-        other (XE-1445); a long pause lets the entry lapse, which is what "nothing moves" means."""
+        node's 30-minute TTL. This runs through a pause on purpose (XE-1445): the entry is addressability,
+        not action. It names only the DAO's own node peer and moves nothing, and without it every chat
+        sent to the DAO fails at the sender's node thirty minutes into a pause, while the inbox is one of
+        the things a pause keeps open. The `dao` key's narrowest scope, `directory.register`, is all it uses."""
         ctx = self.ctx
         if not ctx.signer.has("dao") or not ctx.node.network_id:
             return
         async with session() as db:
-            if await pause.is_paused(db):
-                return
             try:
                 kp = ctx.signer.keypair("dao", "directory.register")
                 reg = new_registration(kp, ctx.node.network_id, ctx.directory_node_peer)

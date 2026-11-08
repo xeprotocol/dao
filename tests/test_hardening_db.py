@@ -1164,9 +1164,9 @@ async def test_a_unique_key_collision_answers_409_on_every_route():
     assert resp.status_code == 409
 
 
-# ---- XE-1445: the pause gates every chain write the worker can make -----------------------------------
+# ---- XE-1445: the pause stops every node write the worker can make, bar the one that keeps it addressable --
 
-async def test_no_worker_job_writes_to_the_chain_while_paused(db, monkeypatch):
+async def test_no_worker_job_writes_to_the_node_while_paused_except_directory_reregistration(db, monkeypatch):
     from contextlib import asynccontextmanager
     from pathlib import Path
 
@@ -1216,13 +1216,11 @@ async def test_no_worker_job_writes_to_the_chain_while_paused(db, monkeypatch):
     await db.commit()
 
     w = worker_mod.Worker(ctx)
-    for job in (w.job_directory, w.job_fees, w.job_outbox, w.job_timers, w.job_sessions, w.job_anchor):
+    for job in (w.job_fees, w.job_outbox, w.job_timers, w.job_sessions, w.job_anchor):
         await job()
-    assert calls == [], f"chain writes under pause: {calls}"
-
-    # control: lifted, the registration goes out
-    (await db.execute(select(PauseRecord))).scalar_one().status = "lifted"
-    await db.commit()
+    assert calls == [], f"node writes under pause: {calls}"
+    # the directory entry is addressability, not action: it is kept alive through the pause so the inbox,
+    # which the pause keeps open, can still be reached
     await w.job_directory()
     assert calls == ["directory_register"]
 
