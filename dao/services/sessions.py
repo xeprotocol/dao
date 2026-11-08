@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.client import XeError
 from xe.keys import KeyError_, is_valid_public_key, verify_hex_signature
-from xe.statechain import StateBlock, StateChainError, StateOp, build_block
+from xe.statechain import StateBlock, StateChainError, StateOp, build_block, validate_keyset
 
 from ..auth import Verified
 from ..canonical import canonical_json, sha256_hex
@@ -57,23 +57,27 @@ def check_ops(kind: str, ops: list[dict]) -> None:
 
 
 def _check_keyset(value) -> None:
-    """keys: 2..MAX_KEYSET distinct lowercase hex ed25519 public keys, each a usable point; threshold 1..len.
-    A key nobody can sign with, if the threshold needs it, would leave the chain with no valid signer
-    (XE-0694 on the node side; checked here before the block is ever built)."""
+    """The node's rule for `sys.dao_keyset`, as the protocol mirror states it (`xe.statechain.validate_keyset`:
+    distinct keys, threshold between MIN_DAO_THRESHOLD and the key count), plus what the harness asks on
+    top: the shape, lowercase hex, at most MAX_KEYSET keys, and every key a usable ed25519 point. A key
+    nobody can sign with, if the threshold needs it, would leave the chain with no valid signer (XE-0694).
+    The gate states no bound of its own, so it cannot be looser than the node on any of them (XE-1447)."""
     if not isinstance(value, dict) or set(value) != {"keys", "threshold"}:
         raise HTTPException(400, "keyset value must be {keys: [...], threshold: n}")
     keys, threshold = value["keys"], value["threshold"]
-    if not isinstance(keys, list) or not 2 <= len(keys) <= MAX_KEYSET:
-        raise HTTPException(400, f"keyset needs 2 to {MAX_KEYSET} keys")
+    if not isinstance(keys, list) or len(keys) > MAX_KEYSET:
+        raise HTTPException(400, f"keyset holds at most {MAX_KEYSET} keys")
     if any(not isinstance(k, str) or not KEY_HEX_RE.fullmatch(k) for k in keys):
         raise HTTPException(400, "every keyset key is 64 lowercase hex digits")
-    if len(set(keys)) != len(keys):
-        raise HTTPException(400, "keyset keys must be distinct")
+    if not isinstance(threshold, int) or isinstance(threshold, bool):
+        raise HTTPException(400, "keyset threshold must be an integer")
+    try:
+        validate_keyset(value)
+    except StateChainError as e:
+        raise HTTPException(400, f"keyset: {e}") from e
     for k in keys:
         if not is_valid_public_key(bytes.fromhex(k)):
             raise HTTPException(400, f"{k[:12]}… is not a usable ed25519 public key")
-    if not isinstance(threshold, int) or isinstance(threshold, bool) or not 1 <= threshold <= len(keys):
-        raise HTTPException(400, "keyset threshold must be between 1 and the number of keys")
 
 
 def ops_digest(ops: list[dict]) -> str:

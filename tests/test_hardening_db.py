@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from dao.auth import MAX_SKEW_NS, Verified, claim_signature, purge_seen_signatures
 from dao.db import Base
 from dao.log import EventLog
-from dao.models import Anchor, Event, FeeLedger, HealthCheck, InboxMessage, Proposal, SeenSignature, SigningSession, Vote
+from dao.models import Anchor, Event, FeeLedger, HealthCheck, InboxMessage, Proposal, Resolution, SeenSignature, SigningSession, Vote
 from dao.services import fees, inbox, portal, sessions
 from dao.signer import Signer
 from xe.client import XeError
@@ -700,8 +700,11 @@ async def test_change_keyset_opens_a_keyset_session_and_bad_ops_are_refused_when
     await refused("change_treasury_policy", [{"action": "set", "key": "sys.treasury_policy", "value": 1}], "dao.* keys")
     await refused("change_keyset", [{"action": "set", "key": "dao.x", "value": 1}], "exactly one op")
     await refused("change_keyset", good + [{"action": "set", "key": "dao.x", "value": 1}], "exactly one op")
-    await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k1], "threshold": 1}}], "distinct")
+    await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k1], "threshold": 2}}], "duplicate")
     await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2], "threshold": 3}}], "threshold")
+    # the node floors the threshold at MIN_DAO_THRESHOLD; the gate states the same rule (XE-1447)
+    await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2], "threshold": 1}}], ">= 2")
+    await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2], "threshold": True}}], "integer")
     await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, "0" * 64], "threshold": 2}}], "usable")
     await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2[:-1] + "G"], "threshold": 2}}], "hex")
 
@@ -1081,3 +1084,172 @@ async def test_snapshot_taint_is_spent_by_later_sends_and_other_assets_are_causa
     assert v["balance"] == 700 and v["excluded_receives"] == ["b1", "b4"] and v["snapshot_block"] == "b3" and v["exists"]
     w = await account_snapshot(chain, "w", at)
     assert not w["exists"] and w["snapshot_block"] == "" and w["excluded_receives"] == ["c0"]
+
+
+# ---- XE-1290 / XE-1435: values computed then inserted are serialised; a unique collision is a 409 ---------
+
+async def test_concurrent_allocations_take_consecutive_numbers_and_a_reused_fee_block_is_a_clean_409(db):
+    import asyncio
+
+    from dao.db import serialize
+    from dao.services import records, resolutions
+    ctx = _ctx()
+    ctx.settings = SimpleNamespace(public_base_url="http://dao")
+    ctx.config.members = [_member("founder-a")]
+    await ctx.events.append(db, "x", "harness", {}, public=True)
+    await db.commit()
+    sm = async_sessionmaker(db.bind, expire_on_commit=False)
+
+    # anchors: the first open holds the number until it commits; the second waits, then takes the next one
+    async def open_other():
+        async with sm() as other:
+            out = await records.open_anchor_session(ctx, other, actor="founder-b")
+            await other.commit()
+            return out["title"]
+    first = await records.open_anchor_session(ctx, db)
+    second = asyncio.create_task(open_other())
+    await asyncio.sleep(0.3)
+    assert not second.done(), "the second open must wait for the first to commit"
+    await db.commit()
+    assert first["title"].startswith("Anchor 1:") and (await second).startswith("Anchor 2:")
+    ns = sorted(a.n for a in (await db.execute(select(Anchor))).scalars().all())
+    assert ns == [1, 2]
+
+    # resolution numbers: the same, through _next_number
+    async def number_other():
+        async with sm() as other:
+            n = await resolutions._next_number(other)
+            await other.commit()
+            return n
+    assert await resolutions._next_number(db) == 1
+    db.add(Resolution(id="r1", number=1, title="t", body="b", matter="parameter", ops=[], proposed_by="founder-a"))
+    task = asyncio.create_task(number_other())
+    await asyncio.sleep(0.3)
+    assert not task.done()
+    await db.commit()
+    assert await task == 2
+
+    # a fee block: the second submit waits for the first, then sees its row and gets the 409 it would have got
+    # had it arrived later, not an IntegrityError at the insert
+    now = time.time_ns()
+    ctx.chain.blocks["c" * 64] = _send(True)
+    await serialize(db, "fee:" + "c" * 64)
+    db.add(Proposal(hash="9" * 64, title="t", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64,
+                    author_signature="s", author_timestamp=now, fee_block_hash="c" * 64, status="open", opened_at=now,
+                    closes_at=now + D, rules=ctx.config.pinned_rules(), analysis=[]))
+
+    async def verify_other():
+        async with sm() as other:
+            try:
+                await portal._verify_fee(ctx, other, "c" * 64, AUTHOR, 1000)
+            except HTTPException as e:
+                return e.status_code, e.detail
+            return None
+    task = asyncio.create_task(verify_other())
+    await asyncio.sleep(0.3)
+    assert not task.done()
+    await db.commit()
+    assert await task == (409, "this fee block has already been used")
+
+
+async def test_a_unique_key_collision_answers_409_on_every_route():
+    """The rule in one place: the app maps IntegrityError to 409 before StatementError can make it a 500."""
+    from sqlalchemy.exc import IntegrityError, StatementError
+
+    from dao.main import app
+    assert issubclass(IntegrityError, StatementError), "the ordering this test guards"
+    handler = app.exception_handlers[IntegrityError]
+    req = SimpleNamespace(method="POST", url=SimpleNamespace(path="/v1/proposals"), headers={})
+    resp = await handler(req, IntegrityError("INSERT", {}, Exception('duplicate key value violates unique constraint "fee_ledger_pkey"')))
+    assert resp.status_code == 409
+
+
+# ---- XE-1445: the pause gates every chain write the worker can make -----------------------------------
+
+async def test_no_worker_job_writes_to_the_chain_while_paused(db, monkeypatch):
+    from contextlib import asynccontextmanager
+    from pathlib import Path
+
+    from dao import worker as worker_mod
+    from dao.models import PauseRecord
+
+    # the chain's write methods, read from the client so a new one cannot arrive unlisted
+    src = Path(worker_mod.__file__).parent.parent.joinpath("xe", "client.py").read_text()
+    chunks = src.split("    async def ")[1:]
+    writers = {c.split("(", 1)[0] for c in chunks if "self._post_" in c and not c.startswith("_")}
+    assert writers == {"submit_block", "submit_statechain_block", "directory_register", "chat_send"}, writers
+
+    calls = []
+
+    class Chain(FakeChain):
+        def __getattr__(self, name):
+            if name in writers:
+                async def record(*a, **k):
+                    calls.append(name)
+                return record
+            raise AttributeError(name)
+
+        async def chat_messages(self, *a, **k):
+            return []
+
+        async def statechain_tip(self):
+            return None
+
+    ctx = _ctx(chain=Chain())
+    ctx.signer = FakeSigner(("harness", "fee", "dao"))
+    ctx.node = SimpleNamespace(chat_pow_difficulty=0, network_id="xe-test")
+    ctx.directory_node_peer = "12D3KooWTestPeer"
+    ctx.settings = SimpleNamespace(public_base_url="http://dao")
+    ctx.config.members = [_member("founder-a")]
+    ctx.config.pause = {}
+    sm = async_sessionmaker(db.bind, expire_on_commit=False)
+
+    @asynccontextmanager
+    async def fake_session():
+        async with sm() as s:
+            yield s
+    monkeypatch.setattr(worker_mod, "session", fake_session)
+    now = time.time_ns()
+    db.add(PauseRecord(id="p1", determined_by="founder-a", ground="g", determination="d" * 20, started_at=now,
+                       expires_at=now + 10 ** 12, indefinite=False, extensions=[], lifted_by=[], status="active",
+                       post_text="posted", posted_at=now))
+    await db.commit()
+
+    w = worker_mod.Worker(ctx)
+    for job in (w.job_directory, w.job_fees, w.job_outbox, w.job_timers, w.job_sessions, w.job_anchor):
+        await job()
+    assert calls == [], f"chain writes under pause: {calls}"
+
+    # control: lifted, the registration goes out
+    (await db.execute(select(PauseRecord))).scalar_one().status = "lifted"
+    await db.commit()
+    await w.job_directory()
+    assert calls == ["directory_register"]
+
+
+# ---- XE-1254: the public surfaces carry only what the harness verified ----------------------------------
+
+async def test_an_envelope_that_fails_verification_is_kept_but_never_public(db):
+    import dataclasses
+
+    from xe.chat import new_envelope
+    ctx = _ctx()
+    kp = KeyPair.generate()
+    good = new_envelope(kp, "d" * 64, "hello from a verified key", difficulty=0)
+    forged = dataclasses.replace(new_envelope(kp, "d" * 64, "statement attributed to a member", difficulty=0),
+                                 from_="m" * 64)    # the id and signature no longer match the claimed sender
+    m_good = await inbox.store_envelope(ctx, db, good)
+    m_bad = await inbox.store_envelope(ctx, db, forged)
+    await db.commit()
+    assert m_good.verified and not m_bad.verified and m_bad.status == "new"
+    # stored (so the id is never fetched again), but not on the public list, the public thread, or the public log
+    assert await inbox.store_envelope(ctx, db, forged) is None
+    assert inbox.is_public(m_good) and not inbox.is_public(m_bad)
+    assert [m.id for m in await inbox.list_public(db)] == [good.id]
+    with pytest.raises(HTTPException) as e:
+        await inbox.get_public(db, forged.id)
+    assert e.value.status_code == 404
+    public = {ev.payload["id"]: ev.public for ev in (await db.execute(select(Event).where(Event.kind == "inbox.received"))).scalars().all()}
+    assert public == {good.id: True, forged.id: False}
+    # members still see it, marked
+    assert {m.id: m.verified for m in await inbox.list_messages(db)} == {good.id: True, forged.id: False}

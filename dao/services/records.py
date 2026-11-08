@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from xe.client import XeError
 
 from ..context import Context
+from ..db import serialize
 from ..log import EventLog
 from ..models import Anchor, HealthCheck, SigningSession, TreasurySnapshot
 from . import sessions
@@ -96,7 +97,8 @@ async def open_registry_session(ctx: Context, db: AsyncSession, actor: str) -> d
 
 async def latest_anchor(db: AsyncSession, *, written: bool = False) -> Anchor | None:
     """The newest anchor; `written=True` for only those that reached the chain. Numbering counts the one in
-    flight so two sessions never take the same n; health counts only what was written (XE-0990)."""
+    flight, and `open_anchor_session` serialises on the number, so two sessions never take the same n
+    (XE-1435); health counts only what was written (XE-0990)."""
     q = select(Anchor).order_by(Anchor.n.desc()).limit(1)
     if written:
         q = q.where(Anchor.statechain_index.isnot(None))
@@ -104,6 +106,7 @@ async def latest_anchor(db: AsyncSession, *, written: bool = False) -> Anchor | 
 
 
 async def open_anchor_session(ctx: Context, db: AsyncSession, actor: str = "harness") -> dict:
+    await serialize(db, "anchor.n")   # two opens at once take consecutive numbers (XE-1435)
     head = await EventLog.head(db)
     last = await latest_anchor(db)
     n = (last.n + 1) if last else 1

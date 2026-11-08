@@ -563,3 +563,21 @@ async def test_full_chain_stops_at_the_page_bound_whatever_total_the_node_claims
 
     c.chain = honest
     assert len(await c.full_chain("a" * 64)) == 2500
+
+
+def test_the_streaming_handler_holds_no_request_scoped_session():
+    """XE-1237: a long-lived response takes no pooled session for its lifetime; every read is its own short
+    session. Asserted on every streaming handler in the tree, found by the response class it returns."""
+    import inspect
+    import re
+
+    from dao.api import public
+    streaming = {}
+    for path in sorted(Path(public.__file__).parent.parent.rglob("*.py")):
+        for chunk in re.split(r"\n(?=async def |def )", path.read_text()):   # top-level functions only
+            m = re.match(r"async def (\w+)\(([^)]*)\)", chunk)
+            if m and re.search(r"(EventSourceResponse|StreamingResponse)\(", chunk):
+                streaming[m.group(1)] = m.group(2)
+    assert set(streaming) == {"events_stream"}, streaming
+    for name, params in streaming.items():
+        assert "Db" not in params and "db" not in inspect.signature(getattr(public, name)).parameters, name

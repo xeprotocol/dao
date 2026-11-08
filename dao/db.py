@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -35,6 +36,14 @@ def sessionmaker() -> async_sessionmaker[AsyncSession]:
 async def session() -> AsyncIterator[AsyncSession]:
     async with sessionmaker()() as s:
         yield s
+
+
+async def serialize(db: AsyncSession, name: str) -> None:
+    """Hold a transaction-scoped advisory lock on `name` until this transaction ends. For a value computed
+    from the table and then inserted (the next resolution number, the next anchor number, a fee block's
+    first use): the second transaction waits here, then reads what the first committed, so both succeed
+    in order rather than one losing on the unique key (XE-1290, XE-1435)."""
+    await db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:name))"), {"name": name})
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:

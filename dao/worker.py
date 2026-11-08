@@ -48,10 +48,15 @@ class Worker:
             await db.commit()
 
     async def job_directory(self):
+        """Keep the DAO's directory entry alive: a fresh signed registration every 20 minutes against the
+        node's 30-minute TTL. A chain write under the company key, so it stops while paused like every
+        other (XE-1445); a long pause lets the entry lapse, which is what "nothing moves" means."""
         ctx = self.ctx
         if not ctx.signer.has("dao") or not ctx.node.network_id:
             return
         async with session() as db:
+            if await pause.is_paused(db):
+                return
             try:
                 kp = ctx.signer.keypair("dao", "directory.register")
                 reg = new_registration(kp, ctx.node.network_id, ctx.directory_node_peer)

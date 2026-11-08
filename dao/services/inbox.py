@@ -1,8 +1,12 @@
 """Inbox: third parties talk to the DAO directly, over XE chat or signed HTTP.
 
 Every inbound message is verified (signature over the envelope id, PoW, key derives the account),
-stored, logged, and acknowledged. Replies are written by a seat holder and sent from the DAO's own
-account over chat, so the correspondent gets an answer on the channel they used.
+stored, logged, and acknowledged. One that fails the harness's own verification is still stored, so the
+id is remembered and never fetched again, but it is never public: the node checks every envelope before
+the harness sees it, so such a message means a node or a configuration the harness should not trust for
+attribution, and the public record carries only what the harness itself verified (XE-1254). Replies are
+written by a seat holder and sent from the DAO's own account over chat, so the correspondent gets an
+answer on the channel they used.
 """
 
 from __future__ import annotations
@@ -64,7 +68,7 @@ async def store_envelope(ctx: Context, db: AsyncSession, env: Envelope, channel:
     ev = await ctx.events.append(db, "inbox.received", f"account:{env.from_}", {
         "id": env.id, "channel": channel, "from": env.from_, "verified": verified, "body": body[:4000],
         "timestamp": env.timestamp,
-    }, ref=f"inbox:{env.id}", public=status != "spam")
+    }, ref=f"inbox:{env.id}", public=verified and status != "spam")
     if verified and channel == "chat" and not await pause.is_paused(db):
         await queue_reply(ctx, db, m, f"{AUTO_ACK} Log index {ev.index}.", from_seat="harness", kind="ack")
     return m
@@ -199,15 +203,16 @@ async def list_messages(db: AsyncSession, status: str | None = None, limit: int 
 
 
 def is_public(m: InboxMessage) -> bool:
-    """What the public surfaces may show (XE-0195). Spam never; an HTTP message not until a member has
-    moved it out of `new`, matching when its receipt reaches the public log (`publish_on_triage`). Chat
-    messages are logged on receipt and are public from the start."""
-    return m.status != "spam" and not (m.channel == "http" and m.status == "new")
+    """What the public surfaces may show (XE-0195). Only what the harness verified (XE-1254); spam never;
+    an HTTP message not until a member has moved it out of `new`, matching when its receipt reaches the
+    public log (`publish_on_triage`). Verified chat is logged on receipt and public from the start.
+    `list_public` is the same rule in SQL."""
+    return m.verified and m.status != "spam" and not (m.channel == "http" and m.status == "new")
 
 
 async def list_public(db: AsyncSession, limit: int = 100) -> list[InboxMessage]:
-    """Public listing: spam and untriaged HTTP messages excluded, so `limit` counts visible rows."""
-    q = (select(InboxMessage).where(InboxMessage.status != "spam")
+    """Public listing under `is_public`'s rule, in SQL so `limit` counts visible rows."""
+    q = (select(InboxMessage).where(InboxMessage.verified.is_(True), InboxMessage.status != "spam")
          .where(~((InboxMessage.channel == "http") & (InboxMessage.status == "new")))
          .order_by(InboxMessage.timestamp.desc()).limit(limit))
     return list((await db.execute(q)).scalars().all())

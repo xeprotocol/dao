@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.exc import DataError, StatementError
+from sqlalchemy.exc import DataError, IntegrityError, StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from xe.client import XeError
@@ -150,6 +150,16 @@ async def statement_error(request: Request, exc: StatementError):
     if isinstance(exc, DataError) or isinstance(exc.orig, (OverflowError, ValueError)):
         return await http_error(request, StarletteHTTPException(400, "a parameter is not representable"))
     return await unhandled_error(request, exc)
+
+
+@app.exception_handler(IntegrityError)
+async def integrity_error(request: Request, exc: IntegrityError):
+    """Two requests wrote the same unique key and the database kept one: a fee block reused by two submits,
+    a pause started twice. The loser's request conflicts with a write that has since landed; it is a 409 to
+    retry or re-read, never a 500, on every table with a unique key (XE-1290, XE-1435). The transaction is
+    already rolled back by the session's exit."""
+    log.info("conflicting write on %s %s: %s", request.method, request.url.path, str(exc.orig)[:200])
+    return await http_error(request, StarletteHTTPException(409, "conflicts with a write that has just landed; re-read and retry"))
 
 
 @app.exception_handler(XeError)

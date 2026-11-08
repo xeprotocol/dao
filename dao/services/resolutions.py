@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..auth import Verified
 from ..canonical import DOMAIN_RESOLUTION, digest
 from ..context import Context
+from ..db import serialize
 from ..models import Resolution
 from ..text import clean_text
 from . import sessions
@@ -43,6 +44,7 @@ def resolution_target(res_id: str, body_hash: str, decision: str) -> bytes:
 
 
 async def _next_number(db: AsyncSession) -> int:
+    await serialize(db, "resolution.number")   # two proposers at once take consecutive numbers (XE-1290)
     return int((await db.execute(select(func.coalesce(func.max(Resolution.number), 0)))).scalar_one()) + 1
 
 

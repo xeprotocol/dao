@@ -21,6 +21,7 @@ from ..auth import Verified, bind
 from ..canonical import DOMAIN_PROPOSAL, canonical_json, sha256_hex
 from ..chainops import account_snapshot, snapshot_time
 from ..context import Context
+from ..db import serialize
 from ..models import FeeLedger, Proposal, Resolution, Vote
 from ..text import clean_text, field_text
 from . import sessions
@@ -51,6 +52,9 @@ async def _verify_fee(ctx: Context, db: AsyncSession, fee_block_hash: str, autho
     fee_acct = fee_account(ctx)
     if not fee_acct:
         raise HTTPException(503, "fee account is not configured")
+    # Two submits reusing one block: the second waits here for the first to commit, then sees its row and
+    # gets this 409 rather than losing on the unique key after the node read (XE-1290).
+    await serialize(db, f"fee:{fee_block_hash}")
     used = (await db.execute(select(Proposal.hash).where(Proposal.fee_block_hash == fee_block_hash))).first()
     if used:
         raise HTTPException(409, "this fee block has already been used")
