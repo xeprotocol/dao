@@ -87,7 +87,7 @@ class FakeSigner:
 def _ctx(chain=None, fee=True):
     signer = FakeSigner(("harness", "fee") if fee else ("harness",))
     events = EventLog(Signer({"harness": signer._kp["harness"]}, {"harness": {"event.sign"}}))
-    config = SimpleNamespace(agent_accounts=set(), accounts={"dao": "d" * 64, "fee": FEE_ACCT},
+    config = SimpleNamespace(agent_accounts=set(), accounts={"dao": "d" * 64, "fee": FEE_ACCT}, human_seats=[],
                              pinned_rules=lambda: {"fee_micro_xe": 1000, "window_days": 7, "participating_wallet": {},
                                                    "excluded_accounts": [], "agents": {}})
     return SimpleNamespace(chain=chain or FakeChain(), signer=signer, events=events, config=config,
@@ -416,8 +416,8 @@ def _seat(payload, pr=None):
     return v
 
 
-def _member(seat, rights=("pause",)):
-    return SimpleNamespace(id=seat, is_member=True, can=lambda r, _rs=frozenset(rights): r in _rs)
+def _member(seat, rights=("pause",), key="p" * 64):
+    return SimpleNamespace(id=seat, is_member=True, public_key=key, can=lambda r, _rs=frozenset(rights): r in _rs)
 
 
 async def test_adopt_needs_a_passed_vote_and_is_recorded_once(db):
@@ -567,7 +567,7 @@ async def test_resolution_counts_only_current_members(db):
     from dao.models import Resolution
     from dao.services import resolutions
     ctx = _ctx()
-    ctx.config.members = [SimpleNamespace(id="founder-a", is_member=True), SimpleNamespace(id="founder-b", is_member=True)]
+    ctx.config.members = [_member("founder-a"), _member("founder-b")]
     ctx.config.windows = {}
     # an ordinary matter needs a majority of two: 2. "gone" signed for while a member, then left.
     r = Resolution(id="r9", number=9, title="note", body="b", matter="note", ops=None, proposed_by="founder-a",
@@ -577,7 +577,7 @@ async def test_resolution_counts_only_current_members(db):
 
     def member(seat, decision):
         v = _v(payload={"resolution_id": "r9", "body_hash": resolutions.body_hash(r), "decision": decision})
-        v.seat = SimpleNamespace(id=seat, is_member=True)
+        v.seat = _member(seat)
         return v
 
     await resolutions.decide(ctx, db, r, member("founder-a", "for"), "for")
@@ -605,7 +605,7 @@ async def test_pause_lift_ignores_a_departed_members_signature(db):
 
     def member(seat):
         v = _v(payload={"pause_id": "p1"})
-        v.seat = SimpleNamespace(id=seat, is_member=True)
+        v.seat = _member(seat)
         return v
 
     await pause.lift(ctx, db, r, member("founder-a"))
@@ -631,7 +631,7 @@ async def test_withdrawing_a_resolution_cancels_the_session_it_opened(db):
     from dao.models import Resolution
     from dao.services import resolutions
     ctx = _ctx()
-    ctx.config.members = [SimpleNamespace(id="founder-a", is_member=True)]
+    ctx.config.members = [_member("founder-a")]
     s = SigningSession(id="s1", kind="parameter", title="t", ops=[], ops_digest="d", status="approving", approvals=[],
                        required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0, resolution_id="r1")
     r = Resolution(id="r1", number=1, title="t", body="b", matter="note", ops=None, proposed_by="founder-a",
@@ -639,7 +639,7 @@ async def test_withdrawing_a_resolution_cancels_the_session_it_opened(db):
     db.add_all([s, r])
     await db.flush()
     v = _v(payload={"resolution_id": "r1"})
-    v.seat = SimpleNamespace(id="founder-a", is_member=True)
+    v.seat = _member("founder-a")
     await resolutions.withdraw(ctx, db, r, v)
     assert r.status == "withdrawn" and s.status == "cancelled" and s.error == "resolution withdrawn"
     # and a cancelled session cannot be rebuilt back to life
@@ -686,14 +686,15 @@ async def test_an_overpaid_fee_burns_the_fee_and_returns_the_rest(db, monkeypatc
 async def test_change_keyset_opens_a_keyset_session_and_bad_ops_are_refused_when_proposed(db):
     from dao.services import resolutions
     ctx = _ctx()
-    ctx.config.members = [SimpleNamespace(id="founder-a", is_member=True)]
+    ctx.config.members = [_member("founder-a")]
     ctx.config.windows = {}
     k1, k2, k3 = (KeyPair.generate().pub_key_hex for _ in range(3))
+    ctx.config.human_seats = [SimpleNamespace(public_key=k1), SimpleNamespace(public_key=k2)]   # k3 is nobody's
     good = [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2, k3], "threshold": 2}}]
 
     def proposer(payload):
         v = _v(payload=payload)
-        v.seat = SimpleNamespace(id="founder-a", is_member=True)
+        v.seat = _member("founder-a")
         return v
 
     async def refused(matter, ops, why):
@@ -712,6 +713,10 @@ async def test_change_keyset_opens_a_keyset_session_and_bad_ops_are_refused_when
     await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2], "threshold": True}}], "integer")
     await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, "0" * 64], "threshold": 2}}], "usable")
     await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2[:-1] + "G"], "threshold": 2}}], "hex")
+    # a keyset the seats cannot meet would end every later session, including the one to change it back (XE-1705)
+    await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k3], "threshold": 2}}], "held by a seat")
+    k4 = KeyPair.generate().pub_key_hex
+    await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k3, k4], "threshold": 2}}], "held by a seat")
 
     r = await resolutions.propose(ctx, db, proposer({"title": "rotate", "body": "b", "matter": "change_keyset", "ops": good}))
     await db.flush()
@@ -1333,7 +1338,7 @@ async def test_a_refused_submit_whose_block_landed_is_submitted_and_a_rebuild_ne
     ctx.chain.statechain_block = down
     await sessions.submit(ctx, db, s3)
     assert s3.status == "signing" and "could not confirm" in s3.error
-    assert (await db.execute(select(Event).where(Event.kind == "session.submit_unconfirmed"))).scalars().first() is not None
+    assert (await db.execute(select(Event).where(Event.kind == "session.submit_deferred"))).scalars().first() is not None
     # 4. the tip moved because this block is the tip: a rebuild marks it submitted rather than building the ops again
     ctx.chain.statechain_block = FakeChain.statechain_block.__get__(ctx.chain)
     ctx.chain.state_blocks[2] = {"index": 2, "hash": "h" * 64}
@@ -1420,3 +1425,382 @@ async def test_health_measures_an_unanchored_dao_and_a_late_worker_from_the_firs
     assert up["checks"] == 0 and up["expected"] == 20 * 24 * 6 and up["fraction"] == 0.0
     d = await _check(ctx, db)
     assert d["last_anchor"] is None and d["anchor_overdue"] and not d["ok"]
+
+
+# ---- XE-1689 / XE-1710 / XE-1713: a member's signature survives a node that does not answer --------------
+
+async def test_a_members_signature_survives_a_node_that_does_not_answer(db):
+    from dao.services import resolutions
+    ctx = _ctx()
+    ctx.config.members = [_member("founder-a"), _member("founder-b")]
+    ctx.config.windows = {}
+    down = XeError(0, "ConnectError: connection refused")
+    assert down.transient and "unreachable" in str(down)
+
+    async def no_answer(*a, **k):
+        raise down
+    # 1. the deciding signature on a resolution with ops: passed, session owed, opened when the node is back
+    ctx.chain.dao_keyset = no_answer
+    r = Resolution(id="r1", number=1, title="t", body="b", matter="parameter", proposed_by="founder-a", status="open",
+                   signatures=[], ops=[{"action": "set", "key": "dao.x", "value": "1"}])
+    db.add(r)
+    await db.flush()
+
+    def member(seat, decision):
+        v = _v(payload={"resolution_id": r.id, "body_hash": resolutions.body_hash(r), "decision": decision})
+        v.seat = _member(seat)
+        return v
+    await resolutions.decide(ctx, db, r, member("founder-a", "for"), "for")
+    await resolutions.decide(ctx, db, r, member("founder-b", "for"), "for")
+    assert r.status == "passed" and len(r.signatures) == 2 and r.session_id == ""
+    assert (await db.execute(select(Event).where(Event.kind == "resolution.session_deferred"))).scalars().one()
+    ctx.chain.dao_keyset = FakeChain.dao_keyset.__get__(ctx.chain)
+    assert await resolutions.open_deferred_sessions(ctx, db) == 1 and r.session_id
+    assert (await sessions.get(db, r.session_id)).kind == "parameter"
+    assert await resolutions.open_deferred_sessions(ctx, db) == 0
+    # 2. the deciding approval: recorded, the build owed
+    ctx.chain.statechain_tip = no_answer
+    s = SigningSession(id="s2", kind="parameter", title="t", ops=[{"action": "set", "key": "dao.x", "value": "1"}],
+                       ops_digest=sessions.ops_digest([{"action": "set", "key": "dao.x", "value": "1"}]), status="approving",
+                       approvals=[{"public_key": "k1"}], required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0)
+    db.add(s)
+    await db.flush()
+    v = _v(payload={"session_id": "s2", "ops_digest": s.ops_digest})
+    v.pub_key = "k2"
+    await sessions.approve(ctx, db, s, v)
+    assert s.status == "approving" and len(s.approvals) == 2
+    assert (await db.execute(select(Event).where(Event.kind == "session.build_deferred"))).scalars().one()
+    ctx.chain.statechain_tip = lambda: _tip_at(0)
+    await sessions.rebuild(ctx, db, s)          # what the worker's timer pass does
+    assert s.status == "signing" and s.block
+    # 3. the deciding block signature: the session stays signing with the error on record, and is submitted later
+    ctx.chain.submit_statechain_block = no_answer
+    ctx.chain.statechain_block = no_answer
+    s.block_signatures = [{"public_key": "k1", "signature": "s"}, {"public_key": "k2", "signature": "s"}]
+    await sessions.submit(ctx, db, s)
+    assert s.status == "signing" and "unreachable" in s.error
+    ks = await sessions.live_keyset(ctx)
+    assert sessions.ready_to_submit(s, ks)
+
+    async def accepted(blk):
+        return {"ok": True}
+    ctx.chain.submit_statechain_block = accepted
+    await sessions.submit(ctx, db, s)
+    assert s.status == "submitted" and s.submitted_index == s.block["index"]
+
+
+# ---- XE-1677 / XE-1817: only a refusal about the block ends a session -------------------------------------
+
+async def test_a_refusal_that_says_nothing_about_the_block_defers_and_a_keyset_refusal_rebuilds(db):
+    ctx = _ctx()
+    ctx.chain.statechain_tip = lambda: _tip_at(0)
+    answers = {}
+
+    async def refuse(blk):
+        raise answers["e"]
+    ctx.chain.submit_statechain_block = refuse
+    # a rate limit: the node never looked at the block
+    s1 = await _signing(db, "s1", index=1, n=1)
+    answers["e"] = XeError(429, "rate limit exceeded")
+    await sessions.submit(ctx, db, s1)
+    assert s1.status == "signing" and "429" in s1.error and len(s1.block_signatures) == 2
+    # a server error: the same
+    answers["e"] = XeError(503, "service unavailable")
+    await sessions.submit(ctx, db, s1)
+    assert s1.status == "signing"
+    # the keyset moved under the block, approvals still meet the live keyset: rebuilt for the new signers
+    s2 = await _signing(db, "s2", index=1, n=2)
+    answers["e"] = XeError(400, "block rejected: signer k9 not in keyset")
+    await sessions.submit(ctx, db, s2)
+    assert s2.status == "signing" and s2.block_signatures == [] and s2.rebuilds == 1
+    assert (await db.execute(select(Event).where(Event.kind == "session.keyset_moved"))).scalars().first()
+    # the keyset moved and the approvals no longer meet it: back to approving (XE-0988), not failed
+    s3 = await _signing(db, "s3", index=1, n=3)
+    s3.approvals = [{"public_key": "old1"}, {"public_key": "old2"}]
+    answers["e"] = XeError(400, "block rejected: insufficient signatures: got 1, need 2")
+    await sessions.submit(ctx, db, s3)
+    assert s3.status == "approving" and s3.block is None
+    # a refusal about the block itself, from a node that answered: failed, as before
+    s4 = await _signing(db, "s4", index=1, n=4)
+    answers["e"] = XeError(400, "block rejected: epoch key already exists")
+    await sessions.submit(ctx, db, s4)
+    assert s4.status == "failed"
+
+
+# ---- XE-1843: a cancel asks the chain first ------------------------------------------------------------
+
+async def test_cancelling_a_session_whose_block_landed_records_it_submitted(db):
+    from dao.services import records
+    ctx = _ctx()
+    v = _v()
+    v.seat = _member("founder-a")
+    s = await _signing(db, "c1", index=3, n=3)
+    ctx.chain.state_blocks[3] = {"index": 3, "hash": "h" * 64}
+    out = await sessions.cancel(ctx, db, s, v, "looks stuck")
+    assert out.status == "submitted" and s.submitted_index == 3
+    assert (await records.latest_anchor(db)).session_id == "c1", "the anchor row stays"
+    # a block not on the chain: cancelled, and its anchor row goes
+    s2 = await _signing(db, "c2", index=4, n=4)
+    await sessions.cancel(ctx, db, s2, v, "withdrawn")
+    assert s2.status == "cancelled" and (await records.latest_anchor(db)).session_id == "c1"
+
+
+# ---- XE-1651 / XE-1666 / XE-1768: the chat cursor is derived from the stored inbox ----------------------
+
+async def test_chat_cursor_comes_from_the_stored_inbox_with_a_margin(db, monkeypatch):
+    ctx = _ctx()
+    ctx.signer = FakeSigner(("harness", "fee", "dao"))
+    now = time.time_ns()
+    assert abs(await inbox.chat_cursor(db) - (now - inbox.CURSOR_START_NS)) < 5 * inbox.NS
+    # an envelope dated five minutes ahead by its sender moves the cursor only to fifteen minutes before it
+    db.add(InboxMessage(id="e1", channel="chat", from_account="a" * 64, to_account="d" * 64, pub_key="p" * 64, body="x",
+                        timestamp=now + 300 * inbox.NS, signature="s", pow_nonce=0, verified=True, status="new"))
+    db.add(InboxMessage(id="h1", channel="http", from_account="a" * 64, to_account="d" * 64, pub_key="p" * 64, body="x",
+                        timestamp=now + 3600 * inbox.NS, signature="s", pow_nonce=0, verified=True, status="new"))
+    await db.commit()
+    cursor = await inbox.chat_cursor(db)
+    assert cursor == now + 300 * inbox.NS - inbox.CURSOR_MARGIN_NS, "http rows do not move the chat cursor"
+    assert cursor <= now - 600 * inbox.NS, "an honest message dated inside the skew window is still fetched"
+    asked = []
+
+    async def messages(proof, since):
+        asked.append(since)
+        return []
+
+    async def proof(ctx_):
+        return {}
+    ctx.chain.chat_messages = messages
+    monkeypatch.setattr(inbox, "read_proof", proof)
+    await inbox.backfill(ctx, db)
+    assert asked == [cursor]
+    assert inbox.CURSOR_MARGIN_NS >= 3 * 300 * inbox.NS
+
+
+# ---- XE-1729 / XE-1776 / XE-1846 / XE-1845: the outbox --------------------------------------------------------
+
+async def test_outbox_sends_at_most_once_in_priority_order_and_the_message_follows_delivery(db, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from dao.models import OutboxMessage
+    ctx = _ctx()
+    ctx.signer = FakeSigner(("harness", "fee", "dao"))
+    now = time.time_ns()
+    m = InboxMessage(id="m1", channel="chat", from_account="a" * 64, to_account="d" * 64, pub_key="p" * 64, body="q",
+                     timestamp=now, signature="s", pow_nonce=0, verified=True, status="new")
+    db.add(m)
+    await db.flush()
+    ack = await inbox.queue_reply(ctx, db, m, "ack", from_seat="harness", kind="ack")
+    assert m.status == "new", "an acknowledgement is not an answer"
+    reply = await inbox.queue_reply(ctx, db, m, "the answer", from_seat="cto")
+    assert m.status == "replying" and m.reply_id == reply.id
+    await db.commit()
+    sm = async_sessionmaker(db.bind, expire_on_commit=False)
+    sent, seen = [], []
+
+    async def send(env):
+        async with sm() as other:   # what is on disk at the moment the node is handed the envelope
+            row = (await other.execute(select(OutboxMessage).where(OutboxMessage.body == env["body"]))).scalar_one()
+            seen.append(row.status)
+        sent.append(env["body"])
+    ctx.chain.chat_send = send
+    monkeypatch.setattr(inbox, "new_envelope", lambda kp, to, body, *a: SimpleNamespace(id="e" + body, to_json=lambda: {"to": to, "body": body}))
+    assert await inbox.flush_outbox(ctx, db) == 2
+    assert sent == ["the answer", "ack"], "a member's reply goes before an acknowledgement queued earlier"
+    assert seen == ["sending", "sending"], "the intent to send is on disk before the send"
+    await db.refresh(m)
+    assert m.status == "answered" and reply.status == "sent" and ack.status == "sent"
+    # a row the last pass left `sending`: not sent again, settled as unconfirmed
+    db.add(OutboxMessage(id="u1", to_account="b" * 64, body="maybe", status="sending", in_reply_to="m1", from_seat="cto", envelope={}, error=""))
+    await db.commit()
+    assert await inbox.flush_outbox(ctx, db) == 0 and "maybe" not in sent
+    u = (await db.execute(select(OutboxMessage).where(OutboxMessage.id == "u1"))).scalar_one()
+    assert u.status == "sent" and "unconfirmed" in u.error
+    assert (await db.execute(select(Event).where(Event.kind == "outbox.unconfirmed"))).scalars().one()
+    # a reply given up after a week returns its message to `new`
+    m2 = InboxMessage(id="m2", channel="chat", from_account="c" * 64, to_account="d" * 64, pub_key="p" * 64, body="q",
+                      timestamp=now, signature="s", pow_nonce=0, verified=True, status="new")
+    db.add(m2)
+    await db.flush()
+    old = await inbox.queue_reply(ctx, db, m2, "late", from_seat="cto")
+    old.created_at = datetime.now(timezone.utc) - timedelta(days=8)
+    await db.commit()
+    await inbox.flush_outbox(ctx, db)
+    await db.refresh(m2)
+    assert old.status == "failed" and m2.status == "new" and m2.reply_id == "" and "late" not in sent
+    # acknowledgements are rationed per correspondent
+    assert await inbox._acked_recently(db, "a" * 64) and not await inbox._acked_recently(db, "z" * 64)
+    # the by-hand statuses do not include the two that delivery sets
+    bad = _v(payload={"status": "answered"})
+    bad.seat = _member("cto")
+    with pytest.raises(HTTPException):
+        await inbox.set_status(ctx, db, m, bad)
+
+
+# ---- XE-1726 / XE-1893: a lapsed pause is not active, whatever its row says --------------------------------
+
+async def test_a_lapsed_pause_cannot_be_extended_lifted_or_posted(db):
+    from dao.models import PauseRecord
+    from dao.services import pause
+    ctx = _ctx()
+    ctx.config.members = [_member("founder-a")]
+    ctx.config.pause = {}
+    now = time.time_ns()
+    r = PauseRecord(id="p1", determined_by="founder-a", ground="g", determination="d" * 20, started_at=now - 10 * 3600 * 10**9,
+                    expires_at=now - 3600 * 10**9, indefinite=False, extensions=[], lifted_by=[], status="active")
+    db.add(r)
+    await db.flush()
+    assert not pause.in_force(r) and await pause.active(db) is None
+
+    def member(payload):
+        v = _v(payload={"pause_id": "p1", **payload})
+        v.seat = _member("founder-a")
+        return v
+    for action in (pause.extend, pause.lift, pause.set_post):
+        with pytest.raises(HTTPException) as e:
+            await action(ctx, db, r, member({"text": "the public post text", "reason": "more"}))
+        assert e.value.status_code == 409 and "expired" in e.value.detail, action.__name__
+    assert r.status == "active" and r.posted_at is None and r.extensions == [] and r.lifted_by == []
+    # the worker marks it expired and publishes no post for it
+    await pause.tick(ctx, db)
+    assert r.status == "expired" and r.posted_at is None
+
+
+# ---- XE-1761: a signature counts only while its seat holds the key it was made with -----------------------
+
+async def test_signatures_from_a_rotated_key_are_set_aside(db):
+    from dao.models import PauseRecord
+    from dao.services import pause, resolutions
+    ctx = _ctx()
+    ctx.config.members = [_member("founder-a", key="a" * 64), _member("founder-b", key="b" * 64)]
+    ctx.config.windows = {}
+    ctx.config.pause = {}
+    # founder-a signed with a key the seat no longer holds
+    r = Resolution(id="r1", number=1, title="t", body="b", matter="note", ops=None, proposed_by="founder-a", status="open",
+                   signatures=[{"seat": "founder-a", "public_key": "0" * 64, "signature": "s", "decision": "for", "timestamp": 1}])
+    db.add(r)
+    await db.flush()
+    v = _v(payload={"resolution_id": "r1", "body_hash": resolutions.body_hash(r), "decision": "for"})
+    v.seat, v.pub_key = _member("founder-b", key="b" * 64), "b" * 64
+    await resolutions.decide(ctx, db, r, v, "for")
+    assert r.status == "open", "one live signature plus one from a rotated key is not a majority of two"
+    ev = (await db.execute(select(Event).where(Event.kind == "resolution.signed"))).scalars().all()[-1]
+    assert ev.payload["for"] == 1 and ev.payload["set_aside"] == ["founder-a"]
+    # the pause: a lift signed with the old key does not count either
+    now = time.time_ns()
+    p = PauseRecord(id="p1", determined_by="founder-a", ground="g", determination="d" * 20, started_at=now, expires_at=now + 10**12,
+                    indefinite=False, extensions=[], lifted_by=[{"seat": "founder-a", "public_key": "0" * 64, "signature": "s", "timestamp": 1}],
+                    status="active")
+    db.add(p)
+    await db.flush()
+    lv = _v(payload={"pause_id": "p1"})
+    lv.seat, lv.pub_key = _member("founder-b", key="b" * 64), "b" * 64
+    await pause.lift(ctx, db, p, lv)
+    assert p.status == "active"
+    met, n_live, set_aside = pause._consent(ctx, p.lifted_by)
+    assert not met and n_live == 1 and set_aside == ["founder-a"]
+
+
+# ---- XE-1649 / XE-1725 / XE-1847 / XE-1770: the decision record ------------------------------------------------
+
+async def test_decide_compares_ops_by_meaning_names_a_referral_and_closes_analysis(db):
+    ctx = _ctx()
+    ops_a = [{"action": "set", "key": "dao.x", "value": '{"b":1,"a":2}'}]
+    ops_b = [{"action": "set", "key": "dao.x", "value": '{"a":2,"b":1}'}]
+    pr = _closed(ctx, "7" * 64, "passed", ops=ops_a)
+    db.add(pr)
+    db.add(Resolution(id="rp", number=1, title="t", body="b", matter="parameter", ops=ops_b, proposed_by="cto", status="passed",
+                      signatures=[], related_proposal=pr.hash))
+    db.add(Resolution(id="ro", number=2, title="t", body="b", matter="note", ops=None, proposed_by="cto", status="open",
+                      signatures=[], related_proposal=pr.hash))
+    await db.flush()
+    # a referral must name a resolution
+    with pytest.raises(HTTPException) as e:
+        await portal.decide(ctx, db, pr, _seat({"decision": "refer_to_resolution", "reasons": "needs a resolution first"}, pr))
+    assert e.value.status_code == 400 and "resolution_id" in e.value.detail
+    await portal.decide(ctx, db, pr, _seat({"decision": "refer_to_resolution", "reasons": "needs a resolution first", "resolution_id": "ro"}, pr))
+    assert pr.decision["resolution_id"] == "ro"
+    # analysis is still open while the decision is interim
+    await portal.add_analysis(ctx, db, pr, _seat({"text": "a note before the final decision"}, pr))
+    # the same ops written with the keys in another order authorise the adoption
+    await portal.decide(ctx, db, pr, _seat({"decision": "adopt", "reasons": "the vote passed and R1 authorises it", "resolution_id": "rp"}, pr))
+    assert pr.decision["decision"] == "adopt"
+    # and once final, analysis is closed
+    with pytest.raises(HTTPException) as e:
+        await portal.add_analysis(ctx, db, pr, _seat({"text": "a note after the fact"}, pr))
+    assert e.value.status_code == 409 and len(pr.analysis) == 1
+
+
+# ---- XE-1706 / XE-1724 / XE-1664: unreadable chains, agent class, and the open tally -------------------------
+
+async def test_unreadable_chain_weighs_nothing_agent_class_is_live_and_open_tallies_count_only_current_rows(db):
+    from dao.chainops import SNAPSHOT_RULE, snapshot_time
+    ctx = _ctx()
+    ctx.config.agent_accounts = {"ag"}
+    now = time.time_ns()
+    pr = Proposal(hash="8" * 64, title="t", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64, author_signature="s",
+                  author_timestamp=now, fee_block_hash="8" * 64, status="open", opened_at=now - D, closes_at=now - 1,
+                  rules=ctx.config.pinned_rules(), analysis=[])
+    db.add(pr)
+    at = snapshot_time(pr.opened_at)
+    chains = {"ag": [{"timestamp": at - 1000, "asset": "XE", "balance": 5_000_000, "hash": "g0", "type": "open"}],
+              "ok": [{"timestamp": at - 1000, "asset": "XE", "balance": 1_000_000, "hash": "o0", "type": "open"}]}
+
+    async def full_chain(account):
+        if account == "big":
+            raise XeError(413, "account chain exceeds 100000 blocks")
+        return chains[account]
+    ctx.chain.full_chain = full_chain
+    current = {"at": at, "rule": SNAPSHOT_RULE}
+    for acct, is_agent, snap in (("big", False, {}), ("ag", False, current), ("ok", False, current)):
+        db.add(Vote(proposal_hash=pr.hash, account=acct, pub_key="p" * 64, choice="for", reason="", timestamp=now,
+                    signature=os.urandom(8).hex(), weight=1_000_000, participating=True, is_agent=is_agent,
+                    eligibility={"snapshot": snap, "not_participating_because": []}))
+    await db.commit()
+    votes = await portal.votes_for(db, pr.hash)
+    open_t = portal.tally(pr, votes, ctx)
+    assert open_t["stale_rows"] == 2 and open_t["votes"] == 1 and open_t["weight"]["for"] == 1_000_000, \
+        "the row with no snapshot and the row whose account became an agent seat are not counted while stale"
+    assert portal.tally(pr, votes)["stale_rows"] == 0, "without a context nothing is filtered (the close path re-derives first)"
+    # the worker's pass re-derives them
+    assert await portal.rederive_open(ctx, db) == 2
+    rows = {v.account: v for v in await portal.votes_for(db, pr.hash)}
+    assert rows["big"].weight == 0 and not rows["big"].participating and "could not be read" in rows["big"].eligibility["not_participating_because"][0]
+    assert rows["big"].eligibility["snapshot"]["unreadable"]
+    assert rows["ag"].is_agent and not rows["ag"].participating
+    assert portal.tally(pr, await portal.votes_for(db, pr.hash), ctx)["stale_rows"] == 0
+    # and the close is not held by the unreadable chain
+    closed = await portal.close_due(ctx, db)
+    assert [p.hash for p in closed] == [pr.hash] and pr.result["participating_wallets"] == 1
+    # a transient fault still waits
+    pr2 = Proposal(hash="9" * 64, title="t", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64, author_signature="s",
+                   author_timestamp=now, fee_block_hash="9" * 64, status="open", opened_at=now - D, closes_at=now - 1,
+                   rules=ctx.config.pinned_rules(), analysis=[])
+    db.add(pr2)
+    db.add(Vote(proposal_hash=pr2.hash, account="ok", pub_key="p" * 64, choice="for", reason="", timestamp=now, signature=os.urandom(8).hex(),
+                weight=1, participating=True, is_agent=False, eligibility={}))
+    await db.commit()
+
+    async def down(a):
+        raise XeError(0, "ReadTimeout")
+    ctx.chain.full_chain = down
+    assert await portal.close_due(ctx, db) == [] and pr2.status == "open"
+
+
+# ---- XE-1650: a proposal's ops are ones a resolution could carry -------------------------------------------
+
+async def test_proposal_ops_must_be_ones_some_resolution_could_authorise(db):
+    ctx = _ctx()
+    k1, k2, k3 = (KeyPair.generate().pub_key_hex for _ in range(3))
+    ctx.config.human_seats = [SimpleNamespace(public_key=k1), SimpleNamespace(public_key=k2)]
+    seat_keys = sessions.seat_keys_of(ctx.config)
+    sessions.check_proposal_ops(sessions.normalise_ops([{"action": "set", "key": "dao.param.x", "value": 1}]), seat_keys)
+    sessions.check_proposal_ops(sessions.normalise_ops([{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2], "threshold": 2}}]), seat_keys)
+    for ops, why in (([{"action": "set", "key": "sys.tokenomics", "value": {"r": 1}}], "dao.* keys"),
+                     ([{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2], "threshold": 2}},
+                       {"action": "set", "key": "dao.x", "value": 1}], "exactly one op"),
+                     ([{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k3], "threshold": 2}}], "held by a seat")):
+        with pytest.raises(HTTPException) as e:
+            sessions.check_proposal_ops(sessions.normalise_ops(ops), seat_keys)
+        assert e.value.status_code == 400 and why in e.value.detail, e.value.detail
+        with pytest.raises(HTTPException) as e:
+            await portal.submit(ctx, db, _v(payload={"title": "t", "body": "b", "fee_block_hash": "c" * 64, "ops": ops}))
+        assert e.value.status_code == 400

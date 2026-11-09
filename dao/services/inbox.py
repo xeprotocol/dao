@@ -14,10 +14,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.chat import ChatError, Envelope, new_envelope, verify_envelope
@@ -67,9 +68,23 @@ async def store_envelope(ctx: Context, db: AsyncSession, env: Envelope, channel:
         "id": env.id, "channel": channel, "from": env.from_, "verified": verified, "body": body[:4000],
         "timestamp": env.timestamp,
     }, ref=f"inbox:{env.id}", public=verified and status != "spam")
-    if verified and channel == "chat" and not await pause.is_paused(db):
+    if verified and channel == "chat" and not await pause.is_paused(db) and not await _acked_recently(db, env.from_):
         await queue_reply(ctx, db, m, f"{AUTO_ACK} Log index {ev.index}.", from_seat="harness", kind="ack")
     return m
+
+
+ACK_EVERY_S = 3600
+
+
+async def _acked_recently(db: AsyncSession, account: str) -> bool:
+    """One acknowledgement per correspondent per hour. Every verified envelope is still stored and logged;
+    only the courtesy reply is rationed, so a flood of cheap messages cannot fill the outbox with
+    acknowledgements and hold members' replies behind them (XE-1845)."""
+    since = datetime.now(timezone.utc) - timedelta(seconds=ACK_EVERY_S)
+    q = select(func.count()).select_from(OutboxMessage).where(OutboxMessage.to_account == account,
+                                                               OutboxMessage.from_seat == "harness",
+                                                               OutboxMessage.created_at >= since)
+    return int((await db.execute(q)).scalar_one()) > 0
 
 
 async def http_submit(ctx: Context, db: AsyncSession, v: Verified) -> InboxMessage:
@@ -105,11 +120,14 @@ async def publish_on_triage(ctx: Context, db: AsyncSession, m: InboxMessage, act
 
 
 async def queue_reply(ctx: Context, db: AsyncSession, m: InboxMessage, text: str, from_seat: str, kind: str = "reply") -> OutboxMessage:
+    """Queue a reply. A member's reply moves the message to `replying`; it becomes `answered` when the reply
+    has gone out and returns to `new` if the reply is given up, so the record says what was delivered,
+    not what was intended (XE-1776, XE-1846)."""
     o = OutboxMessage(id=secrets.token_hex(8), in_reply_to=m.id, from_seat=from_seat, to_account=m.from_account,
                       body=text, envelope={}, status="queued")
     db.add(o)
     if kind == "reply":
-        m.status = "answered"
+        m.status = "replying"
         m.reply_id = o.id
     await ctx.events.append(db, "outbox.queued", from_seat if from_seat == "harness" else f"seat:{from_seat}", {
         "id": o.id, "in_reply_to": m.id, "to": m.from_account, "kind": kind, "body": text[:4000],
@@ -125,8 +143,8 @@ async def reply(ctx: Context, db: AsyncSession, m: InboxMessage, v: Verified) ->
 
 async def set_status(ctx: Context, db: AsyncSession, m: InboxMessage, v: Verified) -> InboxMessage:
     status = field_text(v.payload, "status")
-    if status not in ("new", "read", "answered", "closed", "spam"):
-        raise HTTPException(400, "bad status")
+    if status not in ("new", "read", "closed", "spam"):
+        raise HTTPException(400, "bad status")   # `replying` and `answered` are set by delivery, not by hand
     if status not in ("new", "spam"):
         await publish_on_triage(ctx, db, m, v.actor)
     m.status = status
@@ -144,7 +162,10 @@ async def flush_outbox(ctx: Context, db: AsyncSession) -> int:
     XE-0486 on the fee path)."""
     if not ctx.signer.has("dao") or await pause.is_paused(db):
         return 0
-    rows = list((await db.execute(select(OutboxMessage).where(OutboxMessage.status == "queued").limit(10))).scalars().all())
+    await _settle_unconfirmed(ctx, db)
+    # Members' replies before acknowledgements, oldest first (XE-1845).
+    order = (case((OutboxMessage.from_seat == "harness", 1), else_=0), OutboxMessage.created_at.asc())
+    rows = list((await db.execute(select(OutboxMessage).where(OutboxMessage.status == "queued").order_by(*order).limit(10))).scalars().all())
     n = 0
     give_up_before = datetime.now(timezone.utc) - timedelta(days=OUTBOX_RETRY_DAYS)
     for o in rows:
@@ -153,6 +174,7 @@ async def flush_outbox(ctx: Context, db: AsyncSession) -> int:
             o.status = "failed"
             await ctx.events.append(db, "outbox.failed", "harness", {"id": o.id, "to": o.to_account, "error": o.error[:300]},
                                     ref=f"inbox:{o.in_reply_to}")
+            await _reply_outcome(ctx, db, o, delivered=False)
             await db.commit()
             continue
         try:
@@ -161,18 +183,51 @@ async def flush_outbox(ctx: Context, db: AsyncSession) -> int:
                                           None, WORKER_POW_DEADLINE_S)
             if await pause.is_paused(db):   # read after the work, right before the send (XE-1172)
                 return n
+            # At most once: the intent to send is on disk before the send, so a commit that fails after it
+            # cannot roll a delivered reply back to `queued` and send it again under a new id (XE-1729).
+            o.status, o.envelope = "sending", env.to_json()
+            await db.commit()
             await ctx.chain.chat_send(env.to_json())
-            o.envelope = env.to_json()
             o.status = "sent"
             o.sent_at = datetime.now(timezone.utc)
             await ctx.events.append(db, "outbox.sent", "harness", {"id": o.id, "envelope_id": env.id, "to": o.to_account},
                                     ref=f"inbox:{o.in_reply_to}")
+            await _reply_outcome(ctx, db, o, delivered=True)
             n += 1
         except (SignerError, ChatError, Exception) as e:
+            o.status = "queued"   # the node did not take it; it goes again
             o.error = str(e)[:500]
             log.warning("outbox send failed %s: %s", o.id, e)
         await db.commit()
     return n
+
+
+async def _settle_unconfirmed(ctx: Context, db: AsyncSession) -> None:
+    """A row found `sending` was handed to the node before the pass that wrote it ended; whether the node
+    took it is unknown. It is not sent again: a reply goes out at most once, and the uncertainty is on the
+    record (XE-1729)."""
+    for o in (await db.execute(select(OutboxMessage).where(OutboxMessage.status == "sending"))).scalars().all():
+        o.status, o.sent_at = "sent", datetime.now(timezone.utc)
+        o.error = "delivery unconfirmed: the pass that sent it did not finish"
+        await ctx.events.append(db, "outbox.unconfirmed", "harness", {"id": o.id, "to": o.to_account},
+                                ref=f"inbox:{o.in_reply_to}")
+        await _reply_outcome(ctx, db, o, delivered=True)
+    await db.commit()
+
+
+async def _reply_outcome(ctx: Context, db: AsyncSession, o: OutboxMessage, *, delivered: bool) -> None:
+    """The inbox message a member's reply answers follows the reply: `answered` once it has gone out, back
+    to `new` if it never will (XE-1776, XE-1846). Acknowledgements leave the message as it is."""
+    if o.from_seat == "harness":
+        return
+    m = (await db.execute(select(InboxMessage).where(InboxMessage.id == o.in_reply_to))).scalar_one_or_none()
+    if m is None or m.reply_id != o.id:
+        return
+    m.status = "answered" if delivered else "new"
+    if not delivered:
+        m.reply_id = ""
+    await ctx.events.append(db, "inbox.status", "harness", {"id": m.id, "status": m.status, "reply": o.id},
+                            ref=f"inbox:{m.id}")
 
 
 async def read_proof(ctx: Context) -> dict[str, str]:
@@ -181,12 +236,28 @@ async def read_proof(ctx: Context) -> dict[str, str]:
     return chat_read_proof(kp, ch["challenge"])
 
 
-async def backfill(ctx: Context, db: AsyncSession, since_ns: int) -> int:
-    """Pull messages since a timestamp (used at start and after stream drops)."""
+NS = 1_000_000_000
+CURSOR_MARGIN_NS = 15 * 60 * NS   # three times the node's envelope clock skew (5 minutes)
+CURSOR_START_NS = 24 * 3600 * NS
+
+
+async def chat_cursor(db: AsyncSession) -> int:
+    """Where a backfill asks the node from: the newest stored chat envelope's timestamp less a margin wider
+    than the node's clock skew allowance, or a day ago if nothing is stored. The cursor is derived from
+    what is on disk, never from what was seen: an envelope that failed to store, or one dated five minutes
+    ahead by its sender, cannot move it past honest messages (XE-1651, XE-1666, XE-1768). Over-fetching is
+    harmless; `store_envelope` skips ids it holds."""
+    newest = (await db.execute(select(func.max(InboxMessage.timestamp)).where(InboxMessage.channel == "chat"))).scalar_one()
+    now = time.time_ns()
+    return max(now - CURSOR_START_NS, int(newest) - CURSOR_MARGIN_NS) if newest else now - CURSOR_START_NS
+
+
+async def backfill(ctx: Context, db: AsyncSession) -> int:
+    """Pull messages the node holds since the stored cursor (used at start and after stream drops)."""
     if not ctx.signer.has("dao"):
         return 0
     proof = await read_proof(ctx)
-    msgs = await ctx.chain.chat_messages(proof, since_ns)
+    msgs = await ctx.chain.chat_messages(proof, await chat_cursor(db))
     me = dao_account(ctx)
     n = 0
     for d in msgs or []:

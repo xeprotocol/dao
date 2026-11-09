@@ -734,3 +734,146 @@ def test_every_client_path_segment_is_percent_encoded():
     assert _seg("dao.anchor.1") == "dao.anchor.1" and _seg(7) == "7"
     assert _seg("x/../y") == "x%2F..%2Fy" and _seg("k?limit=1") == "k%3Flimit%3D1" and _seg("a#b") == "a%23b"
     assert _seg("a b\n") == "a%20b%0A"
+
+
+# ---- XE-1789: XE that arrives by a lease settle is causal like a receive -----------------------------------
+
+async def test_snapshot_does_not_count_a_settle_for_a_lease_opened_after_it():
+    from dao.chainops import account_snapshot
+    T = 100 * H
+    # the provider's chain: a settle dated just before the snapshot, minting 59 XE for lease L
+    settle = {"type": "lease_settle", "asset": "XE", "balance": 59_000_000, "timestamp": T - 60 * 10**9, "hash": "s1", "source": "L"}
+    lease_after = {"type": "lease", "asset": "XUSD", "timestamp": T + 50 * 60 * 10**9, "hash": "L"}   # escrow dated after the snapshot
+    chain = _Lattice({"P": [settle]}, {"L": lease_after})
+    p = await account_snapshot(chain, "P", T)
+    assert p["balance"] == 0 and p["excluded_receives"] == ["s1"] and chain.lookups == 1
+    # a lease opened before the snapshot: the emission counts
+    lease_after["timestamp"] = T - 2 * H
+    p = await account_snapshot(chain, "P", T)
+    assert p["balance"] == 59_000_000 and p["excluded_receives"] == []
+    # a settle outside the two-hour window is not looked up at all
+    settle["timestamp"] = T - 3 * H
+    chain.lookups = 0
+    assert (await account_snapshot(chain, "P", T))["balance"] == 59_000_000 and chain.lookups == 0
+
+
+# ---- XE-1917 / XE-1919: ops are validated as the node validates them: whole block, strict JSON -----------
+
+def test_ops_that_cannot_make_a_block_are_refused_at_intake():
+    from xe.statechain import MAX_BLOCK_SIZE, MAX_VALUE_SIZE, StateChainError, StateOp, check_ops_fit
+    from dao.services.sessions import normalise_ops
+    big = "x" * (MAX_VALUE_SIZE - 10)
+    ops = [StateOp.set(f"dao.k{i}", big) for i in range(5)]   # each under the per-op bound, together past the block
+    for op in ops:
+        op.validate()
+    with pytest.raises(StateChainError, match="MaxBlockSize"):
+        check_ops_fit(ops)
+    with pytest.raises(HTTPException) as e:
+        normalise_ops([{"action": "set", "key": f"dao.k{i}", "value": big} for i in range(5)])
+    assert e.value.status_code == 400 and "MaxBlockSize" in e.value.detail
+    check_ops_fit(ops[:3])
+    assert 3 * MAX_VALUE_SIZE < MAX_BLOCK_SIZE < 5 * MAX_VALUE_SIZE
+
+
+def test_non_finite_numbers_are_not_json_anywhere_a_value_is_read():
+    from xe.statechain import StateChainError, StateOp, canonical_value, compact_json, strict_loads
+    from dao.services.sessions import normalise_ops
+    for raw in ("1e400", "Infinity", "-Infinity", "NaN", '{"a":1e999}', "[NaN]"):
+        with pytest.raises(StateChainError):
+            canonical_value(raw)
+        with pytest.raises(StateChainError):
+            strict_loads(raw)
+    for val in (float("inf"), float("nan"), {"a": float("-inf")}):
+        with pytest.raises(StateChainError):
+            compact_json(val)
+    # a value that arrived already as the text Python would have written is refused when validated
+    with pytest.raises(StateChainError):
+        StateOp("set", "dao.x", "Infinity").validate()
+    with pytest.raises(HTTPException) as e:
+        normalise_ops([{"action": "set", "key": "dao.x", "value": "1e400"}])
+    assert e.value.status_code == 400
+    with pytest.raises(HTTPException):
+        normalise_ops([{"action": "set", "key": "dao.x", "value": float("inf")}])
+    assert normalise_ops([{"action": "set", "key": "dao.x", "value": 1e300}])[0]["value"] == "1e+300"
+
+
+# ---- XE-1688: every Unicode control is refused, the C1 range included ---------------------------------------
+
+def test_text_guard_refuses_c1_controls():
+    from dao.text import clean_text, has_bad_control, scrub
+    for c in ("\x80", "\x85", "\x9f", "\x7f", "\x00"):
+        assert has_bad_control("a" + c + "b"), hex(ord(c))
+        with pytest.raises(HTTPException):
+            clean_text("a" + c + "b", "f", max_len=10)
+        assert scrub("a" + c + "b") == "a\ufffdb"
+    assert clean_text("a\tb\nc", "f", max_len=10) == "a\tb\nc"
+
+
+# ---- XE-1779: a keyfile that cannot be opened is one SignerError -------------------------------------------
+
+def test_every_corrupt_keyfile_is_a_signer_error(tmp_path):
+    good = tmp_path / "ok.json"
+    Signer.init_keyfile(good, "pass phrase here")
+    blob = json.loads(good.read_text())
+    cases = {
+        "not-json": "{not json",
+        "not-object": "[1,2,3]",
+        "no-salt": json.dumps({k: v for k, v in blob.items() if k != "salt"}),
+        "bad-hex-salt": json.dumps({**blob, "salt": "zz"}),
+        "no-ciphertext": json.dumps({k: v for k, v in blob.items() if k != "ciphertext"}),
+        "truncated": json.dumps({**blob, "ciphertext": blob["ciphertext"][:20]}),
+    }
+    for name, text in cases.items():
+        p = tmp_path / f"{name}.json"
+        p.write_text(text)
+        with pytest.raises(SignerError):
+            Signer.load(p, "pass phrase here")
+
+
+# ---- XE-1639: the expected number of checks is counted under the cadence in force at the time --------------
+
+def test_expected_checks_use_the_cadence_each_stretch_ran_under():
+    from dao.services.records import expected_checks
+    S = 10**9
+    start, now = 0, 30 * 86400 * S
+    # ten-minute checks for 29 days, then hourly for the last day
+    rows = [(t, 600) for t in range(0, 29 * 86400 * S, 600 * S)] + [(t, 3600) for t in range(29 * 86400 * S, now, 3600 * S)]
+    assert expected_checks(rows, start, now, 3600) == 29 * 144 + 24
+    assert expected_checks(rows, start, now, 600) == 29 * 144 + 24, "the current cadence rewrites nothing behind it"
+    # a gap: 144 checks are expected for a missing day at ten minutes, whatever the config says today
+    rows = [(0, 600), (2 * 86400 * S, 600)]
+    assert expected_checks(rows, 0, 3 * 86400 * S, 3600) == 3 * 144
+    # rows without a recorded cadence (older) use the current one; no rows at all: the window at the current cadence
+    assert expected_checks([(0, None)], 0, 86400 * S, 600) == 144
+    assert expected_checks([], 0, 86400 * S, 3600) == 24
+    assert expected_checks([], 10, 10, 600) == 0
+
+
+# ---- XE-1673: the stream parses before it takes a slot -----------------------------------------------------
+
+def test_stream_resume_is_parsed_before_a_slot_is_taken():
+    import re
+    from dao.api.public import RESUME_RE
+    assert RESUME_RE.fullmatch("12") and RESUME_RE.fullmatch("-5") and RESUME_RE.fullmatch("0")
+    for bad in ("--5", "+5", "5x", "", " 5", "1" * 19, "١٢"):
+        assert not RESUME_RE.fullmatch(bad), bad
+    src = (ROOT / "dao" / "api" / "public.py").read_text()
+    body = src.split("async def events_stream(", 1)[1].split("\n    async def gen(", 1)[0]
+    parse_at, take_at = body.index("RESUME_RE.fullmatch"), body.index("STREAMS.take(")
+    assert parse_at < take_at, "anything that can refuse the request happens before the slot is taken"
+    after_take = body[take_at:]
+    assert re.search(r"\bint\(resume\)", after_take), "the parse the regex guarantees happens after the take"
+    assert "raise HTTPException" not in after_take, "nothing between the take and the response refuses the request"
+
+
+# ---- XE-1649 / XE-1725: ops are compared by what they write ---------------------------------------------------
+
+def test_same_ops_compares_values_by_meaning_not_bytes():
+    from dao.services.portal import same_ops
+    a = [{"action": "set", "key": "dao.x", "value": '{"b":1,"a":2}'}, {"action": "delete", "key": "dao.y"}]
+    b = [{"action": "set", "key": "dao.x", "value": '{"a":2,"b":1}'}, {"action": "delete", "key": "dao.y"}]
+    assert same_ops(a, b) and same_ops(a, a)
+    assert not same_ops(a, b[:1]) and not same_ops(a, [b[1], b[0]])
+    assert not same_ops(a, [{"action": "set", "key": "dao.x", "value": '{"a":2,"b":2}'}, b[1]])
+    assert not same_ops(a, [{"action": "set", "key": "dao.z", "value": '{"a":2,"b":1}'}, b[1]])
+    assert not same_ops(None, a) and not same_ops(a, None)

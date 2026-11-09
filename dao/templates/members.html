@@ -75,7 +75,7 @@
 <div id="decmsg" class="msg" hidden></div>
 
 <h2>Inbox</h2>
-<p class="mute" id="untriaged">{% if untriaged %}{{ untriaged }} unread HTTP message{{ 's' if untriaged != 1 }} — shown here once your seat key is loaded, and to everyone once a member has read {{ 'them' if untriaged != 1 else 'it' }}.{% else %}No unread HTTP messages.{% endif %}</p>
+<p class="mute" id="untriaged">Unread HTTP messages are shown here once your seat key is loaded, and to everyone once a member has read them.</p>
 <div id="inbox">
 {% for m in messages %}
 <div class="card" style="margin-bottom:10px">
@@ -115,7 +115,7 @@ async function loadUntriaged() {
   <select name="status"><option value="">status…</option><option>read</option><option>closed</option><option>spam</option></select></form>
 </div>`).join("");
     $("#inbox").insertAdjacentHTML("afterbegin", html);
-    $("#untriaged").textContent = r.messages.length + " unread HTTP message" + (r.messages.length === 1 ? "" : "s") + ", visible to seat holders only until read.";
+    $("#untriaged").textContent = r.total + " unread HTTP message" + (r.total === 1 ? "" : "s") + ", visible to seat holders only until read.";
   } catch (err) { say("#inmsg", err.message, false); }
 }
 const reload = () => setTimeout(() => location.reload(), 900);

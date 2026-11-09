@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request
@@ -123,16 +124,16 @@ async def submit_proposal(request: Request, req: SignedRequest, ctx: Ctx, db: Db
 
 
 @router.get("/proposals/{h}")
-async def get_proposal(h: str, db: Db):
+async def get_proposal(h: str, db: Db, ctx: Ctx):
     pr = await portal.get(db, h)
-    return portal.to_dict(pr, await portal.votes_for(db, pr.hash))
+    return portal.to_dict(pr, await portal.votes_for(db, pr.hash), ctx=ctx)
 
 
 @router.get("/proposals/{h}/votes")
-async def proposal_votes(h: str, db: Db):
+async def proposal_votes(h: str, db: Db, ctx: Ctx):
     pr = await portal.get(db, h)
     votes = await portal.votes_for(db, pr.hash)
-    return {"proposal": pr.hash, "tally": portal.tally(pr, votes),
+    return {"proposal": pr.hash, "tally": portal.tally(pr, votes, ctx),
             "votes": [{"account": v.account, "choice": v.choice, "weight": v.weight, "participating": v.participating,
                        "is_agent": v.is_agent, "timestamp": v.timestamp, "reason": v.reason, "signature": v.signature,
                        "pub_key": v.pub_key} for v in votes]}
@@ -260,6 +261,9 @@ async def log_get(db: Db, index: int = Path(ge=0, le=2**63 - 1)):
     return event_to_dict(ev)
 
 
+RESUME_RE = re.compile(r"-?[0-9]{1,18}")   # ASCII digits only: `\d` would take any script's digits
+
+
 @router.get("/events")
 async def events_stream(request: Request, ctx: Ctx, after: int | None = Query(None, ge=0, le=2**63 - 1)):
     """Server-sent events. Each public log entry is sent as `event: entry` (kind inside the data) as it
@@ -275,16 +279,19 @@ async def events_stream(request: Request, ctx: Ctx, after: int | None = Query(No
     if "text/html" in accept and "text/event-stream" not in accept:
         return RedirectResponse("/live", status_code=302)
     enforce_ip(request, NODE_READ)
+    # Everything that can refuse the request happens before the slot is taken, and the slot is held only
+    # by a generator whose `finally` releases it; nothing between take and the response can raise (XE-1673).
+    resume = request.headers.get("last-event-id", "")
+    if resume and not RESUME_RE.fullmatch(resume):
+        raise HTTPException(400, "Last-Event-ID must be an integer")
     holder = STREAMS.take(request)
-
     try:
         async with session() as s:
             head = await EventLog.head(s)
     except BaseException:
         STREAMS.release(holder)
         raise
-    resume = request.headers.get("last-event-id")
-    last_index = int(resume) if resume and resume.lstrip("-").isdigit() else (after if after is not None else head.index)
+    last_index = int(resume) if resume else (after if after is not None else head.index)
     wake: asyncio.Queue = asyncio.Queue(maxsize=1000)
     ctx.events.subscribe(wake)  # same-process appends shortcut the poll interval
 

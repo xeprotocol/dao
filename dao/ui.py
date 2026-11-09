@@ -119,7 +119,7 @@ async def proposal_page(request: Request, h: str):
         pr = await portal.get(db, h)
         votes = await portal.votes_for(db, pr.hash)
         events = await EventLog.page(db, 0, 50, ref=f"proposal:{pr.hash}")
-    return render(request, "proposal.html", {**common, "p": pr, "votes": votes, "tally": portal.tally(pr, votes), "events": events,
+    return render(request, "proposal.html", {**common, "p": pr, "votes": votes, "tally": portal.tally(pr, votes, get_context()), "events": events,
                                              "snapshot_at": snapshot_time(pr.opened_at)})
 
 
@@ -260,11 +260,10 @@ async def members_page(request: Request):
         res = await resolutions.list_resolutions(db)
         sess = await sessions.list_sessions(db)
         msgs = await inbox_svc.list_public(db, 100)
-        untriaged = await inbox_svc.count_untriaged(db)
         closed = await portal.awaiting_decision(db, 50)
     ks = await records.public_keyset(c)
     return render(request, "members.html", {
-        **common, "cfg": c.config, "resolutions": res, "sessions": sess, "messages": msgs, "untriaged": untriaged,
+        **common, "cfg": c.config, "resolutions": res, "sessions": sess, "messages": msgs,
         "closed": closed, "keyset": ks, "reserved": sorted(resolutions.RESERVED_MATTERS), "ordinary": sorted(resolutions.ORDINARY_MATTERS),
         "res_dict": lambda r: resolutions.to_dict(r, c.config), "sess_dict": sessions.to_dict,
     })

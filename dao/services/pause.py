@@ -31,11 +31,23 @@ H = 3600 * 1_000_000_000
 D = 24 * H
 
 
+def in_force(r: PauseRecord) -> bool:
+    """A pause is in force by its clock, not by its stored status: the worker marks a lapsed row `expired`
+    on its next pass, and until then the row still reads `active`. Every reader and every member action on
+    a pause asks this, so a lapsed pause cannot be extended back to life, lifted after it ended, or given a
+    public post (XE-1726, XE-1893)."""
+    return r.status == "active" and (r.indefinite or r.expires_at > time.time_ns())
+
+
+def require_in_force(r: PauseRecord) -> None:
+    if not in_force(r):
+        raise HTTPException(409, "pause is not active" if r.status != "active" else "pause has expired")
+
+
 async def active(db: AsyncSession) -> PauseRecord | None:
-    now = time.time_ns()
     rows = (await db.execute(select(PauseRecord).where(PauseRecord.status == "active"))).scalars().all()
     for r in rows:
-        if r.indefinite or r.expires_at > now:
+        if in_force(r):
             return r
     return None
 
@@ -87,16 +99,16 @@ def _consent(ctx: Context, sigs: list[dict]) -> tuple[bool, int, list[str]]:
     """Every current member who holds the pause right must have signed: the set that is counted is the set
     the routes let sign, so consent can always be reached (XE-1013). A signature from a seat that has since
     left the company carries nothing (XE-0646, as XE-0600 for resolutions): (met, live_count, set_aside_seats)."""
-    members = {s.id for s in ctx.config.members if s.can("pause")}
-    live = [s for s in sigs if s["seat"] in members]
-    set_aside = sorted(s["seat"] for s in sigs if s["seat"] not in members)
-    return len(live) >= len(members), len(live), set_aside
+    current = {s.id: s.public_key for s in ctx.config.members if s.can("pause")}
+    # ... and made with the key the seat holds today, as for resolutions (XE-1761).
+    live = [s for s in sigs if current.get(s["seat"]) and current[s["seat"]] == (s.get("public_key") or "").lower()]
+    set_aside = sorted({s["seat"] for s in sigs} - {s["seat"] for s in live})
+    return len(live) >= len(current), len(live), set_aside
 
 
 async def extend(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) -> PauseRecord:
     """Extensions need every current member: the first signature is recorded, the last applies it."""
-    if r.status != "active":
-        raise HTTPException(409, "pause is not active")
+    require_in_force(r)
     pending = [e for e in r.extensions if not e.get("applied")]
     sigs = (pending[0]["signatures"] if pending else [])
     if any(s["seat"] == v.seat.id for s in sigs):
@@ -119,8 +131,7 @@ async def extend(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) ->
 
 async def lift(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) -> PauseRecord:
     """Lifting early needs every current member, like an extension."""
-    if r.status != "active":
-        raise HTTPException(409, "pause is not active")
+    require_in_force(r)
     if any(s["seat"] == v.seat.id for s in r.lifted_by):
         raise HTTPException(409, "already signed")
     r.lifted_by = [*r.lifted_by, {"seat": v.seat.id, "public_key": v.pub_key, "signature": v.signature, "timestamp": v.timestamp}]
@@ -138,8 +149,7 @@ async def lift(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) -> P
 
 async def set_post(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) -> PauseRecord:
     """The public post is written while the pause is in force; a lifted or expired pause's record stands."""
-    if r.status != "active":
-        raise HTTPException(409, "pause is not active")
+    require_in_force(r)
     text = clean_text(v.payload.get("text"), "text", max_len=20_000)
     r.post_text = text
     if r.posted_at:
@@ -171,12 +181,13 @@ async def expire_lapsed(ctx: Context, db: AsyncSession) -> int:
 
 
 async def tick(ctx: Context, db: AsyncSession) -> None:
-    """Worker: auto-publish overdue posts, expire pauses."""
+    """Worker: expire lapsed pauses, then auto-publish overdue posts for the ones still in force."""
+    await expire_lapsed(ctx, db)
     now = time.time_ns()
     due_h = int(ctx.config.pause.get("public_post_within_hours", 4))
     for r in await _due_rows(db, PauseRecord.posted_at.is_(None), PauseRecord.started_at <= now - due_h * H):
-        await publish_post(ctx, db, r, "harness")
-    await expire_lapsed(ctx, db)
+        if in_force(r):
+            await publish_post(ctx, db, r, "harness")
 
 
 async def history(db: AsyncSession, limit: int = 50) -> list[PauseRecord]:

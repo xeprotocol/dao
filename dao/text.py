@@ -28,7 +28,7 @@ def _bad(c: str) -> bool:
     o = ord(c)
     if o < 0x20:
         return c not in _ALLOWED_CONTROL
-    if o == 0x7F or 0xD800 <= o <= 0xDFFF:
+    if o == 0x7F or 0x80 <= o <= 0x9F or 0xD800 <= o <= 0xDFFF:   # DEL, the C1 controls (XE-1688), surrogates
         return True
     return o >= 0xAD and c not in _ALLOWED_FORMAT and unicodedata.category(c) == "Cf"
 

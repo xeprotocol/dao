@@ -207,7 +207,7 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
     chain's own timestamps or the members' own records; a leg that cannot fetch records `<leg>_error`; any
     error or mismatch makes `ok` false, which the worker posts as `health.degraded`. A keyset that is not
     the one the members last wrote stays not ok until a keyset session writes it (BRIEF §13)."""
-    detail: dict = {"node_url": ctx.settings.xe_node_url, "network_id": ctx.node.network_id}
+    detail: dict = {"node_url": ctx.settings.xe_node_url, "network_id": ctx.node.network_id, "cadence_s": cadence_s(ctx)}
     ok = True
     now = time.time_ns()
     prev = await last_health(db) or {}
@@ -330,11 +330,28 @@ async def uptime_30d(ctx: Context, db: AsyncSession) -> dict:
     the worker happened to record, so a worker that started late or never does not score full (XE-1620)."""
     now = time.time_ns()
     since = now - WINDOW_30D_NS
-    total = int((await db.execute(select(func.count()).select_from(HealthCheck).where(HealthCheck.ts >= since))).scalar_one())
-    good = int((await db.execute(select(func.count()).select_from(HealthCheck).where(HealthCheck.ts >= since, HealthCheck.ok.is_(True)))).scalar_one())
+    rows = (await db.execute(select(HealthCheck.ts, HealthCheck.ok, HealthCheck.detail["cadence_s"].astext)
+                             .where(HealthCheck.ts >= since).order_by(HealthCheck.ts.asc()))).all()
+    total = len(rows)
+    good = sum(1 for _, ok, _ in rows if ok)
     first = await started_at(db)
     if first is None:
         return {"checks": 0, "ok": 0, "expected": 0, "fraction": None}
-    window_s = min(WINDOW_30D_NS, now - first) / 1e9
-    expected = max(total, int(window_s // cadence_s(ctx)))
+    expected = max(total, expected_checks([(int(ts), int(c) if c else None) for ts, _, c in rows], max(since, first), now, cadence_s(ctx)))
     return {"checks": total, "ok": good, "expected": expected, "fraction": (good / expected) if expected else None}
+
+
+def expected_checks(rows: list[tuple[int, int | None]], start_ns: int, now_ns: int, default_s: int) -> int:
+    """How many checks the window should hold: each stretch of it is divided by the cadence that was in
+    force then, as the check that opened the stretch recorded it, so a cadence change rewrites nothing
+    behind it (XE-1639). A row without a recorded cadence (written before this was kept) uses the current
+    one; the stretch before the first check uses that check's cadence."""
+    if now_ns <= start_ns:
+        return 0
+    edges = [(start_ns, (rows[0][1] if rows and rows[0][1] else default_s))]
+    edges += [(ts, c or default_s) for ts, c in rows if ts > start_ns]
+    expected = 0
+    for i, (ts, cadence) in enumerate(edges):
+        end = edges[i + 1][0] if i + 1 < len(edges) else now_ns
+        expected += int((end - ts) / (max(int(cadence), 1) * 1_000_000_000) + 0.5)   # nearest whole check
+    return expected

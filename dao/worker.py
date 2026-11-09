@@ -24,7 +24,7 @@ from .context import Context, build_context, set_context
 from .db import session
 from .log import EventLog
 from .models import SigningSession
-from .services import fees, inbox, pause, portal, records, sessions
+from .services import fees, inbox, pause, portal, records, resolutions, sessions
 from .worker_schedule import due_at, due_interval, job_table, last_runs, mark_run
 
 log = logging.getLogger("dao.worker")
@@ -35,7 +35,6 @@ class Worker:
     def __init__(self, ctx: Context):
         self.ctx = ctx
         self.stop = asyncio.Event()
-        self.chat_since = time.time_ns() - 24 * 3600 * NS
 
     # ---- jobs -----------------------------------------------------------------------------
 
@@ -94,6 +93,15 @@ class Worker:
             closed = await portal.close_due(self.ctx, db)
             if closed:
                 log.info("closed %d proposals", len(closed))
+            await db.commit()
+            if await portal.rederive_open(self.ctx, db):   # open tallies catch up with a rule or seat change (XE-1664)
+                await db.commit()
+            try:
+                if await resolutions.open_deferred_sessions(self.ctx, db):   # sessions owed to passed resolutions (XE-1710)
+                    await db.commit()
+            except XeError as e:
+                await db.rollback()
+                log.warning("deferred sessions: %s", e)
             await pause.tick(self.ctx, db)
             # promote approved sessions whose timelock has run, once no pause is in force
             now = time.time_ns()
@@ -132,25 +140,33 @@ class Worker:
         return (await db.execute(q)).scalar_one_or_none()
 
     async def job_sessions(self):
-        """If a signing session's block is stale and nobody has signed it yet, rebuild quietly."""
+        """A signing session whose block is stale is rebuilt; one that holds a threshold of signatures and
+        is not yet on the chain (its submit was deferred by a node that did not answer, XE-1677/XE-1689)
+        is submitted again."""
         async with session() as db:
             paused = await pause.is_paused(db)
             ids = [] if paused else await self._session_ids(db, "signing")
             await db.commit()
+            ks = None
             for sid in ids:
                 s = await self._take(db, sid, "signing")
                 if s is None:
                     await db.rollback()
                     continue
                 try:
-                    if not s.block_signatures and await sessions.is_stale(self.ctx, s):
+                    stale = await sessions.is_stale(self.ctx, s)
+                    if not s.block_signatures and stale:
                         await sessions.rebuild(self.ctx, db, s)
-                    elif s.block_signatures and await sessions.is_stale(self.ctx, s):
+                    elif s.block_signatures and stale:
                         # partial signatures over a stale block cannot be submitted; reset and say so
                         await self.ctx.events.append(db, "session.tip_moved", "harness", {
                             "session_id": s.id, "block_hash": s.block_hash, "had_signatures": len(s.block_signatures),
                         }, ref=f"session:{s.id}")
                         await sessions.rebuild(self.ctx, db, s)
+                    else:
+                        ks = ks or await sessions.live_keyset(self.ctx)
+                        if sessions.ready_to_submit(s, ks):
+                            await sessions.submit(self.ctx, db, s)
                     if s.status == "submitted" and s.kind == "anchor":
                         await records.note_anchor_submitted(db, s.id, s.submitted_index, s.submitted_hash)
                     await db.commit()
@@ -223,8 +239,11 @@ class Worker:
         me = ctx.signer.address("dao")
         while not self.stop.is_set():
             try:
+                # The backfill cursor comes from the stored inbox (inbox.chat_cursor), not from this loop: a
+                # store that fails below raises out of the stream, and the next pass asks the node again from
+                # what is on disk (XE-1651, XE-1666, XE-1768).
                 async with session() as db:
-                    n = await inbox.backfill(ctx, db, self.chat_since)
+                    n = await inbox.backfill(ctx, db)
                     await db.commit()
                     if n:
                         log.info("backfilled %d chat messages", n)
@@ -235,7 +254,6 @@ class Worker:
                     env = Envelope.from_json(d)
                     if env.to != me:
                         continue
-                    self.chat_since = max(self.chat_since, env.timestamp)
                     async with session() as db:
                         await inbox.store_envelope(ctx, db, env)
                         await db.commit()

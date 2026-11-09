@@ -15,6 +15,8 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from xe.client import XeError
+
 from ..auth import Verified
 from ..canonical import DOMAIN_RESOLUTION, digest
 from ..context import Context
@@ -60,7 +62,7 @@ async def propose(ctx: Context, db: AsyncSession, v: Verified) -> Resolution:
         ops = sessions.normalise_ops(ops)
         # Checked now against the session kind the matter will open, so a resolution that cannot execute is
         # refused here and not at its deciding vote (XE-0349).
-        sessions.check_ops(session_kind(matter), ops)
+        sessions.check_ops(session_kind(matter), ops, sessions.seat_keys_of(ctx.config))
     r = Resolution(id=secrets.token_hex(8), number=await _next_number(db), title=title, body=body, matter=matter,
                    ops=ops, proposed_by=v.seat.id, status="open", signatures=[],
                    related_proposal=clean_text(p.get("related_proposal"), "related_proposal", max_len=64, required=False))
@@ -86,6 +88,18 @@ def body_hash(r: Resolution) -> str:
     return sha256_hex(canonical_json({"title": r.title, "body": r.body, "matter": r.matter, "ops": r.ops}))
 
 
+def live_signatures(ctx: Context, sigs: list[dict]) -> tuple[list[dict], list[str]]:
+    """The stored signatures that count now: from a seat that is a current member, made with the key that
+    seat holds today. A seat that has left carries nothing (XE-0600); so does a key the seat has rotated
+    away from, exactly as a session counts approvals against the live keyset: a leaked or retired key must
+    not keep casting its seat's vote on items signed while it was live (XE-1761). Returns (live, set_aside
+    seat ids)."""
+    current = {s.id: s.public_key for s in ctx.config.members}
+    live = [s for s in sigs if current.get(s["seat"]) and current[s["seat"]] == (s.get("public_key") or "").lower()]
+    set_aside = sorted({s["seat"] for s in sigs} - {s["seat"] for s in live})
+    return live, set_aside
+
+
 async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, decision: str) -> Resolution:
     """A member signs for or against. payload = {resolution_id, body_hash, decision}."""
     if r.status != "open":
@@ -99,14 +113,9 @@ async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, dec
     r.signatures = [*r.signatures, {"seat": v.seat.id, "public_key": v.pub_key, "signature": v.signature,
                                     "decision": decision, "timestamp": v.timestamp}]
     needed, rule = _matter_rule(ctx.config, r.matter)
-    # Only current members count, the same way a session counts approvals against the live keyset: a seat
-    # that has left since signing carries nothing, for or against (XE-0600). The threshold is computed from
-    # the current membership, so the count must be too.
-    members = {s.id for s in ctx.config.members}
-    live = [s for s in r.signatures if s["seat"] in members]
+    live, set_aside = live_signatures(ctx, r.signatures)
     fors = sum(1 for s in live if s["decision"] == "for")
     againsts = sum(1 for s in live if s["decision"] == "against")
-    set_aside = sorted(s["seat"] for s in r.signatures if s["seat"] not in members)
     await ctx.events.append(db, "resolution.signed", v.actor, {
         "resolution_id": r.id, "decision": decision, "for": fors, "against": againsts, "needed": needed, "rule": rule,
         **({"set_aside": set_aside} if set_aside else {}),
@@ -119,13 +128,13 @@ async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, dec
             "resolution_id": r.id, "number": r.number, "title": r.title, "matter": r.matter, "for": fors, "against": againsts,
         }, ref=f"resolution:{r.id}")
         if r.ops:
-            kind = session_kind(r.matter)
-            w = ctx.config.windows
-            timelock_h = int(w.get("upgrade_timelock_hours", 0) or 0) if w.get("upgrade_timelock_status") == "active" else 0
-            not_before = time.time_ns() + timelock_h * 3600 * 1_000_000_000 if timelock_h else None
-            s = await sessions.create(ctx, db, kind=kind, title=f"R{r.number}: {r.title}", ops=r.ops, actor="harness",
-                                      resolution_id=r.id, not_before=not_before)
-            r.session_id = s.id
+            try:
+                await open_session(ctx, db, r)
+            except XeError as e:
+                # The deciding signature and the passed status are on the record; opening the session needs
+                # the node's keyset and the node did not answer. The worker opens it when it does (XE-1710).
+                await ctx.events.append(db, "resolution.session_deferred", "harness",
+                                        {"resolution_id": r.id, "error": str(e)[:300]}, ref=f"resolution:{r.id}")
     elif againsts > n_members - needed:
         r.status = "rejected"
         r.decided_at = datetime.now(timezone.utc)
@@ -133,6 +142,30 @@ async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, dec
             "resolution_id": r.id, "number": r.number, "for": fors, "against": againsts,
         }, ref=f"resolution:{r.id}")
     return r
+
+
+async def open_session(ctx: Context, db: AsyncSession, r: Resolution) -> None:
+    """Open the execution session a passed resolution with ops is owed."""
+    kind = session_kind(r.matter)
+    w = ctx.config.windows
+    timelock_h = int(w.get("upgrade_timelock_hours", 0) or 0) if w.get("upgrade_timelock_status") == "active" else 0
+    not_before = time.time_ns() + timelock_h * 3600 * 1_000_000_000 if timelock_h else None
+    s = await sessions.create(ctx, db, kind=kind, title=f"R{r.number}: {r.title}", ops=r.ops, actor="harness",
+                              resolution_id=r.id, not_before=not_before)
+    r.session_id = s.id
+
+
+async def open_deferred_sessions(ctx: Context, db: AsyncSession) -> int:
+    """Worker: passed resolutions with ops whose session could not be opened at the deciding signature."""
+    q = (select(Resolution).where(Resolution.status == "passed", Resolution.ops.isnot(None), Resolution.session_id == "")
+         .with_for_update(skip_locked=True))
+    n = 0
+    for r in (await db.execute(q)).scalars().all():
+        if not r.ops:
+            continue
+        await open_session(ctx, db, r)
+        n += 1
+    return n
 
 
 async def withdraw(ctx: Context, db: AsyncSession, r: Resolution, v: Verified) -> Resolution:

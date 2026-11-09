@@ -18,10 +18,12 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.client import XeError
+from xe.statechain import strict_loads
 
 from ..auth import Verified, bind
 from ..canonical import DOMAIN_PROPOSAL, canonical_json, sha256_hex
-from ..chainops import SNAPSHOT_RULE, account_snapshot, snapshot_time
+
+from ..chainops import SNAPSHOT_RULE, account_snapshot, empty_snapshot, snapshot_time
 from ..context import Context
 from ..db import serialize
 from ..models import FeeLedger, Proposal, Resolution, Vote
@@ -92,6 +94,7 @@ async def submit(ctx: Context, db: AsyncSession, v: Verified) -> Proposal:
         raise HTTPException(400, "fee_block_hash must be 64 hex characters")
     if ops is not None:
         ops = sessions.normalise_ops(ops)
+        sessions.check_proposal_ops(ops, sessions.seat_keys_of(ctx.config))   # ops some resolution could carry (XE-1650)
     rules = ctx.config.pinned_rules()
     fee = int(rules["fee_micro_xe"])
     if fee and not fee_block_hash:
@@ -154,9 +157,19 @@ async def eligibility(ctx: Context, pr: Proposal, account: str, is_agent: bool) 
     time, at cast and again at close for any row derived under a different snapshot (XE-1617)."""
     rules = pr.rules
     pw = rules.get("participating_wallet", {})
-    snap = await account_snapshot(ctx.chain, account, snapshot_time(pr.opened_at), rules.get("weight_asset", "XE"))
-    excluded = account in set(rules.get("excluded_accounts", []))
+    at = snapshot_time(pr.opened_at)
     reasons = []
+    try:
+        snap = await account_snapshot(ctx.chain, account, at, rules.get("weight_asset", "XE"))
+    except XeError as e:
+        if e.transient:
+            raise   # the node may answer next time; the caller decides whether to wait
+        # A definite answer that the chain cannot be read for this account (413: past the page bound the
+        # harness reads, XE-1189) is the account's answer, not the node's mood: it weighs nothing, and the
+        # proposal is not held open for it (XE-1706).
+        snap = empty_snapshot(at, unreadable=str(e)[:200])
+        reasons.append(f"the account's chain could not be read: {e.message[:120]}")
+    excluded = account in set(rules.get("excluded_accounts", []))
     if excluded:
         reasons.append("excluded account")
     if pw.get("must_exist_before_open", True) and not snap["exists"]:
@@ -168,10 +181,13 @@ async def eligibility(ctx: Context, pr: Proposal, account: str, is_agent: bool) 
     return snap, reasons, not reasons, (0 if excluded else int(snap["balance"]))
 
 
-def _current(pr: Proposal, row: Vote) -> bool:
-    """Whether the row's stored weight was derived under the proposal's snapshot as it is now defined."""
+def is_current(ctx: Context, pr: Proposal, row: Vote) -> bool:
+    """Whether the row's stored weight was derived under the proposal's snapshot as it is now defined, and
+    under the account's present class (an account made or unmade an agent seat since it voted is re-derived
+    too, XE-1724)."""
     snap = (row.eligibility or {}).get("snapshot") or {}
-    return snap.get("at") == snapshot_time(pr.opened_at) and snap.get("rule") == SNAPSHOT_RULE
+    return (snap.get("at") == snapshot_time(pr.opened_at) and snap.get("rule") == SNAPSHOT_RULE
+            and bool(row.is_agent) == (row.account in ctx.config.agent_accounts))
 
 
 async def rederive_stale(ctx: Context, db: AsyncSession, pr: Proposal) -> list[Vote]:
@@ -181,18 +197,34 @@ async def rederive_stale(ctx: Context, db: AsyncSession, pr: Proposal) -> list[V
     rather than closing on stale weight (XE-1617)."""
     stale = []
     for row in await votes_for(db, pr.hash):
-        if _current(pr, row):
+        if is_current(ctx, pr, row):
             continue
-        snap, reasons, participating, weight = await eligibility(ctx, pr, row.account, row.is_agent)
-        changed = (row.weight, row.participating) != (weight, participating)
-        row.weight, row.participating = weight, participating
+        is_agent = row.account in ctx.config.agent_accounts
+        snap, reasons, participating, weight = await eligibility(ctx, pr, row.account, is_agent)
+        changed = (row.weight, row.participating, row.is_agent) != (weight, participating, is_agent)
+        row.weight, row.participating, row.is_agent = weight, participating, is_agent
         row.eligibility = {"snapshot": snap, "not_participating_because": reasons}
         if changed:
             await ctx.events.append(db, "vote.rederived", "harness", {
                 "proposal": pr.hash, "account": row.account, "weight": weight, "participating": participating,
+                "is_agent": is_agent,
             }, ref=f"proposal:{pr.hash}")
         stale.append(row)
     return stale
+
+
+async def rederive_open(ctx: Context, db: AsyncSession) -> int:
+    """Worker: re-derive stale rows on open proposals, so the published open tally (which counts only
+    current rows) catches up within a pass of a rule change or a seat change (XE-1664). A transient node
+    error leaves the rest for the next pass."""
+    n = 0
+    for pr in (await db.execute(select(Proposal).where(Proposal.status == "open"))).scalars().all():
+        try:
+            n += len(await rederive_stale(ctx, db, pr))
+        except XeError as e:
+            log.warning("proposal %s: could not re-derive stale votes: %s", pr.hash[:12], e)
+            break
+    return n
 
 
 async def vote(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Vote:
@@ -253,13 +285,21 @@ def _share(parts: dict[str, int], total: int) -> dict[str, int]:
     return out
 
 
-def tally(pr: Proposal, votes: list[Vote]) -> dict:
+def tally(pr: Proposal, votes: list[Vote], ctx: Context | None = None) -> dict:
+    """The count. With `ctx`, only rows derived under the proposal's current snapshot and class are
+    counted and the rest are reported as `stale_rows`: a published figure never includes a weight the
+    proposal no longer means (XE-1664); the worker re-derives such rows and the close re-derives them
+    before it tallies, so at close there are none."""
     rules = pr.rules
     agents = rules.get("agents", {})
     cap = float(agents.get("max_weight_share", 0.01))
     human = {"for": 0, "against": 0, "abstain": 0}
     agent = {"for": 0, "against": 0, "abstain": 0}
     participating = 0
+    stale = 0
+    if ctx is not None:
+        counted = [v for v in votes if is_current(ctx, pr, v)]
+        stale, votes = len(votes) - len(counted), counted
     for v in votes:
         (agent if v.is_agent else human)[v.choice] += v.weight
         if v.participating:
@@ -280,7 +320,7 @@ def tally(pr: Proposal, votes: list[Vote]) -> dict:
     pass_mark = float(rules.get("pass_mark_fraction", 0.5))
     passed = quorum_met and decided > 0 and (counted["for"] / decided) > pass_mark
     return {
-        "votes": len(votes), "participating_wallets": participating, "quorum_wallets": quorum, "quorum_met": quorum_met,
+        "votes": len(votes), "stale_rows": stale, "participating_wallets": participating, "quorum_wallets": quorum, "quorum_met": quorum_met,
         "weight": counted, "weight_human": human, "weight_agent_raw": agent, "agent_scale": round(scale, 6),
         "for_share": (counted["for"] / decided) if decided else 0.0, "pass_mark": pass_mark,
         "outcome": ("passed" if passed else ("failed" if quorum_met else "no_quorum")),
@@ -311,16 +351,38 @@ async def close_due(ctx: Context, db: AsyncSession) -> list[Proposal]:
     return closed
 
 
-async def _decision_resolution(db: AsyncSession, pr: Proposal, res_id: str) -> Resolution:
-    """A resolution named by a decision must exist, have passed, and be about this proposal (XE-0201)."""
+async def _decision_resolution(db: AsyncSession, pr: Proposal, res_id: str, *, passed: bool = True) -> Resolution:
+    """A resolution named by a decision must exist and be about this proposal; for an adoption it must
+    also have passed (XE-0201). A referral names one that is open or passed (XE-1847)."""
     r = (await db.execute(select(Resolution).where(Resolution.id == res_id))).scalar_one_or_none()
     if r is None:
         raise HTTPException(400, "resolution_id names no resolution")
     if r.related_proposal != pr.hash:
         raise HTTPException(409, "that resolution is not about this proposal")
-    if r.status != "passed":
+    if passed and r.status != "passed":
         raise HTTPException(409, f"that resolution is {r.status}, not passed")
+    if not passed and r.status not in ("open", "passed"):
+        raise HTTPException(409, f"that resolution is {r.status}; a referral names one that is open or passed")
     return r
+
+
+def same_ops(a: list[dict] | None, b: list[dict] | None) -> bool:
+    """Whether two op lists write the same state: same actions and keys in order, and values that parse to
+    the same JSON. Values are stored as the exact bytes their author wrote (key order kept, because those
+    bytes go on the chain), so byte equality would refuse `{"a":1,"b":2}` against `{"b":2,"a":1}`, which
+    authorise the same thing (XE-1649, XE-1725)."""
+    if a is None or b is None or len(a) != len(b):
+        return False
+    for x, y in zip(a, b):
+        if (x.get("action"), x.get("key")) != (y.get("action"), y.get("key")):
+            return False
+        if x.get("action") == "set":
+            try:
+                if strict_loads(x["value"]) != strict_loads(y["value"]):
+                    return False
+            except (KeyError, ValueError):
+                return False
+    return True
 
 
 async def decide(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Proposal:
@@ -348,14 +410,18 @@ async def decide(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> P
         raise HTTPException(400, "reasons are required")
     res_id = clean_text(v.payload.get("resolution_id"), "resolution_id", max_len=64, required=False)
     outcome = (pr.result or {}).get("outcome")
-    resolution = await _decision_resolution(db, pr, res_id) if res_id else None
+    if decision == "refer_to_resolution" and not res_id:
+        # A referral to nothing would spend the proposal's one interim step on a record that names no
+        # resolution (XE-1847).
+        raise HTTPException(400, "refer_to_resolution names the resolution; give its resolution_id")
+    resolution = await _decision_resolution(db, pr, res_id, passed=decision != "refer_to_resolution") if res_id else None
     if decision == "adopt":
         if outcome != "passed":
             raise HTTPException(409, f"the vote {outcome or 'has no tally'}; a proposal is adopted only when it passed")
         if pr.ops:
             if resolution is None:
                 raise HTTPException(409, "a proposal with ops is adopted via a passed resolution; give its resolution_id")
-            if resolution.ops != pr.ops:
+            if not same_ops(resolution.ops, pr.ops):
                 raise HTTPException(409, "that resolution does not authorise exactly this proposal's ops")
     history = [*pr.decision.get("history", []), {k: x for k, x in pr.decision.items() if k != "history"}] if pr.decision else []
     pr.decision = {"decision": decision, "reasons": reasons, "by": v.seat.id, "timestamp": v.timestamp,
@@ -366,7 +432,11 @@ async def decide(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> P
 
 
 async def add_analysis(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Proposal:
+    """Analysis informs a decision, so it is written before one is final: a decided record is closed to
+    further analysis the same way it is closed to a second decision (XE-1770)."""
     bind(v, proposal=pr.hash)
+    if pr.status == "decided" and (pr.decision or {}).get("decision") in FINAL:
+        raise HTTPException(409, "a final decision is recorded for this proposal; its analysis is closed")
     text = clean_text(v.payload.get("text"), "text", max_len=MAX_BODY)
     entry = {"by": v.seat.id if v.seat else v.account, "timestamp": v.timestamp, "text": text}
     pr.analysis = [*pr.analysis, entry]
@@ -379,7 +449,7 @@ async def counts(db: AsyncSession) -> dict:
     return {s: int(c) for s, c in rows}
 
 
-def to_dict(pr: Proposal, votes: list[Vote] | None = None, include_body: bool = True) -> dict:
+def to_dict(pr: Proposal, votes: list[Vote] | None = None, include_body: bool = True, ctx: Context | None = None) -> dict:
     d = {
         "hash": pr.hash, "title": pr.title, "author": pr.author_account, "status": pr.status, "opened_at": pr.opened_at,
         "snapshot_at": snapshot_time(pr.opened_at), "closes_at": pr.closes_at, "fee_block_hash": pr.fee_block_hash,
@@ -389,7 +459,7 @@ def to_dict(pr: Proposal, votes: list[Vote] | None = None, include_body: bool = 
     if include_body:
         d["body"] = pr.body
     if votes is not None:
-        d["tally"] = tally(pr, votes)
+        d["tally"] = tally(pr, votes, ctx)
         d["votes"] = [{"account": v.account, "choice": v.choice, "weight": v.weight, "participating": v.participating,
                        "is_agent": v.is_agent, "timestamp": v.timestamp, "reason": v.reason} for v in votes]
     return d

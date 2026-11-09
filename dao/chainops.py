@@ -129,7 +129,11 @@ async def burn(ctx: Context, key_name: str, scope: str, amount: int, memo: str =
 # impossible in fact: the XE cannot be in the receiving wallet before it left the sending one. Counting it
 # would let one balance vote from two wallets (send dated late, receive dated early), as many times as there
 # are wallets. A receive only counts when its source send is also at or before the snapshot. Only receives
-# dated within two hours of the snapshot can be affected, so only those are looked up.
+# dated within two hours of the snapshot can be affected, so only those are looked up. The same holds for
+# every other block that brings the weight asset onto a chain from somewhere else: a lease settle mints XE
+# to the provider for a lease named in its `source`, and a settle dated before the snapshot for a lease
+# opened after it is the same impossibility as a receive before its send (XE-1789). `ARRIVALS` lists the
+# block types that are checked this way; each names its cause in `source`.
 #
 # Third, a snapshot costs a bounded number of node reads whatever the chain looks like (XE-1460): each
 # source send is looked up once, at most `CAUSAL_LOOKUP_CONCURRENCY` at a time, and after
@@ -148,12 +152,24 @@ CAUSAL_LOOKUP_CONCURRENCY = 8
 # Bumped whenever the figure this function derives for the same chain and `at` can change. A vote row
 # stores the result it was derived from; at close, rows derived under another `at` or rule are re-derived
 # before they are tallied (XE-1617).
-SNAPSHOT_RULE = 3
+SNAPSHOT_RULE = 4
+# Block types that raise the asset balance by bringing value from another block, which `source` names.
+ARRIVALS = ("receive", "lease_settle")
 
 
 def snapshot_time(opened_at_ns: int) -> int:
     """The time a proposal's weight is read at: an hour and a margin before it opened (see above)."""
     return opened_at_ns - SNAPSHOT_LEAD_NS
+
+
+def empty_snapshot(at_ns: int, unreadable: str = "") -> dict:
+    """The snapshot of an account the chain has nothing for: not there, or (with `unreadable` set) one whose
+    chain the harness cannot read on purpose, such as one past the page bound (XE-1706)."""
+    d = {"exists": False, "balance": 0, "first_block_ts": None, "snapshot_block": "", "excluded_receives": [],
+         "lookups_capped": False, "at": at_ns, "rule": SNAPSHOT_RULE}
+    if unreadable:
+        d["unreadable"] = unreadable
+    return d
 
 
 async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str = "XE") -> dict:
@@ -168,8 +184,7 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
     was hit. `at` and `rule` record what the figure was derived under, so a stored result can be told
     from one derived under a different rule (XE-1617).
     """
-    empty = {"exists": False, "balance": 0, "first_block_ts": None, "snapshot_block": "", "excluded_receives": [],
-             "lookups_capped": False, "at": at_ns, "rule": SNAPSHOT_RULE}
+    empty = empty_snapshot(at_ns)
     try:
         blocks = await chain.full_chain(account)
     except XeError as e:
@@ -187,7 +202,7 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
         if b.get("asset") != asset:
             continue
         new_bal = int(b.get("balance", 0))
-        if b.get("type") == "receive" and int(b.get("timestamp", 0)) > at_ns - CAUSAL_CHECK_NS:
+        if b.get("type") in ARRIVALS and int(b.get("timestamp", 0)) > at_ns - CAUSAL_CHECK_NS:
             window.append((max(new_bal - prev, 0), b.get("source") or ""))
         prev = new_bal
     by_amount: dict[str, int] = {}
@@ -206,7 +221,7 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
         if ts > at_ns:
             break
         ours = b.get("asset") == asset
-        if ours and b.get("type") == "receive" and ts > at_ns - CAUSAL_CHECK_NS and not causal.get(b.get("source") or "", False):
+        if ours and b.get("type") in ARRIVALS and ts > at_ns - CAUSAL_CHECK_NS and not causal.get(b.get("source") or "", False):
             excluded.append(b.get("hash", ""))
             new_bal = int(b.get("balance", 0))
             tainted += max(new_bal - bal, 0)
@@ -226,8 +241,9 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
 
 
 async def _sends_at_or_before(chain: XeClient, send_hashes: list[str], at_ns: int) -> dict[str, bool]:
-    """For each source send: True when it is on the chain and dated at or before `at_ns`. One read per
-    distinct hash, a bounded number in flight; a hash not in the result is not causal."""
+    """For each source block (a send, or the lease a settle pays out): True when it is on the chain and
+    dated at or before `at_ns`. One read per distinct hash, a bounded number in flight; a hash not in the
+    result is not causal."""
     gate = asyncio.Semaphore(CAUSAL_LOOKUP_CONCURRENCY)
 
     async def one(h: str) -> bool:

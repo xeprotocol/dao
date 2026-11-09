@@ -29,6 +29,7 @@ ACTION_BYTES = {ACTION_SET: 0x01, ACTION_DELETE: 0x02}
 MAX_KEY_LENGTH = 128
 MAX_VALUE_SIZE = 65536
 MAX_BLOCK_SIZE = 262144
+MAX_SIGNATURES = 16       # the most keys a DAO keyset may hold (dao.services.sessions.MAX_KEYSET)
 MIN_DAO_THRESHOLD = 2
 KEY_RE = re.compile(r"^[a-z0-9_.-]+$")
 ZERO_HASH = "0" * 64
@@ -44,15 +45,35 @@ def compact_json(value: Any) -> str:
     Go's encoder escapes `<`, `>`, `&` and the line separators U+2028 and U+2029 inside strings; the node
     re-marshals op values on gossip and sync, so a value that differs from this form hashes one way on the
     submitting node and another on every peer (XE-0465). This is the one form every op value takes."""
-    s = json.dumps(value, separators=(",", ":"), ensure_ascii=False, sort_keys=False)
+    try:
+        s = json.dumps(value, separators=(",", ":"), ensure_ascii=False, sort_keys=False, allow_nan=False)
+    except ValueError as e:   # NaN and the infinities: Python would write `Infinity`, Go's json.Valid refuses it (XE-1919)
+        raise StateChainError("value is not JSON: non-finite number") from e
     return (s.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
              .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
+def _non_finite(name: str) -> Any:
+    raise StateChainError(f"value is not JSON: {name}")
+
+
+def _finite_float(text: str) -> float:
+    f = float(text)
+    if f != f or f in (float("inf"), float("-inf")):
+        raise StateChainError(f"value is not JSON: {text} is not a finite number")
+    return f
+
+
+def strict_loads(text: str) -> Any:
+    """json.loads as Go reads it: `NaN`, `Infinity` and `-Infinity` are not JSON, and neither is a number
+    too large to be finite (`1e400`), which Python's parser would otherwise read as infinity (XE-1919)."""
+    return json.loads(text, parse_constant=_non_finite, parse_float=_finite_float)
 
 
 def canonical_value(raw: Any) -> str:
     """The compact text for an op value given either as JSON text or as a parsed object."""
     if isinstance(raw, str) and _looks_like_json(raw):
-        raw = json.loads(raw)
+        raw = strict_loads(raw)
     return compact_json(raw)
 
 
@@ -80,7 +101,7 @@ class StateOp:
     def to_json(self) -> dict[str, Any]:
         d: dict[str, Any] = {"action": self.action, "key": self.key}
         if self.action == ACTION_SET and self.value is not None:
-            d["value"] = json.loads(self.value)
+            d["value"] = strict_loads(self.value)
         return d
 
     def validate(self) -> None:
@@ -95,7 +116,7 @@ class StateOp:
             if len(raw) > MAX_VALUE_SIZE:
                 raise StateChainError("value too large")
             try:
-                parsed = json.loads(self.value)
+                parsed = strict_loads(self.value)
             except json.JSONDecodeError as e:
                 raise StateChainError("value is not valid JSON") from e
             if self.value != compact_json(parsed):
@@ -106,10 +127,23 @@ class StateOp:
 
 def _looks_like_json(s: str) -> bool:
     try:
-        json.loads(s)
+        strict_loads(s)
         return True
     except (json.JSONDecodeError, TypeError):
         return False
+
+
+def check_ops_fit(ops: list["StateOp"]) -> None:
+    """The node bounds the whole block (MaxBlockSize), not only each op. Ops that pass one by one can still
+    make a block no node accepts, and the harness only finds out at build time, after the vote and the
+    resolution (XE-1917). This asks the question at intake, on the largest block these ops could become:
+    the widest index and timestamp, a full set of signatures."""
+    for op in ops:
+        op.validate()
+    widest = StateBlock(index=2**63 - 1, prev_hash="f" * 64, ops=list(ops), timestamp=2**63 - 1,
+                        signatures=[{"public_key": "f" * 64, "signature": "f" * 128}] * MAX_SIGNATURES, hash="f" * 64)
+    if len(widest.to_wire().encode("utf-8")) > MAX_BLOCK_SIZE:
+        raise StateChainError(f"ops exceed MaxBlockSize ({MAX_BLOCK_SIZE} bytes) once in a block")
 
 
 @dataclass

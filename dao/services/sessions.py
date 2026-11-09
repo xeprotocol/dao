@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.client import XeError
 from xe.keys import KeyError_, is_valid_public_key, verify_hex_signature
-from xe.statechain import StateBlock, StateChainError, StateOp, build_block, validate_keyset
+from xe.statechain import StateBlock, StateChainError, StateOp, build_block, check_ops_fit, validate_keyset
 
 from ..auth import Verified
 from ..canonical import canonical_json, sha256_hex
@@ -38,11 +38,12 @@ MAX_KEYSET = 16
 MAX_OPS = 32
 
 
-def check_ops(kind: str, ops: list[dict]) -> None:
+def check_ops(kind: str, ops: list[dict], seat_keys: set[str] | None = None) -> None:
     """What a session of this kind may write. Every kind but `keyset` writes the harness's own `dao.*` keys.
     A `keyset` session is the one route to a `sys.*` key and it is exactly one op: set `sys.dao_keyset` to
-    a well-formed keyset. The same check runs when a resolution is proposed, so nothing can pass a vote and
-    then be refused at execution (XE-0349)."""
+    a well-formed keyset the seats can meet. The same check runs when a resolution is proposed and when a
+    proposal is submitted (`check_proposal_ops`), so nothing can pass a vote and then be refused at
+    execution (XE-0349, XE-1650)."""
     parsed = _ops_from_json(ops)
     for o in parsed:
         o.validate()
@@ -53,15 +54,33 @@ def check_ops(kind: str, ops: list[dict]) -> None:
         return
     if len(parsed) != 1 or parsed[0].action != "set" or parsed[0].key != KEYSET_KEY:
         raise HTTPException(400, f"a keyset session is exactly one op: set {KEYSET_KEY}")
-    _check_keyset(json.loads(parsed[0].value))
+    _check_keyset(json.loads(parsed[0].value), seat_keys)
 
 
-def _check_keyset(value) -> None:
+def check_proposal_ops(ops: list[dict], seat_keys: set[str] | None = None) -> None:
+    """A proposal names no session kind, so its ops must be ones *some* kind could authorise: all `dao.*`
+    keys (any kind but keyset), or exactly the one keyset op. Otherwise the vote is spent on ops no
+    resolution can carry and adoption refuses forever (XE-1650)."""
+    parsed = _ops_from_json(ops)
+    if any(o.key == KEYSET_KEY for o in parsed):
+        check_ops("keyset", ops, seat_keys)
+    else:
+        check_ops("parameter", ops, seat_keys)
+
+
+def seat_keys_of(config) -> set[str]:
+    """The public keys the DAO's human seats hold: the only keys a keyset may ask signatures from."""
+    return {s.public_key for s in config.human_seats if s.public_key}
+
+
+def _check_keyset(value, seat_keys: set[str] | None = None) -> None:
     """The node's rule for `sys.dao_keyset`, as the protocol mirror states it (`xe.statechain.validate_keyset`:
     distinct keys, threshold between MIN_DAO_THRESHOLD and the key count), plus what the harness asks on
     top: the shape, lowercase hex, at most MAX_KEYSET keys, and every key a usable ed25519 point. A key
     nobody can sign with, if the threshold needs it, would leave the chain with no valid signer (XE-0694).
-    The gate states no bound of its own, so it cannot be looser than the node on any of them (XE-1447)."""
+    The gate states no bound of its own, so it cannot be looser than the node on any of them (XE-1447).
+    When the seats' keys are given, at least `threshold` of the keyset's keys must be seat keys: a keyset
+    the seats cannot meet would end every later session, including the one to fix it (XE-1705)."""
     if not isinstance(value, dict) or set(value) != {"keys", "threshold"}:
         raise HTTPException(400, "keyset value must be {keys: [...], threshold: n}")
     keys, threshold = value["keys"], value["threshold"]
@@ -78,6 +97,11 @@ def _check_keyset(value) -> None:
     for k in keys:
         if not is_valid_public_key(bytes.fromhex(k)):
             raise HTTPException(400, f"{k[:12]}… is not a usable ed25519 public key")
+    if seat_keys is not None:
+        held = sum(1 for k in keys if k in seat_keys)
+        if held < threshold:
+            raise HTTPException(400, f"keyset needs {threshold} signatures but only {held} of its keys are held by a seat; "
+                                     "the seats could never meet it, nor change it back")
 
 
 def ops_digest(ops: list[dict]) -> str:
@@ -105,6 +129,10 @@ def normalise_ops(ops) -> list[dict]:
         if op.action == "set":
             d["value"] = op.value
         out.append(d)
+    try:
+        check_ops_fit(_ops_from_json(out))   # the node bounds the block, not only each op (XE-1917)
+    except StateChainError as e:
+        raise HTTPException(400, f"ops are malformed: {e}") from e
     return out
 
 
@@ -137,7 +165,7 @@ async def create(ctx: Context, db: AsyncSession, *, kind: str, title: str, ops: 
     if kind not in KINDS:
         raise HTTPException(400, f"unknown session kind {kind!r}")
     ops = normalise_ops(ops)
-    check_ops(kind, ops)
+    check_ops(kind, ops, seat_keys_of(ctx.config))
     ks = await live_keyset(ctx)
     s = SigningSession(id=secrets.token_hex(8), kind=kind, title=title, ops=ops, ops_digest=ops_digest(ops),
                        status="approving", approvals=[], required_approvals=ks["threshold"], block=None,
@@ -218,7 +246,13 @@ async def approve(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified
         if (s.not_before and now < s.not_before) or await pause.is_paused(db):
             # timelock or pause: stay in approving; the worker's timer job promotes it when clear
             return s
-        await rebuild(ctx, db, s, actor="harness")
+        try:
+            await rebuild(ctx, db, s, actor="harness")
+        except XeError as e:
+            # The approval is on the record; building the block needs the node and the node did not answer.
+            # The worker's timer pass builds it when the node is back (XE-1713).
+            await ctx.events.append(db, "session.build_deferred", "harness",
+                                    {"session_id": s.id, "error": str(e)[:300]}, ref=f"session:{s.id}")
     return s
 
 
@@ -347,41 +381,75 @@ async def _submitted(ctx: Context, db: AsyncSession, s: SigningSession) -> Signi
     return s
 
 
+TIP_MOVED = ("prev", "index", "tip", "stale", "not the next")
+KEYSET_MOVED = ("keyset", "signer", "signature")
+
+
+def ready_to_submit(s: SigningSession, ks: dict) -> bool:
+    """A signing session holding a threshold of signatures over its block: its submit is owed to the chain."""
+    return s.status == "signing" and bool(s.block) and len(s.block_signatures) >= int(ks["threshold"])
+
+
 async def submit(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSession:
+    """Submit the signed block. A node failure never escapes and never, on its own, ends the session: only
+    a refusal that is about the block, from a node that answered and whose chain does not hold the block,
+    sets `failed`. Everything else leaves the session `signing` with the error on record, and the worker
+    submits it again (XE-1511, XE-1677, XE-1689, XE-1817)."""
     require_timelock_run(s)
     await require_unpaused(db)
     blk = _block_from_session(s)
     try:
         await ctx.chain.submit_statechain_block(blk)
     except XeError as e:
-        # Before believing a refusal, ask the chain. If the block is there, it was accepted. If the chain
-        # cannot be read, the session stays `signing` with the error on record and the next pass asks again.
-        try:
-            if await landed(ctx, s):
-                return await _submitted(ctx, db, s)
-        except XeError as read_err:
-            s.error = f"submit: {e}; could not confirm against the chain: {read_err}"
-            await ctx.events.append(db, "session.submit_unconfirmed", "harness",
-                                    {"session_id": s.id, "error": s.error[:300]}, ref=f"session:{s.id}")
-            return s
-        msg = str(e).lower()
-        if any(w in msg for w in ("prev", "index", "tip", "stale", "not the next")):
-            await ctx.events.append(db, "session.tip_moved", "harness", {
-                "session_id": s.id, "error": str(e), "block_hash": s.block_hash,
-            }, ref=f"session:{s.id}")
-            await rebuild(ctx, db, s)
-            return s
-        s.status = "failed"
-        s.error = str(e)
-        await _ended(db, s)
-        await ctx.events.append(db, "session.failed", "harness", {"session_id": s.id, "error": str(e)}, ref=f"session:{s.id}")
-        return s
+        return await _refused(ctx, db, s, e)
     return await _submitted(ctx, db, s)
 
 
+async def _refused(ctx: Context, db: AsyncSession, s: SigningSession, e: XeError) -> SigningSession:
+    # Before believing a refusal, ask the chain. If the block is there, it was accepted.
+    try:
+        if await landed(ctx, s):
+            return await _submitted(ctx, db, s)
+    except XeError as read_err:
+        return await _deferred(ctx, db, s, f"submit: {e}; could not confirm against the chain: {read_err}")
+    if e.transient:
+        # 429, 5xx, no answer: the node said nothing about the block.
+        return await _deferred(ctx, db, s, f"submit: {e}")
+    msg = str(e).lower()
+    if any(w in msg for w in TIP_MOVED) or any(w in msg for w in KEYSET_MOVED):
+        # The chain moved under the block (its tip, or the keyset it is checked against): rebuild on what is
+        # live. A rotation that leaves the approvals short sends it back to approving (XE-0988).
+        kind = "session.tip_moved" if any(w in msg for w in TIP_MOVED) else "session.keyset_moved"
+        await ctx.events.append(db, kind, "harness", {"session_id": s.id, "error": str(e), "block_hash": s.block_hash},
+                                ref=f"session:{s.id}")
+        try:
+            await rebuild(ctx, db, s)
+        except XeError as build_err:
+            return await _deferred(ctx, db, s, f"submit: {e}; rebuild: {build_err}")
+        return s
+    s.status = "failed"
+    s.error = str(e)
+    await _ended(db, s)
+    await ctx.events.append(db, "session.failed", "harness", {"session_id": s.id, "error": str(e)}, ref=f"session:{s.id}")
+    return s
+
+
+async def _deferred(ctx: Context, db: AsyncSession, s: SigningSession, error: str) -> SigningSession:
+    s.error = error[:500]
+    await ctx.events.append(db, "session.submit_deferred", "harness", {"session_id": s.id, "error": error[:300]},
+                            ref=f"session:{s.id}")
+    return s
+
+
 async def cancel(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified, reason: str) -> SigningSession:
+    """A member ends a session. One that holds a block is first checked against the chain: a block that
+    landed is recorded as submitted, not cancelled, whatever the node said at the time (XE-1843, as for
+    rebuild and submit). If the chain cannot be read the cancel waits (502). The answer carries the
+    session as it now stands."""
     if s.status in ("submitted", "cancelled"):
         raise HTTPException(409, f"session is {s.status}")
+    if s.status == "signing" and await landed(ctx, s):
+        return await _submitted(ctx, db, s)
     s.status = "cancelled"
     s.error = reason
     await _ended(db, s)

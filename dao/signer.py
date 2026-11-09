@@ -59,12 +59,16 @@ def encrypt_keyfile(contents: dict, passphrase: str) -> dict:
 
 
 def decrypt_keyfile(blob: dict, passphrase: str) -> dict:
-    box = secret.SecretBox(_kdf(passphrase, bytes.fromhex(blob["salt"])))
+    """Every way the file can fail to open is a SignerError, which the startup path turns into a clean
+    abort: a missing field, bad hex, a wrong passphrase, or plaintext that is not JSON (XE-1779)."""
     try:
+        box = secret.SecretBox(_kdf(passphrase, bytes.fromhex(blob["salt"])))
         pt = box.decrypt(bytes.fromhex(blob["ciphertext"]))
-    except Exception as e:  # nacl.exceptions.CryptoError
-        raise SignerError("keyfile passphrase is wrong or the file is corrupt") from e
-    return json.loads(pt.decode("utf-8"))
+        return json.loads(pt.decode("utf-8"))
+    except SignerError:
+        raise
+    except Exception as e:  # nacl CryptoError, KeyError, ValueError (hex, JSON, UTF-8), TypeError
+        raise SignerError(f"keyfile passphrase is wrong or the file is corrupt ({type(e).__name__})") from e
 
 
 class Signer:
@@ -80,10 +84,17 @@ class Signer:
             raise SignerError(f"signer keyfile not found at {path}; run `dao keys init`")
         if not passphrase:
             raise SignerError("DAO_SIGNER_PASSPHRASE is empty")
-        blob = json.loads(path.read_text(encoding="utf-8"))
-        contents = decrypt_keyfile(blob, passphrase)
-        keys = {name: KeyPair.from_seed_hex(seed) for name, seed in contents["keys"].items()}
-        scopes = {name: set(s) for name, s in contents.get("scopes", {}).items()}
+        try:
+            blob = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(blob, dict):
+                raise SignerError("keyfile is not a JSON object")
+            contents = decrypt_keyfile(blob, passphrase)
+            keys = {name: KeyPair.from_seed_hex(seed) for name, seed in contents["keys"].items()}
+            scopes = {name: set(s) for name, s in contents.get("scopes", {}).items()}
+        except SignerError:
+            raise
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+            raise SignerError(f"keyfile at {path} is corrupt ({type(e).__name__})") from e
         for name in keys:
             scopes.setdefault(name, set(SCOPES.get(name, AGENT_SCOPES if name.startswith("agent:") else set())))
         return cls(keys, scopes)

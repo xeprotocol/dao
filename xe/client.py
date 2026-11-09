@@ -26,11 +26,22 @@ def _seg(value: Any) -> str:
     return quote(str(value), safe="")
 
 
+UNREACHABLE = 0   # XeError.status when the node gave no answer at all (connection, timeout, bad body)
+
+
 class XeError(RuntimeError):
+    """Every way a node call can fail: a status >= 400, no connection, a timeout, a body that is not JSON.
+    Callers catch this one type; nothing from httpx or json escapes the client (XE-1689, XE-1774).
+    `transient` says whether asking again later could succeed."""
+
     def __init__(self, status: int, message: str):
-        super().__init__(f"node returned {status}: {message}")
+        super().__init__(f"node returned {status}: {message}" if status else f"node unreachable: {message}")
         self.status = status
         self.message = message
+
+    @property
+    def transient(self) -> bool:
+        return self.status in (UNREACHABLE, 408, 425, 429) or self.status >= 500
 
 
 class XeClient:
@@ -45,16 +56,20 @@ class XeClient:
     # ---- plumbing -------------------------------------------------------------------------
 
     async def _get(self, path: str, **params: Any) -> Any:
-        r = await self._client.get(path, params={k: v for k, v in params.items() if v is not None})
-        return self._unwrap(r)
+        return self._unwrap(await self._send("GET", path, params={k: v for k, v in params.items() if v is not None}))
 
     async def _post_json(self, path: str, body: Any) -> Any:
-        r = await self._client.post(path, json=body)
-        return self._unwrap(r)
+        return self._unwrap(await self._send("POST", path, json=body))
 
     async def _post_raw(self, path: str, body: str) -> Any:
-        r = await self._client.post(path, content=body.encode("utf-8"), headers={"Content-Type": "application/json"})
-        return self._unwrap(r)
+        return self._unwrap(await self._send("POST", path, content=body.encode("utf-8"),
+                                             headers={"Content-Type": "application/json"}))
+
+    async def _send(self, method: str, path: str, **kw: Any) -> httpx.Response:
+        try:
+            return await self._client.request(method, path, **kw)
+        except httpx.HTTPError as e:   # connect, read, write, pool timeouts and transport failures
+            raise XeError(UNREACHABLE, f"{type(e).__name__}: {e}") from e
 
     @staticmethod
     def _unwrap(r: httpx.Response) -> Any:
@@ -66,7 +81,10 @@ class XeClient:
             raise XeError(r.status_code, msg)
         if not r.content:
             return None
-        return r.json()
+        try:
+            return r.json()
+        except ValueError as e:
+            raise XeError(UNREACHABLE, f"response is not JSON: {str(e)[:100]}") from e
 
     # ---- node -----------------------------------------------------------------------------
 
@@ -80,7 +98,7 @@ class XeClient:
         return await self._get("/health")
 
     async def ready(self) -> tuple[bool, Any]:
-        r = await self._client.get("/ready")
+        r = await self._send("GET", "/ready")
         try:
             body = r.json()
         except Exception:
@@ -224,17 +242,20 @@ class XeClient:
 
     async def chat_events(self, proof: dict[str, str]) -> AsyncIterator[dict]:
         """Yield chat envelopes from the SSE stream for one account. Caller handles reconnects."""
-        async with self._client.stream("GET", "/chat/events", params=proof, timeout=None) as r:
-            if r.status_code >= 400:
-                body = await r.aread()
-                raise XeError(r.status_code, body.decode("utf-8", "replace"))
-            async for line in r.aiter_lines():
-                if not line or line.startswith(":"):
-                    continue
-                if line.startswith("data:"):
-                    payload = line[5:].strip()
-                    if payload:
-                        try:
-                            yield json.loads(payload)
-                        except json.JSONDecodeError:
-                            continue
+        try:
+            async with self._client.stream("GET", "/chat/events", params=proof, timeout=None) as r:
+                if r.status_code >= 400:
+                    body = await r.aread()
+                    raise XeError(r.status_code, body.decode("utf-8", "replace"))
+                async for line in r.aiter_lines():
+                    if not line or line.startswith(":"):
+                        continue
+                    if line.startswith("data:"):
+                        payload = line[5:].strip()
+                        if payload:
+                            try:
+                                yield json.loads(payload)
+                            except json.JSONDecodeError:
+                                continue
+        except httpx.HTTPError as e:
+            raise XeError(UNREACHABLE, f"{type(e).__name__}: {e}") from e
