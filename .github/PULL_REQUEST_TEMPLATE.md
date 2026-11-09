@@ -2,7 +2,7 @@
 
 ## Bounty fix
 
-Engineering ticket: core#NNNN. Reports: `fixes xe#NN`, XE-NNNN (the desk moves them on open and merge).
+Engineering ticket: core#NNNN (the desk moves its reports to `patched` when it closes). Reports: `fixes #NN` for an issue in this repo (the desk moves it on open and merge); XE-NNNN or `xe#NN` for the record only, the ticket moves those.
 
 **The rule this enforces.** One sentence, copied from the engineering ticket or corrected here.
 

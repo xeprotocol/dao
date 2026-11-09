@@ -11,7 +11,7 @@ Bug reports reach this code through the XE bounty desk (`https://bounty.xe.netwo
 5. **Before `patched`, a sibling sweep:** someone who did not write the fix, usually the triage agent on the desk, takes the rule and the list and reads the tree for what the fix missed. Findings go in an internal note on the desk ticket or into the engineering ticket, never into a public issue.
 6. **One engineering ticket per class.** A sibling report is tagged onto the existing ticket (its desk id or `xe#n` in the title or body; the desk links it on the next poll and keeps the link if the text is later edited), and the ticket stays open until the class is closed.
 
-Write `fixes xe#n` (or the desk id) in the pull request description; the desk moves the report to `fixing` when the PR opens and `patched` when it merges. The report's body may be private: never paste it, its attachments or its reporter's details into a commit, a PR or a public issue.
+Two things move a report, and nothing else. The engineering ticket in `core`: the reports it names go to `accepted` while it is open and `patched` when it is closed as completed. And, in `xe`, `dao` and `sdk` only, a pull request that says `fixes #n` of an issue in the same repo: `fixing` when a maintainer's PR opens, `patched` when it merges. A `core` PR says `Closes #<ticket>`; the merge closes the ticket and the ticket moves the reports. `fixes xe#n` in a `core` PR does nothing: the desk reads `core` issues, not `core` PRs. The report's body may be private: never paste it, its attachments or its reporter's details into a commit, a PR or a public issue.
 
 ## Reading a report
 
