@@ -39,7 +39,7 @@ $("#offline").addEventListener("click", async () => {
     const t = await XeSigner.offlineTarget(DOMAIN, payload());
     $("#offline_out").hidden = false;
     $("#offline_out").textContent = "Sign this digest (hex) with your key and POST /v1/proposals with the same payload, timestamp and your pub_key:\n\n" +
-      "digest:    " + t.digest + "\ntimestamp: " + t.ts + "\ncanonical: " + t.canonical + "\n\nCLI: dao sign --seed <hex> --digest " + t.digest;
+      "digest:    " + t.digest + "\ntimestamp: " + t.ts + "\ncanonical: " + t.canonical + "\n\nCLI (asks for the seed): dao sign --digest " + t.digest;
   } catch (err) { say("#pmsg", err.message, false); }
 });
 </script>

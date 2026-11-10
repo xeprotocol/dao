@@ -12,8 +12,11 @@ import typer
 
 from xe.keys import KeyPair, derive_address
 
-app = typer.Typer(help="XE DAO harness tools", no_args_is_help=True)
-keys_app = typer.Typer(help="Company key file (harness, dao, fee, agent:<id>)", no_args_is_help=True)
+# A command that fails prints its error, not its local variables: several of these hold a seed or a
+# passphrase while they run, and typer's default traceback writes every local to the terminal (XE-2213).
+app = typer.Typer(help="XE DAO harness tools", no_args_is_help=True, pretty_exceptions_show_locals=False)
+keys_app = typer.Typer(help="Company key file (harness, dao, fee, agent:<id>)", no_args_is_help=True,
+                       pretty_exceptions_show_locals=False)
 app.add_typer(keys_app, name="keys")
 
 
@@ -22,18 +25,31 @@ def _settings():
     return get_settings()
 
 
-def _passphrase(explicit: str | None) -> str:
-    return explicit or os.environ.get("DAO_SIGNER_PASSPHRASE") or getpass.getpass("signer passphrase: ")
+def _secret(env: str, prompt: str) -> str:
+    """A secret reaches this program through the environment or a prompt that does not echo, and no other
+    way. No command takes one as an option: a command line can be read by every local user for as long as
+    the process runs (`ps`, /proc/<pid>/cmdline) and is kept in shell history (XE-2213). This is the only
+    function that reads one, so a new command cannot grow its own."""
+    return os.environ.get(env) or getpass.getpass(prompt)
+
+
+def _passphrase() -> str:
+    return _secret("DAO_SIGNER_PASSPHRASE", "signer passphrase: ")
+
+
+def _seat_key() -> KeyPair:
+    return KeyPair.from_seed_hex(_secret("XE_SEED", "seed hex: "))
 
 
 # ---- keys -------------------------------------------------------------------------------------
 
 @keys_app.command("init")
-def keys_init(path: Path = typer.Option(None, help="defaults to DAO_SIGNER_KEYFILE"), passphrase: str = typer.Option(None)):
-    """Create the encrypted keyfile with harness, dao and fee keys. Prints addresses to publish."""
+def keys_init(path: Path = typer.Option(None, help="defaults to DAO_SIGNER_KEYFILE")):
+    """Create the encrypted keyfile with harness, dao and fee keys. Prints addresses to publish.
+    The passphrase is read from DAO_SIGNER_PASSPHRASE, or asked for."""
     from .signer import Signer
     p = path or _settings().signer_keyfile
-    infos = Signer.init_keyfile(p, _passphrase(passphrase))
+    infos = Signer.init_keyfile(p, _passphrase())
     typer.echo(f"wrote {p}")
     for i in infos.values():
         typer.echo(f"  {i.name:10} pub {i.public_key}  account {i.address}  scopes {','.join(i.scopes)}")
@@ -42,20 +58,20 @@ def keys_init(path: Path = typer.Option(None, help="defaults to DAO_SIGNER_KEYFI
 
 
 @keys_app.command("add")
-def keys_add(name: str, path: Path = typer.Option(None), passphrase: str = typer.Option(None)):
+def keys_add(name: str, path: Path = typer.Option(None)):
     """Add a key (e.g. agent:research) to the keyfile."""
     from .signer import Signer
     p = path or _settings().signer_keyfile
-    i = Signer.add_key(p, _passphrase(passphrase), name)
+    i = Signer.add_key(p, _passphrase(), name)
     typer.echo(f"{i.name} pub {i.public_key} account {i.address} scopes {','.join(i.scopes)}")
 
 
 @keys_app.command("show")
-def keys_show(path: Path = typer.Option(None), passphrase: str = typer.Option(None)):
+def keys_show(path: Path = typer.Option(None)):
     """List keys, public keys, accounts and scopes. Never prints seeds."""
     from .signer import Signer
     p = path or _settings().signer_keyfile
-    s = Signer.load(p, _passphrase(passphrase))
+    s = Signer.load(p, _passphrase())
     for i in s.infos():
         typer.echo(f"{i.name:12} pub {i.public_key}  account {i.address}  scopes {','.join(i.scopes)}")
 
@@ -73,25 +89,22 @@ def new_seat_key():
 # ---- offline signing ------------------------------------------------------------------------
 
 @app.command("sign")
-def sign(digest: str = typer.Option(..., help="32-byte hex digest shown by the web form"),
-         seed: str = typer.Option(None, help="64-hex seed; or set XE_SEED")):
-    """Sign a digest offline with a personal key (for browsers without Ed25519 WebCrypto)."""
-    s = seed or os.environ.get("XE_SEED") or getpass.getpass("seed hex: ")
-    kp = KeyPair.from_seed_hex(s)
+def sign(digest: str = typer.Option(..., help="32-byte hex digest shown by the web form")):
+    """Sign a digest offline with a personal key (for browsers without Ed25519 WebCrypto).
+    The seed is read from XE_SEED, or asked for."""
+    kp = _seat_key()
     typer.echo(json.dumps({"pub_key": kp.pub_key_hex, "signature": kp.sign_hex(bytes.fromhex(digest))}))
 
 
 @app.command("sign-request")
 def sign_request(domain: str = typer.Argument(..., help="e.g. xe-dao/vote/v1"),
                  payload: str = typer.Argument(..., help="JSON payload"),
-                 seed: str = typer.Option(None, help="64-hex seed; or set XE_SEED"),
                  pow_difficulty: str = typer.Option(None, "--pow", help="hex difficulty from GET /v1/inbox; adds pow_nonce")):
-    """Produce a complete SignedRequest body for curl."""
+    """Produce a complete SignedRequest body for curl. The seed is read from XE_SEED, or asked for."""
     import time
     from .auth import compute_http_pow
     from .canonical import digest as _digest
-    s = seed or os.environ.get("XE_SEED") or getpass.getpass("seed hex: ")
-    kp = KeyPair.from_seed_hex(s)
+    kp = _seat_key()
     p = json.loads(payload)
     ts = time.time_ns()
     d = _digest(domain.encode() + b"\x00", {"payload": p, "timestamp": ts})

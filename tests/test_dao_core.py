@@ -1455,6 +1455,43 @@ async def test_the_snapshot_preview_answers_what_the_vote_would(monkeypatch):
         assert e.value.status_code == 400
 
 
+# ---- XE-2213: no command takes a secret on its command line -------------------------------------------------
+
+def test_no_command_takes_a_secret_as_an_argument():
+    import re
+
+    import typer
+    from typer.testing import CliRunner
+
+    from dao import cli
+    secretish = re.compile(r"seed|pass|secret|priv|mnemonic", re.I)
+    seen = []
+
+    def walk(cmd, path):
+        for name, sub in getattr(cmd, "commands", {}).items():
+            walk(sub, path + [name])
+        for p in cmd.params:
+            seen.append((" ".join(path), p.name))
+            assert not secretish.search(p.name) and not any(secretish.search(o) for o in p.opts), (path, p.name, p.opts)
+    walk(typer.main.get_command(cli.app), [])
+    assert ("sign", "digest") in seen and ("keys init", "path") in seen, "the walk reached the commands"
+    src = (ROOT / "dao" / "cli.py").read_text()
+    assert src.count("getpass.getpass(") == 1 and src.count("os.environ") == 1, "one function reads a secret"
+    # and the commands still work, from the environment
+    kp = KeyPair.generate()
+    runner = CliRunner()
+    digest_hex = "ab" * 32
+    r = runner.invoke(cli.app, ["sign", "--digest", digest_hex], env={"XE_SEED": kp.seed.hex()})
+    assert r.exit_code == 0, r.output
+    out = json.loads(r.output)
+    assert out["pub_key"] == kp.pub_key_hex and out["signature"] == kp.sign_hex(bytes.fromhex(digest_hex))
+    assert kp.seed.hex() not in r.output
+    for argv in (["sign", "--digest", digest_hex, "--seed", kp.seed.hex()], ["keys", "show", "--passphrase", "x"],
+                 ["sign-request", "xe-dao/vote/v1", "{}", "--seed", kp.seed.hex()]):
+        r = runner.invoke(cli.app, argv)
+        assert r.exit_code == 2, (argv, r.output)
+
+
 async def test_a_block_signature_from_a_key_no_longer_in_the_keyset_is_counted_nowhere(monkeypatch):
     """XE-2713: whether a block has its signatures is one count, of signatures from keys in the keyset
     now, asked by every site that sends a block to the chain or decides why the chain refused it."""
