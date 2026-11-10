@@ -1270,6 +1270,63 @@ async def test_the_chain_walk_and_the_tip_do_not_take_the_nodes_total_on_trust()
     await c.aclose()
 
 
+async def test_a_built_block_is_given_up_only_when_another_final_block_stands_on_its_parent():
+    """XE-2043: `placed` reads the block's parent and what follows it, in one page. It says `lost` only for
+    a final block standing where this one was built to stand, and concludes nothing from a chain that does
+    not hold the parent there: a node one block behind shows a final tip that is not the parent too."""
+    from dao import chainops
+    from xe.client import XeError
+
+    class Node:
+        def __init__(self, blocks):
+            self.blocks = blocks
+
+        async def chain(self, account, offset=0, limit=1000):
+            if self.blocks is None:
+                raise XeError(404, "account not found")
+            return {"blocks": self.blocks[offset:offset + limit], "total": len(self.blocks)}
+
+    def b(h, final=True):
+        return {"hash": h, "finalized": final}
+    p0, p1 = b("p0"), b("p1")
+    ours = {"account": "a" * 64, "hash": "ours", "previous": "p1", "at": 2}
+    first = {"account": "a" * 64, "hash": "ours", "previous": "0", "at": 0}   # built to open the account
+    for block, below in ((ours, [p0, p1]), (first, [])):
+        for after, want in (([], "open"), ([b("ours")], "landed"), ([b("ours", False)], "pending"),
+                            ([b("x", False)], "pending"), ([b("x")], "lost"), ([b("x"), b("y")], "lost"),
+                            ([b("ours"), b("y", False)], "landed")):
+            assert await chainops.placed(Node(below + after), block) == want, (block["at"], after)
+    assert await chainops.placed(Node(None), first) == "open", "an account the node has no chain for"
+    # the parent is not where the block was built on it: behind, unknown, or another chain altogether
+    for served in ([p0], [], None, [p0, b("q")], [p0, b("q"), b("x")], [b("p1"), b("p0"), b("x")]):
+        with pytest.raises(XeError) as e:
+            await chainops.placed(Node(served), ours)
+        assert e.value.status == 0 and "nothing is concluded" in e.value.message, served
+
+
+async def test_nothing_is_signed_for_a_network_the_node_has_not_named():
+    """A process that came up while the node was down has no network id. A block signed for "" is one no
+    node takes, and a stored settlement signed that way would be offered for ever: the node is asked
+    again, and nothing is signed until it answers."""
+    from dao import chainops
+    from xe.client import XeError
+    from xe.encoding import Block
+    kp = KeyPair.generate()
+    answers = iter(["", "xe-test"])
+
+    async def refresh_node():
+        ctx.node.network_id = next(answers)
+    ctx = SimpleNamespace(node=SimpleNamespace(network_id="", pow_difficulty=0), refresh_node=refresh_node)
+
+    def receive():
+        return Block(type="receive", account=kp.address, previous="0", balance=1, timestamp=1, asset="XE", source="1" * 64)
+    with pytest.raises(XeError) as e:
+        await chainops.signed(ctx, receive(), kp)
+    assert e.value.transient
+    done = await chainops.signed(ctx, receive(), kp)
+    assert done.hash and done.signature and ctx.node.network_id == "xe-test"
+
+
 def test_an_envelope_from_a_node_is_an_envelope_or_a_chaterror():
     from xe.chat import MAX_MESSAGE_BYTES, ChatError, Envelope, new_envelope, verify_envelope
     kp = KeyPair.generate()

@@ -46,6 +46,23 @@ async def serialize(db: AsyncSession, name: str) -> None:
     await db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:name))"), {"name": name})
 
 
+@asynccontextmanager
+async def only_one(db: AsyncSession, name: str) -> AsyncIterator[bool]:
+    """True inside the block if no other process on this database is inside it under the same `name`; False
+    if one is, without waiting. For a job that must not run twice at once and commits as it goes, where the
+    transaction-scoped lock above would be let go at the first commit. The lock belongs to a connection
+    taken for the purpose and is released by closing that connection, which a dying process also does:
+    there is no unlock to miss."""
+    conn = await db.bind.connect()
+    try:
+        got = (await conn.execute(text("SELECT pg_try_advisory_lock(hashtext(:name))"), {"name": name})).scalar()
+        await conn.commit()
+        yield bool(got)
+    finally:
+        await conn.invalidate()
+        await conn.close()
+
+
 async def get_db() -> AsyncIterator[AsyncSession]:
     async with sessionmaker()() as s:
         yield s

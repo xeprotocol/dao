@@ -20,7 +20,7 @@ from xe.directory import new_registration
 
 from .auth import purge_seen_signatures
 from .context import Context, build_context, set_context
-from .db import session
+from .db import only_one, session
 from .log import EventLog
 from .models import SigningSession
 from .services import fees, inbox, pause, portal, records, resolutions, sessions
@@ -83,14 +83,14 @@ class Worker:
             return None
 
     async def job_fees(self):
-        async with session() as db:
-            if await pause.is_paused(db):
+        # One fee pass at a time, in this process or any other: a settlement is one block because one pass
+        # builds it, and two passes over one row would each build their own.
+        async with session() as db, only_one(db, "worker:fees") as alone:
+            if not alone or await pause.is_paused(db):
                 return
-            try:
-                await fees.receive_all(self.ctx, db)
-                await fees.settle_due(self.ctx, db)
-            except Exception as e:
-                log.warning("fees: %s", e)
+            await self._step(db, "fees: receive", lambda: fees.receive_all(self.ctx, db))
+            await self._step(db, "fees: record receives", lambda: fees.record_receives(self.ctx, db))
+            await self._step(db, "fees: settle", lambda: fees.settle_due(self.ctx, db))
             await mark_run(db, "fees")
             await db.commit()
 
@@ -171,10 +171,13 @@ class Worker:
                     if not s.block_signatures and stale:
                         await sessions.rebuild(self.ctx, db, s)
                     elif s.block_signatures and stale:
-                        # partial signatures over a stale block cannot be submitted; reset and say so
-                        await self.ctx.events.append(db, "session.tip_moved", "harness", {
-                            "session_id": s.id, "block_hash": s.block_hash, "had_signatures": len(s.block_signatures),
-                        }, ref=f"session:{s.id}")
+                        # partial signatures over a stale block cannot be submitted; reset and say so. Unless
+                        # the tip moved because this block is the tip (its submit was deferred and it has
+                        # landed since): nothing moved under the session, and `rebuild` records it submitted.
+                        if not await sessions.landed(self.ctx, s):
+                            await self.ctx.events.append(db, "session.tip_moved", "harness", {
+                                "session_id": s.id, "block_hash": s.block_hash, "had_signatures": len(s.block_signatures),
+                            }, ref=f"session:{s.id}")
                         await sessions.rebuild(self.ctx, db, s)
                     else:
                         ks = ks or await sessions.live_keyset(self.ctx)

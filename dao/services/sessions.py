@@ -29,6 +29,7 @@ from xe.statechain import StateBlock, StateChainError, StateOp, build_block, che
 from ..auth import Verified
 from ..canonical import canonical_json, sha256_hex
 from ..context import Context
+from ..log import EventLog
 from ..models import Anchor, SigningSession
 from . import pause
 
@@ -410,10 +411,13 @@ def ready_to_submit(s: SigningSession, ks: dict) -> bool:
 
 
 async def submit(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSession:
-    """Submit the signed block. A node failure never escapes and never, on its own, ends the session: only
-    a refusal that is about the block, from a node that answered and whose chain does not hold the block,
+    """Submit the signed block. What happened to it is what the chain says, never what the node answered:
+    the session is `submitted` when the chain holds the block at its index, whether the node said yes
+    (a 200 from a node that then drops the block is not a write, XE-2361) or no (a refusal after the block
+    was applied, XE-1511). A node failure never escapes and never, on its own, ends the session: only a
+    refusal from a node that answered, on a chain that neither holds the block nor has moved under it,
     sets `failed`. Everything else leaves the session `signing` with the error on record, and the worker
-    submits it again (XE-1511, XE-1677, XE-1689, XE-1817)."""
+    submits it again (XE-1677, XE-1689, XE-1817)."""
     require_timelock_run(s)
     await require_unpaused(db)
     blk = _block_from_session(s)
@@ -421,7 +425,24 @@ async def submit(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSe
         await ctx.chain.submit_statechain_block(blk)
     except XeError as e:
         return await _refused(ctx, db, s, e)
-    return await _submitted(ctx, db, s)
+    try:
+        if await landed(ctx, s):
+            return await _submitted(ctx, db, s)
+    except XeError as read_err:
+        return await _deferred(ctx, db, s, f"submit accepted; could not confirm against the chain: {read_err}")
+    return await _deferred(ctx, db, s, "submit accepted, but the chain does not hold the block at its index yet")
+
+
+async def _moved_under(ctx: Context, s: SigningSession) -> str | None:
+    """Whether the chain has moved under the session's block, asked of the chain: the tip is no longer the
+    block's `prev_hash`, or the signatures the block carries no longer meet the live keyset. These are the
+    two ways a block that was right when it was signed stops being acceptable, and both are facts the node
+    serves; the wording of a refusal is not one (XE-2216). Raises if the chain cannot be read."""
+    if await is_stale(ctx, s):
+        return "session.tip_moved"
+    if not signatures_met(s, await live_keyset(ctx)):
+        return "session.keyset_moved"
+    return None
 
 
 async def _refused(ctx: Context, db: AsyncSession, s: SigningSession, e: XeError) -> SigningSession:
@@ -454,9 +475,13 @@ async def _refused(ctx: Context, db: AsyncSession, s: SigningSession, e: XeError
 
 
 async def _deferred(ctx: Context, db: AsyncSession, s: SigningSession, error: str) -> SigningSession:
+    """The submit is still owed and the worker will try it again. The row carries the latest reason; the log
+    says so once per spell, not on every pass, as `resolutions._owed` does for a session not yet opened."""
     s.error = error[:500]
-    await ctx.events.append(db, "session.submit_deferred", "harness", {"session_id": s.id, "error": error[:300]},
-                            ref=f"session:{s.id}")
+    last = await EventLog.page(db, limit=1, ref=f"session:{s.id}", public_only=False)
+    if not last or last[0].kind != "session.submit_deferred":
+        await ctx.events.append(db, "session.submit_deferred", "harness", {"session_id": s.id, "error": error[:300]},
+                                ref=f"session:{s.id}")
     return s
 
 

@@ -1,28 +1,41 @@
 """Fee handling: receive into the fee account, then refund or burn per the pinned rules.
 
-Every chain write here is made exactly once, whatever the worker does around it (XE-0486, XE-0488):
+The chain is the ground truth; the ledger is a record of it, never ahead of it and never guessing. Nothing
+is recorded from what the node answers to a submit, only from a block read back from the chain, final.
 
-- a receive is recorded and committed the moment the node has it, before the next one is attempted;
-- a settlement is marked `settling` with a nonce and committed *before* the send or burn goes out, and the
-  nonce rides in the memo; the block hash is committed straight after;
-- on every pass, a row still `settling` is reconciled against the fee account's own chain: a block carrying
-  its nonce means the payment landed and the record is completed; no block means it never went out and the
-  row goes back to due. A row with no receive on record is reconciled the same way, by looking for a receive
-  whose source is the fee send, before it is given up on.
+A settlement (a refund, a burn, or the return of what was paid above the fee) is one block:
 
-The chain is the ground truth; the ledger is a record of it, never ahead of it.
+- it is built once, signed, and committed to the row (`tx_hashes["settle_block"]`) before it is offered;
+- every pass asks the chain what stands where that block was built to stand (`chainops.placed`). The block,
+  final: the row is recorded settled, with its hash. Nothing: the same block is offered again. Another
+  block, final: this one can never land, so it is dropped and a new one is built. Anything else: wait.
+
+An account chain is a line, so the one block can land at most once, and a row can only be paid twice if
+two blocks are built for it; the second is built only when the first provably cannot land. That replaces
+the memo nonce and its search of the chain, which read "no block with this nonce yet" as "never sent",
+forgot the nonce and paid again (XE-2043), and which recorded a settlement on the node's answer to the
+submit without asking the chain at all (XE-2380). The first rule here was XE-0486/XE-0488: every chain
+write is made exactly once, whatever the worker does around it. One pass runs at a time (the worker holds
+`db.only_one` for the job), so a row has one block because one process builds it.
+
+A block the node keeps refusing is offered for as long as nothing else stands in its place, with the reason
+on the row. It is replaced when the fee account's chain next moves, which the next fee received does.
+
+A receive is offered for every send pending to the fee account, and recorded for a fee the ledger knows
+when the fee account's chain holds a final receive whose source is that fee's send. A fee whose receive is
+not on the chain is not settled: there is nothing of the payer's to pay out.
 """
 
 from __future__ import annotations
 
 import logging
-import secrets
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import chainops
 from ..context import Context
+from ..log import EventLog
 from ..models import FeeLedger, Proposal
 from ..signer import SignerError
 from . import pause
@@ -31,35 +44,41 @@ log = logging.getLogger("dao.fees")
 
 DUE = ("due_refund", "due_burn")
 UNRECEIVED_ERROR = "fee send was never received into the fee account; nothing to settle"
+ARRIVING_NOTE = "the fee's receive is not final on the fee account's chain yet; settlement waits for it"
 
 
 async def receive_all(ctx: Context, db: AsyncSession) -> int:
-    """Pull any pending sends into the fee account (fees land as pending sends until received)."""
+    """Offer a receive for every send pending to the fee account (fees arrive as pending sends). Returns
+    how many the node took; `record_receives` is what puts a receive on record."""
     if not ctx.signer.has("fee"):
         return 0
-
-    async def record(b, amount: int):
-        await ctx.events.append(db, "fee.received", "harness", {
-            "block": b.hash, "source": b.source, "amount": amount, "asset": b.asset,
-        }, ref=f"fee:{b.source}", public=True)
-        row = (await db.execute(select(FeeLedger).where(FeeLedger.fee_block_hash == b.source))).scalar_one_or_none()
-        if row:
-            row.tx_hashes = {**(row.tx_hashes or {}), "receive": b.hash}
-        await db.commit()
-
     try:
-        made = await chainops.receive_pending(ctx, "fee", on_made=record)
+        return await chainops.receive_pending(ctx, "fee", lambda: pause.is_paused(db))
     except SignerError as e:
         log.warning("fee receive refused: %s", e)
         return 0
-    return len(made)
+
+
+async def record_receives(ctx: Context, db: AsyncSession) -> int:
+    """Record the receive of every fee that has none on record and whose receive the chain now holds.
+    Returns how many were recorded. The fee account's chain is read only when a row is waiting."""
+    if not ctx.signer.has("fee"):
+        return 0
+    rows = (await db.execute(select(FeeLedger).where(FeeLedger.state.in_(("seen",) + DUE))
+                             .order_by(FeeLedger.fee_block_hash))).scalars().all()
+    chain = _FeeChain(ctx)
+    n = 0
+    for f in rows:
+        if not (f.tx_hashes or {}).get("receive") and await _record_receive(ctx, db, f, chain):
+            n += 1
+    return n
 
 
 class _FeeChain:
-    """The fee account's chain, read once per pass and only when something needs reconciling."""
+    """The fee account's chain, read once per pass and only when something needs it."""
 
     def __init__(self, ctx: Context):
-        self.ctx, self._blocks = ctx, None
+        self.ctx, self._blocks, self._pending = ctx, None, None
 
     async def blocks(self) -> list[dict]:
         if self._blocks is None:
@@ -67,58 +86,80 @@ class _FeeChain:
         return self._blocks
 
     async def receive_of(self, send_hash: str) -> dict | None:
-        return next((b for b in await self.blocks() if b.get("type") == "receive" and b.get("source") == send_hash), None)
+        """The final receive of a send. One that is not final yet can still be dropped; it is found on a
+        later pass, when it is."""
+        return next((b for b in await self.blocks() if b.get("type") == "receive" and b.get("source") == send_hash
+                     and b.get("finalized") is True and b.get("hash")), None)   # the hash is what gets recorded
 
-    async def settlement_with(self, nonce: str) -> dict | None:
-        return next((b for b in await self.blocks()
-                     if b.get("type") in ("send", "burn") and (b.get("memo") or "").endswith(f" {nonce}")), None)
+    async def arriving(self, send_hash: str) -> bool:
+        """Whether a send with no final receive is still on its way in: its receive is on the chain and
+        not final yet, or the node holds the send pending for the fee account, where every pass offers a
+        receive for it. Neither is "never received"."""
+        if any(b.get("type") == "receive" and b.get("source") == send_hash for b in await self.blocks()):
+            return True
+        if self._pending is None:
+            self._pending = {p["send_hash"] for p in await self.ctx.chain.pending_for(self.ctx.signer.address("fee"))}
+        return send_hash in self._pending
+
+
+async def _record_receive(ctx: Context, db: AsyncSession, f: FeeLedger, chain: _FeeChain) -> bool:
+    got = await chain.receive_of(f.fee_block_hash)
+    if not got:
+        return False
+    f.tx_hashes = {**(f.tx_hashes or {}), "receive": got["hash"]}
+    f.error = ""
+    await ctx.events.append(db, "fee.received", "harness", {
+        "block": got["hash"], "source": f.fee_block_hash, "amount": f.amount, "asset": got.get("asset"),
+    }, ref=f"fee:{f.fee_block_hash}", public=True)
+    await db.commit()
+    return True
 
 
 async def settle_due(ctx: Context, db: AsyncSession) -> int:
-    """Refund or burn fees whose proposals have closed. Each row is committed as it moves."""
+    """Refund or burn fees whose proposals have closed. Each row is committed as it moves. Returns how many
+    rows reached `refunded` or `burned` this pass."""
     if not ctx.signer.has("fee"):
         return 0
-    rows = list((await db.execute(select(FeeLedger).where(FeeLedger.state.in_(DUE + ("settling",))))).scalars().all())
+    keys = list((await db.execute(select(FeeLedger.fee_block_hash).where(FeeLedger.state.in_(DUE + ("settling",)))
+                                  .order_by(FeeLedger.updated_at.asc(), FeeLedger.fee_block_hash.asc()))).scalars().all())
     chain = _FeeChain(ctx)
     n = 0
-    for f in rows:
+    for key in keys:
+        f = await db.get(FeeLedger, key)
         try:
-            if f.state == "settling":
-                if await _finish_or_retry(ctx, db, f, chain):
-                    n += 1
-                    continue
-                # not on chain: back to due, and fall through to settle it now
-            if not (f.tx_hashes or {}).get("receive") and not await _find_receive(ctx, db, f, chain):
+            if f.state in DUE and not (f.tx_hashes or {}).get("receive") and not await _received(ctx, db, f, chain):
                 continue
-            await _settle(ctx, db, f)
-            n += 1
-        except Exception as e:  # keep going; retried next tick
+            if await _settle(ctx, db, f):
+                n += 1
+        except Exception as e:  # keep going; the row is as it was last committed, and is taken again next tick
+            await db.rollback()
+            f = await db.get(FeeLedger, key)
             f.error = str(e)[:500]
             await db.commit()
             log.warning("fee settle failed for %s: %s", f.proposal_hash, e)
     return n
 
 
-async def _find_receive(ctx: Context, db: AsyncSession, f: FeeLedger, chain: _FeeChain) -> bool:
-    """A due row with no receive on record: the receive may have landed without being recorded (XE-0488)."""
-    got = await chain.receive_of(f.fee_block_hash)
-    if got:
-        f.tx_hashes = {**(f.tx_hashes or {}), "receive": got["hash"]}
-        f.error = ""
-        await ctx.events.append(db, "fee.received", "harness", {
-            "block": got["hash"], "source": f.fee_block_hash, "amount": f.amount, "asset": got.get("asset"),
-            "reconciled": True,
-        }, ref=f"fee:{f.fee_block_hash}", public=True)
-        await db.commit()
+async def _received(ctx: Context, db: AsyncSession, f: FeeLedger, chain: _FeeChain) -> bool:
+    """A due row with no receive on record: is its receive on the chain (XE-0488)? If it is not, we never
+    received this fee into the fee account, so there is nothing of the payer's to refund or burn: paying out
+    here would spend other payers' XE (XE-0034). The row stays due and is looked at every pass.
+
+    A receive that is on the chain and not final, or a send the node still holds pending, is not "never
+    received": the row waits and nothing is said. The event fires once for a fee, and the log is what says
+    whether it has: the row's `error` is overwritten by whatever last went wrong with the row, so a node
+    failure between two passes would otherwise have the same fee announced again."""
+    if await _record_receive(ctx, db, f, chain):
         return True
-    # We never received this fee into the fee account, so there is nothing of the payer's to refund or burn:
-    # paying out here would spend other payers' XE (XE-0034). The row stays due and is looked at every pass;
-    # the event fires once.
-    if f.error != UNRECEIVED_ERROR:
-        f.error = UNRECEIVED_ERROR
+    if await chain.arriving(f.fee_block_hash):
+        await _note(db, f, ARRIVING_NOTE)
+        return False
+    await _note(db, f, UNRECEIVED_ERROR)
+    ref = f"proposal:{f.proposal_hash}"
+    if not await EventLog.page(db, limit=1, kind="fee.unreceived", ref=ref, public_only=False):
         await ctx.events.append(db, "fee.unreceived", "harness", {
             "proposal": f.proposal_hash, "payer": f.payer, "amount": f.amount, "fee_block_hash": f.fee_block_hash,
-        }, ref=f"proposal:{f.proposal_hash}")
+        }, ref=ref)
         await db.commit()
         log.warning("fee for %s was never received; not settling", f.proposal_hash)
     return False
@@ -137,58 +178,88 @@ def _phase_amount(f: FeeLedger, fee: int) -> int:
     return f.amount if as_ == "refund" else fee if as_ == "burn" else f.amount - fee
 
 
+_IN_FLIGHT = ("settle_as", "settle_block")
+
+
 def _mark(f: FeeLedger, as_: str) -> None:
-    f.tx_hashes = {**(f.tx_hashes or {}), "settle_as": as_, "settle_nonce": secrets.token_hex(4)}
+    """Begin a settlement phase: what is owed, and no block yet."""
+    f.tx_hashes = {**{k: v for k, v in (f.tx_hashes or {}).items() if k not in _IN_FLIGHT}, "settle_as": as_}
     f.state = "settling"
 
 
-async def _settle(ctx: Context, db: AsyncSession, f: FeeLedger) -> None:
-    """Mark, commit, pay, record, commit; twice when a burn leaves an excess to return."""
+async def _note(db: AsyncSession, f: FeeLedger, why: str) -> None:
+    if f.error != why:
+        f.error = why
+        await db.commit()
+
+
+async def _settle(ctx: Context, db: AsyncSession, f: FeeLedger) -> bool:
+    """Take a row as far as the chain allows this pass; True once it is `refunded` or `burned`. A burn that
+    leaves an excess to return is two phases, one block each."""
+    if "settle_nonce" in (f.tx_hashes or {}):
+        # Marked by the release before this one, which named its block by a nonce in the memo and kept no
+        # hash. Whether that block went out cannot be told from the row, so no block is built for it here.
+        raise RuntimeError(f"settlement was begun under the memo-nonce scheme (nonce {f.tx_hashes['settle_nonce']}) "
+                           "and is not continued automatically: check the fee account's chain for that memo")
     if f.state in DUE:
         _mark(f, "refund" if f.state == "due_refund" else "burn")
         await db.commit()
     fee = await _fee_due(db, f)
     while f.state == "settling":
-        if await pause.is_paused(db):
-            # Read here, not only at the start of the job: a pause committed since then stops the burn or
-            # refund before it is sent (XE-1172). The row stays `settling` and is reconciled next pass.
-            return
-        as_, nonce = f.tx_hashes["settle_as"], f.tx_hashes["settle_nonce"]
-        memo = f"fee {as_} {f.proposal_hash[:12]} {nonce}"
-        amount = _phase_amount(f, fee)
-        if as_ == "burn":
-            b = await chainops.burn(ctx, "fee", "block.burn", amount, memo=memo)
+        block = f.tx_hashes.get("settle_block")
+        if block is None:
+            block = await _build(ctx, db, f, fee)
+            if block is None:
+                return False
+            # The block is on the row before it is offered: whatever happens next, this is the block the
+            # next pass asks the chain about.
+            f.tx_hashes = {**f.tx_hashes, "settle_block": block}
+            await db.commit()
+            where = "open"
         else:
-            b = await chainops.send(ctx, "fee", "block.send.refund", f.payer, amount, memo=memo)
-        await _record_settled(ctx, db, f, b.hash, fee)
+            where = await chainops.placed(ctx.chain, block)
+        if where == "open":
+            if await pause.is_paused(db):
+                return False
+            where = await chainops.offer(ctx, block)
+        if where == "landed":
+            await _record_settled(ctx, db, f, block["hash"], fee)
+        elif where == "lost":
+            # Another block is final where this one would have stood: it can never land. The next pass
+            # builds another.
+            f.tx_hashes = {k: v for k, v in f.tx_hashes.items() if k != "settle_block"}
+            f.error = f"settlement block {block['hash'][:12]} was not taken and can no longer land; another is built"
+            await db.commit()
+            return False
+        else:
+            if where == "open":
+                await _note(db, f, f"settlement block {block['hash'][:12]} was offered and the node did not take it; "
+                                   "the same block is offered again until the fee account's chain moves")
+            return False   # offered and not final yet, or the node did not take it this time
+    return True
 
 
-async def _finish_or_retry(ctx: Context, db: AsyncSession, f: FeeLedger, chain: _FeeChain) -> bool:
-    """A row left `settling`: completed from the chain if the payment landed, else returned to due (or, for
-    an excess phase whose burn is already recorded, re-marked so the excess goes out again)."""
-    nonce = (f.tx_hashes or {}).get("settle_nonce", "")
-    got = await chain.settlement_with(nonce) if nonce else None
-    if got:
-        await _record_settled(ctx, db, f, got["hash"], await _fee_due(db, f), reconciled=True)
-        return f.state != "settling"
-    as_ = f.tx_hashes.get("settle_as")
-    if as_ == "excess":
-        _mark(f, "excess")
-    else:
-        f.state = "due_refund" if as_ == "refund" else "due_burn"
-        f.tx_hashes = {k: v for k, v in f.tx_hashes.items() if k not in ("settle_as", "settle_nonce")}
-    await db.commit()
-    return False
+async def _build(ctx: Context, db: AsyncSession, f: FeeLedger, fee: int) -> dict | None:
+    """The block for the row's current phase; None if it is not to be built now (a pause, or a fee account
+    whose tip is not final yet)."""
+    if await pause.is_paused(db):
+        # Read here, not only at the start of the job: a pause committed since then stops the burn or
+        # refund before it is signed (XE-1172). The row stays `settling` and is taken up after the pause.
+        return None
+    as_ = f.tx_hashes["settle_as"]
+    memo = f"fee {as_} {f.proposal_hash[:12]}"
+    amount = _phase_amount(f, fee)
+    if as_ == "burn":
+        return await chainops.build_burn(ctx, "fee", "block.burn", amount, memo=memo)
+    return await chainops.build_send(ctx, "fee", "block.send.refund", f.payer, amount, memo=memo)
 
 
-async def _record_settled(ctx: Context, db: AsyncSession, f: FeeLedger, block_hash: str, fee: int, reconciled: bool = False) -> None:
+async def _record_settled(ctx: Context, db: AsyncSession, f: FeeLedger, block_hash: str, fee: int) -> None:
     as_ = f.tx_hashes["settle_as"]
     amount = _phase_amount(f, fee)
-    f.tx_hashes = {**{k: v for k, v in f.tx_hashes.items() if k not in ("settle_as", "settle_nonce")}, as_: block_hash}
+    f.tx_hashes = {**{k: v for k, v in f.tx_hashes.items() if k not in _IN_FLIGHT}, as_: block_hash}
     f.error = ""
     payload = {"proposal": f.proposal_hash, "payer": f.payer, "amount": amount, "block": block_hash}
-    if reconciled:
-        payload["reconciled"] = True
     if as_ == "excess":
         f.state = "burned"
         await ctx.events.append(db, "fee.excess_returned", "harness", payload, ref=f"proposal:{f.proposal_hash}")
@@ -198,8 +269,3 @@ async def _record_settled(ctx: Context, db: AsyncSession, f: FeeLedger, block_ha
         if as_ == "burn" and f.amount > fee:
             _mark(f, "excess")   # the burn is on record; what was sent above the fee goes back next
     await db.commit()
-
-
-def to_dict(f: FeeLedger) -> dict:
-    return {"fee_block_hash": f.fee_block_hash, "proposal": f.proposal_hash, "payer": f.payer, "amount": f.amount,
-            "state": f.state, "tx_hashes": f.tx_hashes, "error": f.error}

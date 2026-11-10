@@ -165,7 +165,7 @@ class FeeLedger(Base):
     payer: Mapped[str] = mapped_column(String(64), nullable=False)
     amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
     state: Mapped[str] = mapped_column(String(16), nullable=False, default="seen")  # seen | due_refund | due_burn | settling | refunded | burned
-    tx_hashes: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)   # receive, refund|burn; settle_as + settle_nonce while settling
+    tx_hashes: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)   # receive, refund|burn|excess; settle_as + settle_block while settling
     error: Mapped[str] = mapped_column(Text, nullable=False, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
