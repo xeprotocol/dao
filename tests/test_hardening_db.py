@@ -2706,3 +2706,30 @@ async def test_a_chat_item_that_is_not_an_envelope_is_skipped_by_both_readers(db
     assert "inbox.receive(" in inspect.getsource(worker_mod.Worker.chat_loop) and not hasattr(worker_mod, "Envelope")
 
 
+# ---- XE-1945: a resolution's link names a proposal that exists ---------------------------------------------
+
+async def test_a_resolution_links_only_a_proposal_that_exists(db):
+    from dao.services import resolutions
+    ctx = _ctx()
+    ctx.config.members = [_member("founder-a")]
+    pr = _closed(ctx, "3" * 64, "passed")
+    db.add(pr)
+    await db.flush()
+
+    def proposing(**link):
+        v = _v(payload={"title": "t", "body": "b", "matter": "note", **link})
+        v.seat = _member("founder-a")
+        return v
+    for bad in ("f" * 64, "3" * 63, "nonsense"):
+        with pytest.raises(HTTPException) as e:
+            await resolutions.propose(ctx, db, proposing(related_proposal=bad))
+        assert e.value.status_code == 400 and "names no proposal" in e.value.detail, bad
+    for bad in (5, ["3" * 64], "3" * 65):
+        with pytest.raises(HTTPException) as e:
+            await resolutions.propose(ctx, db, proposing(related_proposal=bad))
+        assert e.value.status_code == 400, bad
+    assert (await db.execute(select(Resolution))).scalars().all() == []
+    linked = await resolutions.propose(ctx, db, proposing(related_proposal=pr.hash))
+    assert linked.related_proposal == pr.hash
+    for blank in ({}, {"related_proposal": ""}, {"related_proposal": None}):
+        assert (await resolutions.propose(ctx, db, proposing(**blank))).related_proposal == ""

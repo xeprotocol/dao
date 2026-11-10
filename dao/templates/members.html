@@ -38,7 +38,7 @@
 </form>
 <table style="margin-top:12px"><tr><th>#</th><th>Title</th><th>Matter</th><th>Status</th><th>Signatures</th><th></th></tr>
 {% for r in resolutions %}{% set d = res_dict(r) %}<tr>
-  <td>R{{ r.number }}</td><td><details><summary>{{ r.title }}</summary><pre>{{ r.body }}</pre>{% if r.ops %}<pre>{{ r.ops|tojson(indent=1) }}</pre>{% endif %}</details></td>
+  <td>R{{ r.number }}</td><td><details><summary>{{ r.title }}</summary><pre>{{ r.body }}</pre>{% if r.related_proposal %}<p class="small">Decides open vote <a href="/proposals/{{ r.related_proposal }}"><code>{{ r.related_proposal[:16] }}</code></a></p>{% endif %}{% if r.ops %}<pre>{{ r.ops|tojson(indent=1) }}</pre>{% endif %}</details></td>
   <td>{{ r.matter }}{% if d.reserved %} <span class="pill">reserved</span>{% endif %}</td><td><span class="pill">{{ r.status }}</span></td>
   <td class="small">{% for s in d.signatures %}{{ s.seat }}: {{ s.decision }}<br>{% endfor %}{% if d.set_aside %}<span class="mute">set aside: {{ d.set_aside|join(", ") }}</span><br>{% endif %}{{ d.rule }} ({{ d.needed }})</td>
   <td class="right">{% if r.status == 'open' %}<button class="ghost small" data-sign="{{ r.id }}" data-bh="{{ d.body_hash }}" data-dec="for">for</button> <button class="ghost small" data-sign="{{ r.id }}" data-bh="{{ d.body_hash }}" data-dec="against">against</button>{% elif r.session_id %}<a href="#s-{{ r.session_id }}">session</a>{% endif %}</td>

@@ -76,9 +76,13 @@ async def propose(ctx: Context, db: AsyncSession, v: Verified) -> Resolution:
         # Checked now against the session kind the matter will open, so a resolution that cannot execute is
         # refused here and not at its deciding vote (XE-0349).
         sessions.check_ops(session_kind(matter), ops, sessions.seat_keys_of(ctx.config))
+    # The link is the resolution's published claim about which open vote it concerns, so it names a proposal
+    # that exists (XE-1945). Whether the resolution may then decide that proposal is `portal.decide`'s question.
+    related = field_text(p, "related_proposal", max_len=64).strip().lower()
+    if related and (await db.execute(select(Proposal.hash).where(Proposal.hash == related))).first() is None:
+        raise HTTPException(400, "related_proposal names no proposal")
     r = Resolution(id=secrets.token_hex(8), number=await _next_number(db), title=title, body=body, matter=matter,
-                   ops=ops, proposed_by=v.seat.id, status="open", signatures=[],
-                   related_proposal=clean_text(p.get("related_proposal"), "related_proposal", max_len=64, required=False))
+                   ops=ops, proposed_by=v.seat.id, status="open", signatures=[], related_proposal=related)
     db.add(r)
     await ctx.events.append(db, "resolution.proposed", v.actor, {
         "resolution_id": r.id, "number": r.number, "title": title, "body": body, "matter": matter, "ops": ops,
@@ -101,8 +105,13 @@ def session_kind(matter: str) -> str:
 
 
 def body_hash(r: Resolution) -> str:
+    """What a member's signature commits to: everything about the resolution that decides what it does.
+    The open vote it names is part of that (`portal.decide` adopts or declines that proposal on the
+    strength of the pass), so it is in the hash wherever there is one; a resolution that names none hashes
+    as it always did."""
     from ..canonical import canonical_json, sha256_hex
-    return sha256_hex(canonical_json({"title": r.title, "body": r.body, "matter": r.matter, "ops": r.ops}))
+    return sha256_hex(canonical_json({"title": r.title, "body": r.body, "matter": r.matter, "ops": r.ops,
+                                      **({"related_proposal": r.related_proposal} if r.related_proposal else {})}))
 
 
 def live_signatures(ctx: Context, sigs: list[dict]) -> tuple[list[dict], list[str]]:
