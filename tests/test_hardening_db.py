@@ -1722,42 +1722,75 @@ async def test_a_members_signature_survives_a_node_that_does_not_answer(db):
     assert s.status == "submitted" and s.submitted_index == s.block["index"]
 
 
-# ---- XE-1677 / XE-1817: only a refusal about the block ends a session -------------------------------------
+# ---- XE-1677 / XE-1817 / XE-2216: what a refused submit means is asked of the chain, not read off the refusal ----
 
-async def test_a_refusal_that_says_nothing_about_the_block_defers_and_a_keyset_refusal_rebuilds(db):
+async def test_a_refused_submit_is_classified_by_the_state_of_the_chain_whatever_the_refusal_says(db):
     ctx = _ctx()
-    ctx.chain.statechain_tip = lambda: _tip_at(0)
-    answers = {}
+    tip = {"at": 0}
+    keyset = {"keys": ["k1", "k2", "k3"], "threshold": 2}
 
     async def refuse(blk):
         raise answers["e"]
+
+    async def live():
+        return dict(keyset)
     ctx.chain.submit_statechain_block = refuse
-    # a rate limit: the node never looked at the block
+    ctx.chain.statechain_tip = lambda: _tip_at(tip["at"])
+    ctx.chain.dao_keyset = live
+    answers = {}
+    # a rate limit, a server error: the node never looked at the block, whatever state the chain is in
     s1 = await _signing(db, "s1", index=1, n=1)
-    answers["e"] = XeError(429, "rate limit exceeded")
-    await sessions.submit(ctx, db, s1)
-    assert s1.status == "signing" and "429" in s1.error and len(s1.block_signatures) == 2
-    # a server error: the same
-    answers["e"] = XeError(503, "service unavailable")
-    await sessions.submit(ctx, db, s1)
-    assert s1.status == "signing"
-    # the keyset moved under the block, approvals still meet the live keyset: rebuilt for the new signers
-    s2 = await _signing(db, "s2", index=1, n=2)
-    answers["e"] = XeError(400, "block rejected: signer k9 not in keyset")
-    await sessions.submit(ctx, db, s2)
-    assert s2.status == "signing" and s2.block_signatures == [] and s2.rebuilds == 1
-    assert (await db.execute(select(Event).where(Event.kind == "session.keyset_moved"))).scalars().first()
-    # the keyset moved and the approvals no longer meet it: back to approving (XE-0988), not failed
-    s3 = await _signing(db, "s3", index=1, n=3)
-    s3.approvals = [{"public_key": "old1"}, {"public_key": "old2"}]
-    answers["e"] = XeError(400, "block rejected: insufficient signatures: got 1, need 2")
-    await sessions.submit(ctx, db, s3)
-    assert s3.status == "approving" and s3.block is None
-    # a refusal about the block itself, from a node that answered: failed, as before
-    s4 = await _signing(db, "s4", index=1, n=4)
-    answers["e"] = XeError(400, "block rejected: epoch key already exists")
-    await sessions.submit(ctx, db, s4)
-    assert s4.status == "failed"
+    for e in (XeError(429, "rate limit exceeded"), XeError(503, "service unavailable")):
+        answers["e"] = e
+        await sessions.submit(ctx, db, s1)
+        assert s1.status == "signing" and str(e.status) in s1.error and len(s1.block_signatures) == 2
+
+    # The same four refusals are given in each state of the chain. Two are worded like a moved tip or a
+    # moved keyset, one is about the block, one is in words nobody has seen: the outcome follows the state.
+    wordings = ("block rejected: signer k9 not in keyset", "block rejected: prev_hash mismatch",
+                "block rejected: epoch key already exists", "block rejected: some new wording in a later node")
+    n = iter(range(2, 100))
+
+    async def refused_with(words, **over):
+        i = next(n)
+        s = await _signing(db, f"s{i}", index=1, n=i)
+        for k, v in over.items():
+            setattr(s, k, v)
+        answers["e"] = XeError(400, words)
+        await sessions.submit(ctx, db, s)
+        return s
+
+    async def events(kind, s):
+        return (await db.execute(select(Event).where(Event.kind == kind, Event.ref == f"session:{s.id}"))).scalars().all()
+
+    for words in wordings:
+        # nothing moved: the tip is the block's parent and its signatures meet the live keyset. The refusal
+        # is about the block, and the session ends with the node's words on the record
+        s = await refused_with(words)
+        assert s.status == "failed" and words in s.error, words
+        # the tip moved: rebuilt on the live tip
+        tip["at"] = 7
+        s = await refused_with(words)
+        assert s.status == "signing" and s.block_signatures == [] and s.rebuilds == 1 and s.block["index"] == 8, words
+        assert await events("session.tip_moved", s) and not await events("session.failed", s)
+        tip["at"] = 0
+        # the keyset moved under the block's signatures; the approvals still meet it: rebuilt for the new signers
+        keyset["keys"] = ["k1", "k2", "k9"]
+        s = await refused_with(words, block_signatures=[{"public_key": "k1", "signature": "s"}, {"public_key": "k3", "signature": "s"}])
+        assert s.status == "signing" and s.block_signatures == [] and s.rebuilds == 1, words
+        assert await events("session.keyset_moved", s)
+        # the keyset moved and the approvals no longer meet it either: back to approving (XE-0988), not failed
+        keyset["keys"] = ["k7", "k8", "k9"]
+        s = await refused_with(words)
+        assert s.status == "approving" and s.block is None, words
+        assert await events("session.keyset_moved", s) and await events("session.reapproval_needed", s)
+        keyset["keys"] = ["k1", "k2", "k3"]
+    # and a chain that cannot be asked decides nothing
+    async def down():
+        raise XeError(0, "ReadTimeout")
+    ctx.chain.statechain_tip = down
+    s = await refused_with(wordings[0])
+    assert s.status == "signing" and "could not confirm" in s.error and len(s.block_signatures) == 2
 
 
 # ---- XE-1843: a cancel asks the chain first ------------------------------------------------------------

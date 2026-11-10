@@ -401,10 +401,6 @@ async def _submitted(ctx: Context, db: AsyncSession, s: SigningSession) -> Signi
     return s
 
 
-TIP_MOVED = ("prev", "index", "tip", "stale", "not the next")
-KEYSET_MOVED = ("keyset", "signer", "signature")
-
-
 def ready_to_submit(s: SigningSession, ks: dict) -> bool:
     """A signing session holding a threshold of live signatures over its block: its submit is owed to the chain."""
     return s.status == "signing" and bool(s.block) and signatures_met(s, ks)
@@ -450,23 +446,25 @@ async def _refused(ctx: Context, db: AsyncSession, s: SigningSession, e: XeError
     try:
         if await landed(ctx, s):
             return await _submitted(ctx, db, s)
+        # 429, 5xx, no answer: the node said nothing about the block.
+        moved = None if e.transient else await _moved_under(ctx, s)
     except XeError as read_err:
         return await _deferred(ctx, db, s, f"submit: {e}; could not confirm against the chain: {read_err}")
     if e.transient:
-        # 429, 5xx, no answer: the node said nothing about the block.
         return await _deferred(ctx, db, s, f"submit: {e}")
-    msg = str(e).lower()
-    if any(w in msg for w in TIP_MOVED) or any(w in msg for w in KEYSET_MOVED):
+    if moved:
         # The chain moved under the block (its tip, or the keyset it is checked against): rebuild on what is
         # live. A rotation that leaves the approvals short sends it back to approving (XE-0988).
-        kind = "session.tip_moved" if any(w in msg for w in TIP_MOVED) else "session.keyset_moved"
-        await ctx.events.append(db, kind, "harness", {"session_id": s.id, "error": str(e), "block_hash": s.block_hash},
+        await ctx.events.append(db, moved, "harness", {"session_id": s.id, "error": str(e), "block_hash": s.block_hash},
                                 ref=f"session:{s.id}")
         try:
             await rebuild(ctx, db, s)
         except XeError as build_err:
             return await _deferred(ctx, db, s, f"submit: {e}; rebuild: {build_err}")
         return s
+    # The node answered and refused; the chain does not hold the block, its tip is the block's parent and
+    # its keyset is met by the block's signatures. The refusal is about the block, and building the same
+    # ops again would draw it again: the session ends, with the node's words on the record.
     s.status = "failed"
     s.error = str(e)
     await _ended(db, s)
