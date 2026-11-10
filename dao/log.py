@@ -63,8 +63,14 @@ class EventLog:
 
     async def append(self, db: AsyncSession, kind: str, actor: str, payload: dict, *, ref: str = "",
                      public: bool = True, ts: int | None = None) -> Event:
-        """Append one event inside the caller's transaction. Caller commits."""
-        head = (await db.execute(select(LogHead).where(LogHead.id == 1).with_for_update())).scalar_one()
+        """Append one event inside the caller's transaction. Caller commits.
+
+        The head is read from the row, under its lock, every time. A session that has appended and committed
+        still holds the head as it left it, and without `populate_existing` the locked read hands that copy
+        back: a worker pass that commits between events would then chain its next event to a head another
+        process has since moved, and the append fails on the index it reuses."""
+        head = (await db.execute(select(LogHead).where(LogHead.id == 1).with_for_update()
+                                 .execution_options(populate_existing=True))).scalar_one()
         index = head.index + 1
         ts = ts if ts is not None else time.time_ns()
         h = event_hash(index, ts, kind, actor, payload, head.hash, public=public, ref=ref, v=2)

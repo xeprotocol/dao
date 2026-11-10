@@ -4,12 +4,12 @@ DAO_TEST_DATABASE_URL=postgresql+asyncpg://dao:pw@db:5432/dao_test (a scratch da
 import os
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from dao.db import Base
 from dao.log import EventLog
-from dao.models import LogHead  # noqa: F401  (registers the table on Base.metadata)
+from dao.models import LogHead
 from dao.signer import Signer
 from xe.keys import KeyPair
 
@@ -44,6 +44,26 @@ async def test_append_chain_and_verify(db):
     assert res["ok"] and res["count"] == 5
     head = await EventLog.head(db)
     assert head.index == 4
+
+
+async def test_a_session_that_has_appended_chains_to_the_head_as_it_is_now(db):
+    """Two processes write one log. A session that appended and committed (a worker pass commits between
+    events) appends again after another session has: its next event follows the other's, not its own."""
+    log = EventLog(_signer())
+    await log.append(db, "test", "worker", {"i": 0})
+    await db.commit()
+    # held, as a long-lived session's own objects are: without this the head is garbage-collected out of the
+    # session's identity map and read afresh, and the test passes whatever `append` does
+    held = (await db.execute(select(LogHead))).scalar_one()
+    assert held.index == 0
+    async with async_sessionmaker(db.bind, expire_on_commit=False)() as other:
+        await log.append(other, "test", "app", {"i": 1})
+        await other.commit()
+    ev = await log.append(db, "test", "worker", {"i": 2})
+    await db.commit()
+    assert ev.index == 2
+    res = await EventLog.verify(db)
+    assert res["ok"] and res["count"] == 3
 
 
 async def test_tamper_is_detected(db):
