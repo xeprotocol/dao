@@ -95,11 +95,12 @@ class Worker:
             await db.commit()
 
     async def job_outbox(self):
-        async with session() as db:
-            try:
-                await inbox.flush_outbox(self.ctx, db)
-            except Exception as e:
-                log.warning("outbox: %s", e)
+        # One outbox pass at a time, for the reason there is one fee pass: a reply has one envelope because
+        # one pass builds it, and two passes over one queued row would each build and send their own.
+        async with session() as db, only_one(db, "worker:outbox") as alone:
+            if not alone:
+                return
+            await self._step(db, "outbox", lambda: inbox.flush_outbox(self.ctx, db))
             await mark_run(db, "outbox")
             await db.commit()
 

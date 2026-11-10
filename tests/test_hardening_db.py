@@ -1213,9 +1213,9 @@ async def test_pause_consent_counts_only_members_who_hold_the_right_and_post_nee
     assert e.value.status_code == 409
 
 
-async def test_settlement_and_outbox_read_the_pause_right_before_the_chain_write(db, monkeypatch):
+async def test_settlement_receives_and_outbox_read_the_pause_right_before_the_chain_write(db, monkeypatch):
     from dao.models import OutboxMessage, PauseRecord
-    ctx = _ctx()
+    ctx, chain, fee = _fee_ctx(funded=1000)
     now = time.time_ns()
     db.add(FeeLedger(fee_block_hash="1" * 64, proposal_hash="2" * 64, payer=AUTHOR, amount=1000, state="due_burn",
                      tx_hashes={"receive": "r" * 64}))
@@ -1226,33 +1226,79 @@ async def test_settlement_and_outbox_read_the_pause_right_before_the_chain_write
                          envelope={}, error=""))
     await db.commit()
     sent = []
-    pauses = iter(["p1", "p2"])
+    pauses = (f"p{i}" for i in range(1, 9))
 
-    async def pause_then(*a, **k):
-        # the pause is committed after the job began and before the chain write
+    async def pause_now():
+        # a pause committed after the job began and before the chain write
         db.add(PauseRecord(id=next(pauses), determined_by="founder-a", ground="g", determination="d" * 20, started_at=now,
                            expires_at=now + 10 ** 12, indefinite=False, extensions=[], lifted_by=[], status="active"))
         await db.commit()
-        return SimpleNamespace(hash="x" * 64, id="e", to_json=lambda: {})
 
-    async def wrote(*a, **k):
-        sent.append(1)
+    async def lift():
+        for r in (await db.execute(select(PauseRecord).where(PauseRecord.status == "active"))).scalars().all():
+            r.status = "lifted"
+        await db.commit()
 
-    ctx.signer = FakeSigner(("harness", "fee", "dao"))
-    monkeypatch.setattr(fees.chainops, "burn", wrote)
-    monkeypatch.setattr(fees.chainops, "send", wrote)
-    monkeypatch.setattr(fees, "_fee_due", pause_then)      # the last await before the burn
-    await fees.settle_due(ctx, db)
+    ctx.signer._kp["dao"] = KeyPair.generate()
+    fee_due = fees._fee_due
+
+    async def fee_due_then_pause(db_, f):
+        await pause_now()
+        return await fee_due(db_, f)
+
+    # 1. the pause lands on the last await before the burn is built: the row is marked, nothing is signed
+    monkeypatch.setattr(fees, "_fee_due", fee_due_then_pause)
+    assert await fees.settle_due(ctx, db) == 0
     f = (await db.execute(select(FeeLedger))).scalar_one()
-    assert f.state == "settling" and not f.error and not sent, "marked, but the burn did not go out under the pause"
-    # the same for a queued reply: the pause lands while the envelope's proof of work is being computed
-    (await db.execute(select(PauseRecord))).scalar_one().status = "lifted"
-    await db.commit()
+    assert f.state == "settling" and "settle_block" not in f.tx_hashes and not f.error and chain.submits == []
+    # 2. the pause lands while the block is being built and worked: it is on the row, and is not offered
+    monkeypatch.setattr(fees, "_fee_due", fee_due)
+    await lift()
+    build = fees.chainops.build_burn
+
+    async def build_then_pause(*a, **k):
+        block = await build(*a, **k)
+        await pause_now()
+        return block
+    monkeypatch.setattr(fees.chainops, "build_burn", build_then_pause)
+    assert await fees.settle_due(ctx, db) == 0
+    stored = f.tx_hashes["settle_block"]["hash"]
+    assert stored and chain.submits == [], "built before the pause, not offered under it"
+    monkeypatch.setattr(fees.chainops, "build_burn", build)
+    await lift()
+
+    # 3. a block already on the row is not offered again while a pause is in force
+    async def drop(block):
+        return "drop"
+    chain.on_submit = drop
+    assert await fees.settle_due(ctx, db) == 0 and [b["hash"] for b in chain.submits] == [stored]
+    await pause_now()
+    assert await fees.settle_due(ctx, db) == 0 and len(chain.submits) == 1, "the stored block waits for the pause to end"
+    await lift()
+
+    # 4. a run of receives: the pause lands while the first is at the node, and the two behind it are not offered (XE-2483)
+    chain.pending = [{"send_hash": h * 64, "source": AUTHOR, "destination": fee, "amount": 10, "asset": "XE", "timestamp": 0}
+                     for h in "567"]
+
+    async def take_then_pause(block):
+        await pause_now()
+    chain.on_submit = take_then_pause
+    assert await fees.receive_all(ctx, db) == 1 and len(chain.submits) == 2
+    await lift()
+
+    # 5. the same for a queued reply: the pause lands while the envelope's proof of work is being computed
+    async def work_then_pause(fn, *a):
+        env = fn(*a)
+        await pause_now()
+        return env
+
+    async def wrote(env):
+        sent.append(env)
     ctx.chain.chat_send = wrote
-    monkeypatch.setattr(inbox, "asyncio", SimpleNamespace(to_thread=pause_then))
+    monkeypatch.setattr(inbox, "asyncio", SimpleNamespace(to_thread=work_then_pause))
     assert await inbox.flush_outbox(ctx, db) == 0
     o = (await db.execute(select(OutboxMessage))).scalar_one()
-    assert o.status == "queued" and not sent
+    assert o.status == "queued" and o.envelope == {} and not sent, "no envelope is in play: nothing was offered"
 
 
 # ---- XE-0990: an anchor that never reached the chain leaves no row ---------------------------------
@@ -1417,9 +1463,28 @@ async def test_no_worker_job_writes_to_the_node_while_paused_except_directory_re
         async def statechain_tip(self):
             return None
 
+        # a fee account with a send waiting to be received and XE to settle from, so the fee job has both
+        # of its writes to make and is quiet under the pause for no other reason
+        tip_block = {"hash": "7" * 64, "finalized": True}
+
+        async def pending_for(self, account):
+            return [{"send_hash": "5" * 64, "source": AUTHOR, "destination": account, "amount": 10, "asset": "XE", "timestamp": 0}]
+
+        async def chain(self, account, offset=0, limit=1000):
+            return {"blocks": [self.tip_block][offset:offset + limit], "total": 1}
+
+        async def chain_end(self, account):
+            return 1, self.tip_block
+
+        async def tip(self, account):
+            return self.tip_block["hash"]
+
+        async def balances(self, account):
+            return {"XE": 5000}
+
     ctx = _ctx(chain=Chain())
     ctx.signer = FakeSigner(("harness", "fee", "dao"))
-    ctx.node = SimpleNamespace(chat_pow_difficulty=0, network_id="xe-test")
+    ctx.node = SimpleNamespace(chat_pow_difficulty=0, pow_difficulty=0, network_id="xe-test")
     ctx.directory_node_peer = "12D3KooWTestPeer"
     ctx.settings = SimpleNamespace(public_base_url="http://dao")
     ctx.config.members = [_member("founder-a")]
@@ -1435,6 +1500,13 @@ async def test_no_worker_job_writes_to_the_node_while_paused_except_directory_re
     db.add(PauseRecord(id="p1", determined_by="founder-a", ground="g", determination="d" * 20, started_at=now,
                        expires_at=now + 10 ** 12, indefinite=False, extensions=[], lifted_by=[], status="active",
                        post_text="posted", posted_at=now))
+    await _fee_row(db, "due_burn")
+    # and the outbox has both of its sends to make: a reply not yet built, and one whose envelope is in play
+    from dao.models import OutboxMessage
+    db.add_all([OutboxMessage(id="q1", to_account="c" * 64, body="queued", status="queued", in_reply_to="m", from_seat="harness",
+                              envelope={}, error=""),
+                OutboxMessage(id="s1", to_account="c" * 64, body="in play", status="sending", in_reply_to="m", from_seat="harness",
+                              envelope={"id": "e" * 64, "timestamp": now, "message": "in play", "to": "c" * 64}, error="")])
     await db.commit()
 
     w = worker_mod.Worker(ctx)
@@ -1445,6 +1517,30 @@ async def test_no_worker_job_writes_to_the_node_while_paused_except_directory_re
     # which the pause keeps open, can still be reached
     await w.job_directory()
     assert calls == ["directory_register"]
+
+    # The fee job had work it did not do. With the pause over it makes both writes, a receive and a
+    # settlement; and never while another fee pass is running, here or in another process.
+    from dao.db import only_one
+    calls.clear()
+    (await db.execute(select(PauseRecord))).scalar_one().status = "lifted"
+    await db.commit()
+    async with only_one(db, "worker:fees") as first, only_one(db, "worker:fees") as second:
+        assert first and not second
+        await w.job_fees()
+    assert calls == [], "a second fee pass does nothing while the first holds the job"
+    await w.job_fees()
+    assert calls == ["submit_block", "submit_block"]
+    # the outbox the same: one pass at a time, and with the pause over the envelope in play is offered again
+    # as it is and the queued reply is built and sent
+    calls.clear()
+    async with only_one(db, "worker:outbox") as first:
+        assert first
+        await w.job_outbox()
+    assert calls == [], "a second outbox pass does nothing while the first holds the job"
+    await w.job_outbox()
+    assert calls == ["chat_send", "chat_send"]
+    left = {o.id: o.status for o in (await db.execute(select(OutboxMessage).execution_options(populate_existing=True))).scalars().all()}
+    assert left == {"q1": "sent", "s1": "sent"}
 
 
 # ---- XE-1254: the public surfaces carry only what the harness verified ----------------------------------
@@ -1496,12 +1592,13 @@ async def test_each_outbox_row_is_committed_as_it_is_sent(db, monkeypatch):
         if len(on_disk) == 2:
             raise RuntimeError("channel closed")
     ctx.chain.chat_send = send
-    monkeypatch.setattr(inbox, "new_envelope", lambda kp, to, body, *a: SimpleNamespace(id="e", to_json=lambda: {"to": to}))
     assert await inbox.flush_outbox(ctx, db) == 2
     assert on_disk == [0, 1, 1], "each delivered row was committed before the next envelope was built"
-    rows = {o.id: o for o in (await db.execute(select(OutboxMessage))).scalars().all()}
-    assert rows["o0"].status == "sent" and rows["o2"].status == "sent"
-    assert rows["o1"].status == "queued" and "channel closed" in rows["o1"].error
+    rows = (await db.execute(select(OutboxMessage))).scalars().all()
+    assert sorted(o.status for o in rows) == ["sending", "sent", "sent"]
+    # the send that raised says nothing about delivery: the row keeps its envelope and is not `queued` again
+    stuck = next(o for o in rows if o.status == "sending")
+    assert stuck.envelope["id"] and "channel closed" in stuck.error
 
 
 # ---- XE-1511: a session whose block is on the chain is submitted, whatever the node said ------------------
@@ -1864,23 +1961,17 @@ async def test_outbox_sends_at_most_once_in_priority_order_and_the_message_follo
 
     async def send(env):
         async with sm() as other:   # what is on disk at the moment the node is handed the envelope
-            row = (await other.execute(select(OutboxMessage).where(OutboxMessage.body == env["body"]))).scalar_one()
-            seen.append(row.status)
-        sent.append(env["body"])
+            row = (await other.execute(select(OutboxMessage).where(OutboxMessage.body == env["message"]))).scalar_one()
+            seen.append((row.status, row.envelope == env))
+        sent.append(env["message"])
     ctx.chain.chat_send = send
-    monkeypatch.setattr(inbox, "new_envelope", lambda kp, to, body, *a: SimpleNamespace(id="e" + body, to_json=lambda: {"to": to, "body": body}))
     assert await inbox.flush_outbox(ctx, db) == 2
     assert sent == ["the answer", "ack"], "a member's reply goes before an acknowledgement queued earlier"
-    assert seen == ["sending", "sending"], "the intent to send is on disk before the send"
+    assert seen == [("sending", True)] * 2, "the envelope is on the row before it is offered"
     await db.refresh(m)
     assert m.status == "answered" and reply.status == "sent" and ack.status == "sent"
-    # a row the last pass left `sending`: not sent again, settled as unconfirmed
-    db.add(OutboxMessage(id="u1", to_account="b" * 64, body="maybe", status="sending", in_reply_to="m1", from_seat="cto", envelope={}, error=""))
-    await db.commit()
-    assert await inbox.flush_outbox(ctx, db) == 0 and "maybe" not in sent
-    u = (await db.execute(select(OutboxMessage).where(OutboxMessage.id == "u1"))).scalar_one()
-    assert u.status == "sent" and "unconfirmed" in u.error
-    assert (await db.execute(select(Event).where(Event.kind == "outbox.unconfirmed"))).scalars().one()
+    named = {e.payload["id"]: e.payload["envelope_id"] for e in (await db.execute(select(Event).where(Event.kind == "outbox.sent"))).scalars().all()}
+    assert named == {reply.id: reply.envelope["id"], ack.id: ack.envelope["id"]}, "the record names the envelope that went out"
     # a reply given up after a week returns its message to `new`
     m2 = InboxMessage(id="m2", channel="chat", from_account="c" * 64, to_account="d" * 64, pub_key="p" * 64, body="q",
                       timestamp=now, signature="s", pow_nonce=0, verified=True, status="new")
@@ -2316,6 +2407,119 @@ async def test_a_passed_resolution_stays_passed_and_a_failed_step_stops_nothing_
     assert lapsed.status == "expired", "the pause clock ran"
     assert (await db.execute(select(SeenSignature))).scalars().all() == [], "the purge ran"
     assert "timers" in await last_runs(db)
+
+
+# ---- XE-2148: one envelope per reply; the node's store is the record of whether it went ---------------------
+
+async def test_a_reply_has_one_envelope_and_the_nodes_store_says_whether_it_went(db, monkeypatch):
+    from dao.models import OutboxMessage
+    ctx = _ctx()
+    ctx.signer = FakeSigner(("harness", "fee", "dao"))
+    store, offered, mode = [], [], {"send": "ok", "read": "ok"}
+
+    async def send(env):
+        offered.append(env["id"])
+        if mode["send"] == "refuse":
+            raise XeError(503, "peer unreachable")
+        if env["id"] not in [e["id"] for e in store]:   # a node keeps one copy per envelope id
+            store.append(env)
+        if mode["send"] == "lose-answer":
+            raise XeError(0, "ReadTimeout")
+
+    async def messages(proof, since):
+        if mode["read"] != "ok":
+            raise XeError(0, "ConnectError")
+        return [e for e in store if e["timestamp"] > since]
+
+    async def proof(ctx_):
+        return {}
+    ctx.chain.chat_send, ctx.chain.chat_messages = send, messages
+    monkeypatch.setattr(inbox, "read_proof", proof)
+
+    def row(oid, status="queued", envelope=None):
+        o = OutboxMessage(id=oid, to_account="c" * 64, body=oid, status=status, in_reply_to="m", from_seat="harness",
+                          envelope=envelope or {}, error="")
+        db.add(o)
+        return o
+
+    # 1. the node took the envelope and its answer was lost: the reply went once, and is recorded once
+    o1 = row("o1")
+    await db.commit()
+    mode["send"] = "lose-answer"
+    assert await inbox.flush_outbox(ctx, db) == 0
+    first = o1.envelope["id"]
+    assert o1.status == "sending" and offered == [first] and "ReadTimeout" in o1.error
+    mode["send"] = "ok"
+    assert await inbox.flush_outbox(ctx, db) == 1
+    assert o1.status == "sent" and o1.envelope["id"] == first and offered == [first] and len(store) == 1, \
+        "the store held it, so nothing was built or offered a second time"
+    named = [e.payload["envelope_id"] for e in (await db.execute(select(Event).where(Event.kind == "outbox.sent"))).scalars().all()]
+    assert named == [first]
+
+    # 2. every way a `sending` row can stand, by the age of its envelope and what the store holds
+    now = time.time_ns()
+
+    def sending(oid, age_s, held=False):
+        env = {"id": f"env-{oid}", "timestamp": now - age_s * inbox.NS, "message": oid, "to": "c" * 64}
+        if held:
+            store.append(env)
+        return row(oid, "sending", env)
+    rows = {o.id: o for o in (sending("held", 3600, held=True), sending("fresh", 30), sending("limbo", 300),
+                              sending("expired", 3600), row("blank", "sending"))}
+    await db.commit()
+    assert inbox.FRESH_NS < 300 * inbox.NS < inbox.EXPIRED_NS
+    # the store cannot be read: nothing is concluded from that, in either direction. No row is called sent
+    # or given a new envelope; the fresh one is offered again as it is, which needs no reading of the store
+    offered.clear()
+    mode["read"] = "down"
+    assert await inbox.flush_outbox(ctx, db) == 2
+    assert {k: rows[k].status for k in ("held", "limbo", "expired")} == dict.fromkeys(("held", "limbo", "expired"), "sending")
+    assert rows["fresh"].status == "sent" and rows["fresh"].envelope["id"] == "env-fresh", \
+        "still fresh: the same envelope again, which the node keeps one copy of"
+    assert rows["blank"].status == "sent" and offered == ["env-fresh", rows["blank"].envelope["id"]], \
+        "a row marked sending with no envelope had nothing offered: it is built and sent like a queued one"
+    # the store answers
+    offered.clear()
+    mode["read"] = "ok"
+    assert await inbox.flush_outbox(ctx, db) == 2
+    assert rows["held"].status == "sent" and "env-held" not in offered, "in the store: sent, however old, and not offered"
+    assert rows["limbo"].status == "sending" and "env-limbo" not in offered, \
+        "too old to be sure a node takes it, too young to be sure none did: left for the store to answer"
+    assert rows["expired"].status == "sent" and rows["expired"].envelope["id"] != "env-expired" and "env-expired" not in offered, \
+        "never held and past any node's window: only now is a second envelope built"
+    assert len(offered) == 1 and len({e["id"] for e in store}) == len(store)
+    # an item in the store whose id is not a string matches nothing and breaks nothing
+    store.append({"id": ["env-limbo"], "timestamp": now, "message": "x", "to": "c" * 64})
+    assert await inbox.flush_outbox(ctx, db) == 0 and rows["limbo"].status == "sending"
+    store.pop()
+    # an envelope's age is its age when the store was asked. The pass here is slow enough for this envelope
+    # to cross from fresh to expired while it runs; judged afterwards it would be given up and replaced on
+    # the word of a store that was asked while a node would still have taken it
+    slow = sending("slow", 0)
+    slow.envelope = {**slow.envelope, "timestamp": time.time_ns() - inbox.FRESH_NS + 30 * inbox.NS}
+    await db.commit()
+
+    async def slow_messages(proof, since):
+        monkeypatch.setattr(inbox, "time", SimpleNamespace(time_ns=lambda: time.time_ns() + 10 * 60 * inbox.NS))
+        return []
+    ctx.chain.chat_messages = slow_messages
+    offered.clear()
+    mode["send"] = "refuse"
+    assert await inbox.flush_outbox(ctx, db) == 0
+    monkeypatch.setattr(inbox, "time", time)
+    ctx.chain.chat_messages = messages
+    assert slow.status == "sending" and slow.envelope["id"] == "env-slow" and offered == ["env-slow"], \
+        "not replaced on that reading: the envelope it was asked about is the one still in play"
+    slow.status = "sent"
+    await db.commit()
+    # a fresh envelope the node refuses keeps its id for the next pass
+    again = sending("again", 30)
+    await db.commit()
+    offered.clear()
+    mode["send"] = "refuse"
+    assert await inbox.flush_outbox(ctx, db) == 0 and await inbox.flush_outbox(ctx, db) == 0
+    assert again.status == "sending" and again.envelope["id"] == "env-again" and offered == ["env-again"] * 2
+    assert "peer unreachable" in again.error
 
 
 # ---- XE-2209: one bad item from the node costs one item ----------------------------------------------------

@@ -21,7 +21,7 @@ from fastapi import HTTPException
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from xe.chat import ChatError, Envelope, new_envelope, verify_envelope
+from xe.chat import MAX_ENVELOPE_SKEW_NS, ChatError, Envelope, new_envelope, verify_envelope
 from xe.chat_auth import chat_read_proof
 from xe.pow import WORKER_POW_DEADLINE_S
 
@@ -29,7 +29,6 @@ from ..auth import Verified, require_pow
 from ..context import Context
 from ..log import EventLog
 from ..models import InboxMessage, OutboxMessage
-from ..signer import SignerError
 from ..text import clean_text, field_text, has_bad_control, scrub
 from . import pause
 
@@ -155,22 +154,52 @@ async def set_status(ctx: Context, db: AsyncSession, m: InboxMessage, v: Verifie
     return m
 
 
+# The outbox, in one rule (XE-2148): a reply has one envelope at a time, the envelope is on disk before it
+# is offered, and the row says `sent` only when the node has said it took that envelope or the node's own
+# store holds it. Nothing is concluded from a send that raised: the node stores an envelope after the
+# recipient's node has it and before it answers, so a timeout says nothing about delivery.
+#
+#   queued    no envelope is in play. One is built (signed, worked) and committed with the row.
+#   sending   an envelope is in play. While it is fresh it is offered again as it is, which is safe however
+#             many times it happens: the node and the recipient both keep one copy per envelope id. Once it
+#             is too old for any node to take, the node's store says whether it ever landed: there, the row
+#             is `sent`; not there, the row is `queued` again and a new envelope is built.
+#   sent      the node took the envelope.
+#
+# The earlier versions each named the failure they had seen (a commit lost after the send, then a pass that
+# died mid-send) and guessed for the rest; the guess for "the send raised" was "not taken", and the retry
+# went out under a new id that nothing could match to the first.
+#
+# What this cannot see, stated rather than guessed at: the node's chat store is in memory and bounded, so a
+# node restarted (or an account's store evicted) between a send and the read-back looks like "never held",
+# and the reply goes out again under a new id; and a recipient whose node stored the envelope while ours
+# never did (the answer between the two nodes was lost) is offered a second one after the first has expired.
+
+FRESH_NS = MAX_ENVELOPE_SKEW_NS - 60 * 1_000_000_000     # still worth offering: a node will take it
+EXPIRED_NS = MAX_ENVELOPE_SKEW_NS + 60 * 1_000_000_000   # no node will take it now, whatever its clock
+
+
 async def flush_outbox(ctx: Context, db: AsyncSession) -> int:
-    """Worker: send queued replies from the DAO account over chat. PoW off the loop. Each row is marked and
-    committed as soon as its envelope has gone out, before the next is built: a crash or a pause landing
-    mid-batch cannot roll a delivered reply back to `queued` and send it twice (XE-1487, the rule from
-    XE-0486 on the fee path)."""
-    if not ctx.signer.has("dao") or await pause.is_paused(db):
+    """Worker: send queued replies from the DAO account over chat. PoW off the loop. Every row is committed
+    at each step it takes, so a crash or a pause landing mid-batch leaves each row saying exactly how far
+    it got. Returns how many rows became `sent`.
+
+    Under a pause nothing is built and nothing is offered. What was offered before the pause is still
+    looked up in the node's store, which is a read: a reply the node took is recorded as sent while the
+    store still holds it, rather than after a pause that may outlast the store."""
+    if not ctx.signer.has("dao"):
         return 0
-    await _settle_unconfirmed(ctx, db)
+    n = await _resolve_sending(ctx, db)
+    if await pause.is_paused(db):
+        return n
     # Members' replies before acknowledgements, oldest first (XE-1845).
     order = (case((OutboxMessage.from_seat == "harness", 1), else_=0), OutboxMessage.created_at.asc())
     rows = list((await db.execute(select(OutboxMessage).where(OutboxMessage.status == "queued").order_by(*order).limit(10))).scalars().all())
-    n = 0
     give_up_before = datetime.now(timezone.utc) - timedelta(days=OUTBOX_RETRY_DAYS)
     for o in rows:
         if o.created_at and o.created_at < give_up_before:
-            # retried on every tick for a week; the channel is not going to open. Stop, and say so on the record.
+            # retried for a week; the channel is not going to open. Stop, and say so on the record.
+            await _lock_answered(db, o)
             o.status = "failed"
             await ctx.events.append(db, "outbox.failed", "harness", {"id": o.id, "to": o.to_account, "error": o.error[:300]},
                                     ref=f"inbox:{o.in_reply_to}")
@@ -181,38 +210,97 @@ async def flush_outbox(ctx: Context, db: AsyncSession) -> int:
             kp = ctx.signer.keypair("dao", "chat.send")
             env = await asyncio.to_thread(new_envelope, kp, o.to_account, o.body, ctx.node.chat_pow_difficulty,
                                           None, WORKER_POW_DEADLINE_S)
-            if await pause.is_paused(db):   # read after the work, right before the send (XE-1172)
-                return n
-            # At most once: the intent to send is on disk before the send, so a commit that fails after it
-            # cannot roll a delivered reply back to `queued` and send it again under a new id (XE-1729).
-            o.status, o.envelope = "sending", env.to_json()
-            await db.commit()
-            await ctx.chain.chat_send(env.to_json())
-            o.status = "sent"
-            o.sent_at = datetime.now(timezone.utc)
-            await ctx.events.append(db, "outbox.sent", "harness", {"id": o.id, "envelope_id": env.id, "to": o.to_account},
-                                    ref=f"inbox:{o.in_reply_to}")
-            await _reply_outcome(ctx, db, o, delivered=True)
-            n += 1
-        except (SignerError, ChatError, Exception) as e:
-            o.status = "queued"   # the node did not take it; it goes again
+        except Exception as e:   # nothing was built, so nothing was offered: the row is still `queued`
             o.error = str(e)[:500]
-            log.warning("outbox send failed %s: %s", o.id, e)
+            log.warning("outbox %s: no envelope built: %s", o.id, e)
+            await db.commit()
+            continue
+        if await pause.is_paused(db):   # read after the work, right before the send (XE-1172)
+            return n                    # the envelope is discarded; the row is still `queued`
+        o.status, o.envelope, o.error = "sending", env.to_json(), ""
+        await db.commit()
+        n += await _offer(ctx, db, o)
+    return n
+
+
+async def _offer(ctx: Context, db: AsyncSession, o: OutboxMessage) -> bool:
+    """Offer a `sending` row's envelope to the node. True: the node took it and the row is `sent`. False:
+    the send raised, which says nothing either way, so the row stays `sending` for `_resolve_sending`.
+    The caller has read the pause."""
+    try:
+        await ctx.chain.chat_send(o.envelope)
+    except Exception as e:
+        o.error = str(e)[:500]
+        log.warning("outbox %s: send of %s raised; outcome unknown: %s", o.id, str(o.envelope.get("id"))[:12], e)
+        await db.commit()
+        return False
+    await _sent(ctx, db, o)
+    await db.commit()
+    return True
+
+
+async def _lock_answered(db: AsyncSession, o: OutboxMessage) -> None:
+    """Locks are taken in one order everywhere: the inbox message, then the log head. A member's reply or
+    status change holds the message while it appends its event, so the outbox takes the message before it
+    appends what became of the reply, not after; the other way round, the two wait on each other."""
+    if o.from_seat != "harness":
+        await db.execute(select(InboxMessage.id).where(InboxMessage.id == o.in_reply_to).with_for_update())
+
+
+async def _sent(ctx: Context, db: AsyncSession, o: OutboxMessage) -> None:
+    await _lock_answered(db, o)
+    o.status, o.sent_at, o.error = "sent", datetime.now(timezone.utc), ""
+    await ctx.events.append(db, "outbox.sent", "harness", {"id": o.id, "envelope_id": o.envelope["id"], "to": o.to_account},
+                            ref=f"inbox:{o.in_reply_to}")
+    await _reply_outcome(ctx, db, o, delivered=True)
+
+
+async def _resolve_sending(ctx: Context, db: AsyncSession) -> int:
+    """Rows whose envelope was offered (or was about to be) and whose outcome is not on disk. The node's
+    store is asked once for all of them. A store that cannot be read concludes nothing: no row becomes
+    `sent` or `queued` on its account, and an envelope still fresh is offered again all the same."""
+    rows = list((await db.execute(select(OutboxMessage).where(OutboxMessage.status == "sending")
+                                  .order_by(OutboxMessage.created_at.asc()))).scalars().all())
+    for o in [o for o in rows if not _in_play(o)]:   # no envelope to look for: nothing can have been offered
+        o.status = "queued"
+        rows.remove(o)
+    await db.commit()
+    if not rows:
+        return 0
+    # An envelope's age is taken once, as the store is asked. "Not in the store and expired" is only the
+    # end of an envelope if it had expired before the store answered; measured later, row by row, a pass
+    # slowed by its own sends would call one expired that a node could still have taken after the read.
+    asked_at = time.time_ns()
+    held: set[str] | None = None
+    try:
+        since = min(o.envelope["timestamp"] for o in rows) - 1
+        store = await ctx.chain.chat_messages(await read_proof(ctx), since)
+        held = {d["id"] for d in store if isinstance(d.get("id"), str)}
+    except Exception as e:   # nothing is concluded for any row; a fresh envelope can still be offered again
+        log.warning("outbox: %d replies in play and the node's chat store cannot be read: %s", len(rows), e)
+    n = 0
+    for o in rows:
+        age = asked_at - o.envelope["timestamp"]
+        if held is not None and o.envelope["id"] in held:
+            await _sent(ctx, db, o)   # a record of what happened; nothing is written to the node
+            n += 1
+        elif age < FRESH_NS:
+            # the same envelope again, which no reading of the store is needed for: both nodes keep one copy
+            # per id. The pause is read here, after the store was (XE-1172); under one, nothing is offered.
+            if not await pause.is_paused(db):
+                n += await _offer(ctx, db, o)
+        elif held is not None and age > EXPIRED_NS:
+            o.status = "queued"
+            o.error = (f"the node never held the envelope and it is now too old to offer; a new one will be built"
+                       f"{'. The last send said: ' + o.error if o.error else ''}")[:500]
         await db.commit()
     return n
 
 
-async def _settle_unconfirmed(ctx: Context, db: AsyncSession) -> None:
-    """A row found `sending` was handed to the node before the pass that wrote it ended; whether the node
-    took it is unknown. It is not sent again: a reply goes out at most once, and the uncertainty is on the
-    record (XE-1729)."""
-    for o in (await db.execute(select(OutboxMessage).where(OutboxMessage.status == "sending"))).scalars().all():
-        o.status, o.sent_at = "sent", datetime.now(timezone.utc)
-        o.error = "delivery unconfirmed: the pass that sent it did not finish"
-        await ctx.events.append(db, "outbox.unconfirmed", "harness", {"id": o.id, "to": o.to_account},
-                                ref=f"inbox:{o.in_reply_to}")
-        await _reply_outcome(ctx, db, o, delivered=True)
-    await db.commit()
+def _in_play(o: OutboxMessage) -> bool:
+    e = o.envelope if isinstance(o.envelope, dict) else {}
+    ts = e.get("timestamp")
+    return isinstance(e.get("id"), str) and bool(e["id"]) and isinstance(ts, int) and not isinstance(ts, bool)
 
 
 async def _reply_outcome(ctx: Context, db: AsyncSession, o: OutboxMessage, *, delivered: bool) -> None:

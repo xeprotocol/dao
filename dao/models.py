@@ -205,7 +205,7 @@ class OutboxMessage(Base):
     to_account: Mapped[str] = mapped_column(String(64), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     envelope: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")  # queued | sent | failed
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")  # queued | sending | sent | failed
     error: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
