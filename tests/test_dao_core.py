@@ -877,3 +877,419 @@ def test_same_ops_compares_values_by_meaning_not_bytes():
     assert not same_ops(a, [{"action": "set", "key": "dao.x", "value": '{"a":2,"b":2}'}, b[1]])
     assert not same_ops(a, [{"action": "set", "key": "dao.z", "value": '{"a":2,"b":1}'}, b[1]])
     assert not same_ops(None, a) and not same_ops(a, None)
+# ---- XE-2209 / XE-1935 / XE-2305 / XE-2353: what the node sends is input, bounded and typed in one place ----
+
+def _node(handler):
+    import httpx
+
+    from xe.client import XeClient
+    return XeClient("http://node", transport=httpx.MockTransport(handler))
+
+
+_HOSTILE = [
+    b"", b"null", b"[]", b"{}", b'"x"', b"1", b"1.5", b"true", b"<html>busy</html>", b"[" * 100_000,
+    b'{"blocks":1}', b'{"blocks":[1]}', b'{"blocks":[{"amount":"x"}],"total":"y"}', b'{"blocks":[{"hash":5}],"total":1}',
+    b'{"blocks":[{"hash":"a","balance":1.5}],"total":1}', b'{"blocks":[],"total":-1}', b'{"blocks":[],"total":7}',
+    b'{"blocks":null,"total":null}', b'{"blocks":[{"hash":"a"},{"hash":"b"},{"hash":"c"}],"total":3}',
+    b'{"balances":[]}', b'{"balances":{"XE":1.5}}', b'{"balances":{"XE":-1}}', b'{"balances":{"XE":true}}',
+    b'{"balances":{"XE":null}}', b'{"balances":{"XE":"12x"}}', b'{"balances":{"XE":18446744073709551616}}',
+    b'{"pending":5}', b'{"pending":[1]}', b'{"pending":[{"Amount":[]}]}', b'{"pending":[{"amount":"1","SendHash":7}]}',
+    b'{"keys":[1],"threshold":1}', b'{"keys":5,"threshold":"x"}', b'{"keys":["AB"]}', b'{"threshold":2}',
+    b'{"index":{},"timestamp":[],"hash":5}', b'{"index":1,"timestamp":2}', b'{"hash":"h","index":"-1"}',
+    b'{"challenge":"zz"}', b'{"challenge":5}', b'{"key":"k","value":{"a":[1]}}', b'[{"id":1},2,"x",null]',
+    b'{"type":"send","amount":"9","timestamp":1e3}', b'{"error":"no"}', b"\xff\xfe",
+]
+
+
+async def test_every_node_read_returns_its_types_or_fails_as_xeerror():
+    """The rule, across every read the client has and every status the node can answer with: whatever
+    the body, the call returns or raises XeError. Nothing from httpx, json or a conversion escapes, so no
+    caller needs a second except clause, and none is taken down by a body it did not expect."""
+    import inspect
+
+    import httpx
+
+    from xe.client import XeClient, XeError
+    a, proof = "a" * 64, {"account": "a" * 64, "challenge": "00", "signature": "00", "pub_key": "00"}
+    reads = {
+        "node": (), "ready": (), "chain": (a,), "full_chain": (a,), "chain_end": (a,), "tip": (a,), "keyset_of": (a,),
+        "pending_for": (a,), "balances": (a,), "block": ("h",), "statechain_tip": (), "statechain_block": (3,),
+        "statechain_key": ("dao.x",), "dao_keyset": (), "directory": (a,), "chat_challenge": (), "chat_messages": (proof,),
+    }
+    writes = {"submit_block", "submit_statechain_block", "directory_register", "chat_send", "chat_events", "aclose"}
+    public = {n for n, f in inspect.getmembers(XeClient, inspect.isfunction) if not n.startswith("_")}
+    assert public == set(reads) | writes, "a new client method is added to this test, typed, or not added at all"
+    for status in (200, 404, 500):
+        for body in _HOSTILE:
+            c = _node(lambda request: httpx.Response(status, content=body))
+            for name, args in reads.items():
+                try:
+                    await getattr(c, name)(*args)
+                except XeError:
+                    pass
+                except BaseException as e:   # noqa: BLE001 - the assertion is that there is no such thing
+                    raise AssertionError(f"{name} let {type(e).__name__} out for {status} {body[:40]!r}") from e
+            await c.aclose()
+
+    def refuse(request):
+        raise httpx.ConnectError("refused")
+    c = _node(refuse)
+    for name, args in reads.items():
+        with pytest.raises(XeError) as e:
+            await getattr(c, name)(*args)
+        assert e.value.status == 0 and e.value.transient, name
+
+
+async def test_node_fields_the_harness_computes_with_are_integers_or_the_response_is_refused():
+    import httpx
+
+    from xe.client import XeError
+    body = {}
+    c = _node(lambda request: httpx.Response(200, json=body["v"]))
+
+    async def refused(call, *args):
+        with pytest.raises(XeError) as e:
+            await call(*args)
+        assert e.value.status == 0 and "malformed" in e.value.message, body["v"]
+
+    # a decimal string is the number it spells; nothing else is a number
+    body["v"] = {"balances": {"XE": "12", "XUSD": 7}}
+    assert await c.balances("a") == {"XE": 12, "XUSD": 7}
+    for bad in (1.5, -1, True, None, "12x", "", "١٢", "1" * 21, 2**64, [], {}):
+        body["v"] = {"balances": {"XE": bad}}
+        await refused(c.balances, "a")
+    for field in ("balance", "timestamp", "amount"):
+        for bad in (1.5, -1, True, "x", [], {}):
+            body["v"] = {"blocks": [{"hash": "h", field: bad}], "total": 1}
+            await refused(c.chain, "a")
+            body["v"] = {"hash": "h", field: bad}
+            await refused(c.block, "h")
+    for field in ("type", "account", "previous", "asset", "source", "destination", "hash"):
+        body["v"] = {"blocks": [{field: 5}], "total": 1}
+        await refused(c.chain, "a")
+    body["v"] = {"blocks": [{"hash": "h", "amount": "9", "timestamp": 3, "memo": None, "finalized": True}], "total": "1"}
+    page = await c.chain("a")
+    assert page == {"blocks": [{"hash": "h", "amount": 9, "timestamp": 3, "finalized": True}], "total": 1}
+    # a page is never longer than was asked for
+    body["v"] = {"blocks": [{"hash": "1"}, {"hash": "2"}], "total": 2}
+    await refused(lambda: c.chain("a", limit=1))
+    # pending entries, either spelling of the keys
+    body["v"] = {"pending": [{"SendHash": "s", "Amount": "5", "Source": "x"}, {"send_hash": "t", "amount": 6}]}
+    assert [(p["send_hash"], p["amount"], p["asset"], p["timestamp"]) for p in await c.pending_for("a")] == \
+        [("s", 5, "XE", 0), ("t", 6, "XE", 0)]
+    for bad in ({"pending": [{"Amount": 1.5}]}, {"pending": [{"SendHash": 5}]}, {"pending": [[]]}, {"pending": {}}):
+        body["v"] = bad
+        await refused(c.pending_for, "a")
+    # the state chain and the keyset
+    body["v"] = {"index": "4", "timestamp": 9, "hash": "h"}
+    assert await c.statechain_tip() == {"index": 4, "timestamp": 9, "hash": "h"}
+    for bad in ({"index": 4, "timestamp": 9}, {"index": 4.0, "timestamp": 9, "hash": "h"}, {"index": 4, "timestamp": 9, "hash": 7}, []):
+        body["v"] = bad
+        await refused(c.statechain_tip)
+    body["v"] = {"keys": ["AB", "cd"], "threshold": 2}
+    assert await c.dao_keyset() == {"keys": ["ab", "cd"], "threshold": 2}
+    for bad in ({"keys": ["ab", 5], "threshold": 1}, {"keys": "ab", "threshold": 1}, {"keys": ["ab"]}, {"keys": ["ab"], "threshold": "x"}):
+        body["v"] = bad
+        await refused(c.dao_keyset)
+    await c.aclose()
+
+
+async def test_a_response_is_read_under_a_size_cap_and_a_total_deadline(monkeypatch):
+    """XE-2305, XE-1935: on every call, since every call goes through `_send`. A body past the cap is
+    refused before it is all buffered; a node that drips is cut off at the deadline, however short each
+    silence is; a chat stream that goes silent ends, and so does one whose line never does."""
+    import asyncio
+
+    import httpx
+
+    from xe import client as xc
+
+    class Drip(httpx.AsyncByteStream):
+        def __init__(self, chunk=b" ", every=0.01, count=10**9):
+            self.chunk, self.every, self.count, self.sent = chunk, every, count, 0
+
+        async def __aiter__(self):
+            while self.sent < self.count:
+                await asyncio.sleep(self.every)
+                self.sent += 1
+                yield self.chunk
+
+    monkeypatch.setattr(xc, "MAX_BODY_BYTES", 4096)
+    big = Drip(chunk=b"x" * 1024, every=0, count=10**6)
+    c = _node(lambda request: httpx.Response(200, stream=big))
+    for call in (lambda: c.balances("a"), lambda: c.chain("a"), lambda: c.statechain_tip(), lambda: c.chat_send({}),
+                 lambda: c.ready()):
+        big.sent = 0
+        with pytest.raises(xc.XeError) as e:
+            await call()
+        assert e.value.status == 0 and "exceeds" in e.value.message and big.sent <= 6, "stopped reading at the cap"
+    await c.aclose()
+
+    monkeypatch.setattr(xc, "REQUEST_DEADLINE_S", 0.2)
+    slow = Drip()
+    c = _node(lambda request: httpx.Response(200, stream=slow))
+    t0 = time.monotonic()
+    with pytest.raises(xc.XeError) as e:
+        await c.balances("a")
+    assert e.value.status == 0 and e.value.transient and time.monotonic() - t0 < 2
+
+    async def never(request):
+        await asyncio.sleep(3600)
+    c2 = _node(never)
+    with pytest.raises(xc.XeError):
+        await c2.statechain_tip()
+    await c.aclose(), await c2.aclose()
+
+    # the chat stream: no total deadline, an idle limit and a line cap
+    monkeypatch.setattr(xc, "STREAM_IDLE_S", 0.2)
+
+    class Stream(httpx.AsyncByteStream):
+        def __init__(self, parts, then=None):
+            self.parts, self.then = parts, then
+
+        async def __aiter__(self):
+            for p in self.parts:
+                yield p
+            if self.then == "hang":
+                await asyncio.sleep(3600)
+            while self.then == "flood":
+                yield b"x" * 4096
+
+    async def read(stream):
+        c = _node(lambda request: httpx.Response(200, stream=stream))
+        got = []
+        try:
+            async for item in c.chat_events({"account": "a"}):
+                got.append(item)
+        finally:
+            await c.aclose()
+        return got
+
+    lines = [b'data: {"id":"1"}\n\n: ping\n\ndata: [1]\n\nda', b'ta: {"id":"2"}\n', b"data: not json\n", b'data: {"id":"3"}\n']
+    assert await read(Stream(lines)) == [{"id": "1"}, {"id": "2"}, {"id": "3"}]
+    for then, says in (("hang", "silent"), ("flood", "exceeds")):
+        got = []
+        c = _node(lambda request: httpx.Response(200, stream=Stream(lines, then)))
+        t0 = time.monotonic()
+        with pytest.raises(xc.XeError) as e:
+            async for item in c.chat_events({"account": "a"}):
+                got.append(item)
+        assert says in e.value.message and e.value.status == 0 and time.monotonic() - t0 < 2
+        assert [g["id"] for g in got] == ["1", "2", "3"], "what arrived before the stream died was delivered"
+        await c.aclose()
+    c = _node(lambda request: httpx.Response(401))
+    with pytest.raises(xc.XeError) as e:
+        async for _ in c.chat_events({"account": "a"}):
+            pass
+    assert e.value.status == 401
+    await c.aclose()
+
+
+async def test_what_the_client_returns_can_be_kept_and_only_a_2xx_is_an_answer():
+    """The other half of the boundary. Node data ends up in JSONB and text columns, where one value
+    Postgres will not take fails the whole write it rides in on; and "nothing there" is acted on (an empty
+    account, an unregistered entry), so only the node saying so, with a 404, is taken for it."""
+    import gzip
+
+    import httpx
+
+    from xe import client as xc
+    from xe.client import PAGE, XeError
+    a, proof = "a" * 64, {"account": "a" * 64, "challenge": "00", "signature": "00", "pub_key": "00"}
+    reply = {}
+    c = _node(lambda request: reply["v"](request) if callable(reply["v"]) else httpx.Response(200, content=reply["v"]))
+
+    async def refused(call, says=""):
+        with pytest.raises(XeError) as e:
+            await call()
+        assert e.value.status == 0 and says in e.value.message, (reply["v"], e.value.message)
+
+    # not JSON, not storable as JSON, not text: refused whichever read it arrives in
+    nul = '{"key":"k","value":"a\\u0000b"}'
+    unkeepable = (b'{"key":"k","value":NaN}', b'{"key":"k","value":[1,Infinity]}', b'{"key":"k","value":-Infinity}',
+                  nul.encode(), b'{"key":"k","value":{"a\\u0000":1}}', b'{"key":"k","value":"\\ud800"}',
+                  # the same NUL in the encodings a lenient parser guesses: the body is UTF-8 or it is refused
+                  nul.encode("utf-16-le"), nul.encode("utf-16"), nul.encode("utf-32-be"), '{"key":"k","value":"plain"}'.encode("utf-16"))
+    for body in unkeepable:
+        reply["v"] = body
+        await refused(lambda: c.statechain_key("dao.x"))
+    reply["v"] = b'{"key":"k","value":"\\ud83d\\ude00 a pair is a character"}'
+    assert (await c.statechain_key("dao.x")).startswith("\U0001f600")
+    reply["v"] = b'{"key":"k","value":"a backslash, then u0000: \\\\u0000"}'
+    assert (await c.statechain_key("dao.x")).endswith("\\u0000"), "six characters of text, not a NUL"
+    for body in (b'{"blocks":[{"hash":"h","memo":"a\\u0000"}],"total":1}', b'{"blocks":[{"hash":"h","extra":NaN}],"total":1}'):
+        reply["v"] = body
+        await refused(lambda: c.chain(a))
+    reply["v"] = b'[{"id":"1","message":"x\\u0000"}]'
+    await refused(lambda: c.chat_messages(proof))
+    # an error's text is stored too
+    reply["v"] = lambda request: httpx.Response(400, content=b"bad \x00 block")
+    with pytest.raises(XeError) as e:
+        await c.balances(a)
+    assert e.value.status == 400 and "\x00" not in str(e.value)
+
+    # only a 2xx is an answer: a redirect is not followed, is not a success, and is not the node's refusal
+    for status in (301, 302, 307, 308):
+        reply["v"] = lambda request, s=status: httpx.Response(s, headers={"location": "http://elsewhere/"}, json={"balances": {"XE": 5}})
+        for call in (lambda: c.balances(a), lambda: c.directory(a), lambda: c.chat_send({}), lambda: c.directory_register({})):
+            with pytest.raises(XeError) as e:
+                await call()
+            assert e.value.status == status and e.value.transient
+    # a read that comes back empty is not "nothing there"; a 404 is; a null that was found is not
+    for body in (b"", b"null"):
+        reply["v"] = body
+        for call in (lambda: c.balances(a), lambda: c.keyset_of(a), lambda: c.directory(a), lambda: c.chain(a), lambda: c.pending_for(a)):
+            await refused(call, "malformed")
+    await refused(lambda: c.statechain_key("dao.x"), "malformed")   # reply is still `null`: found, and not a value
+    reply["v"] = lambda request: httpx.Response(404, json={"error": "not found"})
+    assert await c.balances(a) == {} and await c.keyset_of(a) is None and await c.directory(a) is None
+    assert await c.statechain_key("dao.x") is None
+
+    # a chain that was there a moment ago and is a 404 now is not an account with no chain
+    def vanishing(request):
+        offset = int(request.url.params["offset"])
+        if offset == 0:
+            return httpx.Response(200, json={"blocks": [{"hash": f"b{i}"} for i in range(int(request.url.params["limit"]))], "total": 5 * PAGE})
+        return httpx.Response(404, json={"error": "account not found"})
+    reply["v"] = vanishing
+    for call in (lambda: c.chain_end(a), lambda: c.tip(a), lambda: c.full_chain(a)):
+        await refused(call, "malformed")
+
+    # compressed: asked not to be, and refused unread if it is, since the size cap counts what is sent
+    seen = []
+
+    def squeezed(request):
+        seen.append(request.headers.get("accept-encoding"))
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, content=gzip.compress(b'{"balances":{"XE":5}}'))
+    reply["v"] = squeezed
+    await refused(lambda: c.balances(a), "gzip")
+    assert seen == ["identity"]
+    got = []
+    with pytest.raises(XeError) as e:
+        async for item in c.chat_events({"account": a}):
+            got.append(item)
+    assert "gzip" in e.value.message and got == []
+
+    # a value too long to put in a URL fails as the node failing, like everything else
+    reply["v"] = b"{}"
+    await refused(lambda: c.statechain_key("k" * 100_000))
+    await refused(lambda: c.chat_messages({**proof, "challenge": "0" * 100_000}))
+    await refused(lambda: c.statechain_key("dao.\ud800"), "not text")   # and so does one that is not text
+
+    # bounds on what is stored or sent back: a keyset's threshold, the tip's hash, /ready, the chat challenge
+    for ks in ({"keys": ["ab", "cd"], "threshold": 0}, {"keys": ["ab", "cd"], "threshold": 3}, {"keys": [], "threshold": 0}):
+        reply["v"] = json.dumps(ks).encode()
+        await refused(c.dao_keyset, "threshold")
+        await refused(lambda: c.keyset_of(a), "threshold")
+    reply["v"] = b'{"keys":["AB","cd"],"threshold":2,"address":"x"}'
+    assert await c.keyset_of(a) == {"keys": ["ab", "cd"], "threshold": 2, "address": "x"}
+    reply["v"] = b'{"address":"x"}'
+    assert await c.keyset_of(a) == {"address": "x"}, "an account that is not multisig"
+    reply["v"] = json.dumps({"index": 4, "timestamp": 9, "hash": "h" * 10_000}).encode()
+    await refused(c.statechain_tip, "hash")
+    reply["v"] = json.dumps({"balances": {"XE": 2**63}}).encode()
+    await refused(lambda: c.balances(a), "range")
+    reply["v"] = json.dumps({"balances": {"XE": 2**63 - 1}}).encode()
+    assert await c.balances(a) == {"XE": 2**63 - 1}, "the most a BIGINT column holds"
+    reply["v"] = json.dumps({"status": "ready", "padding": "x" * xc.MAX_READY_BYTES}).encode()
+    ok, body = await c.ready()
+    assert ok and isinstance(body, str) and len(body) <= xc.MAX_ERROR_CHARS
+    reply["v"] = b'{"status":"ready"}'
+    assert await c.ready() == (True, {"status": "ready"})
+    reply["v"] = json.dumps({"challenge": "ab" * xc.MAX_CHALLENGE_CHARS}).encode()
+    await refused(c.chat_challenge, "challenge")
+    for network in (5, ["x"], {"a": 1}):
+        reply["v"] = json.dumps({"network_id": network}).encode()
+        await refused(c.node, "network_id")
+    await c.aclose()
+
+    # the chat stream: the same parser, so an item that cannot be kept is skipped and costs only itself;
+    # and a whole line past the cap is refused when it arrives in one piece, as when it never ends
+    class Stream(httpx.AsyncByteStream):
+        def __init__(self, parts):
+            self.parts = parts
+
+        async def __aiter__(self):
+            for p in self.parts:
+                yield p
+
+    async def read(parts):
+        s = _node(lambda request: httpx.Response(200, stream=Stream(parts)))
+        got = []
+        try:
+            async for item in s.chat_events({"account": a}):
+                got.append(item)
+        finally:
+            await s.aclose()
+        return got
+    lines = [b'data: {"id":"1"}\n', b'data: {"id":"2","message":"x\\u0000"}\n', b'data: {"id":"3","message":"\\udc00"}\n',
+             b'data: {"id":"4","n":NaN}\n', b'data: {"id":"5"}\n']
+    assert [i["id"] for i in await read(lines)] == ["1", "5"]
+    with pytest.raises(XeError) as e:
+        await read([b'data: {"id":"1"}\n', b'data: {"id":"2","message":"' + b"x" * xc.MAX_STREAM_LINE + b'"}\n', b'data: {"id":"3"}\n'])
+    assert "exceeds" in e.value.message
+
+
+async def test_the_chain_walk_and_the_tip_do_not_take_the_nodes_total_on_trust():
+    """XE-2353: `total` is a claim. The walk ends on a short page only; the tip is the block at the end
+    of the chain or the read is refused."""
+    import httpx
+
+    from xe.client import PAGE, XeError
+    chain = [{"hash": f"b{i}", "previous": f"b{i - 1}" if i else "0"} for i in range(2 * PAGE + 7)]
+    claim = {}
+
+    def serve(request):
+        offset, limit = int(request.url.params["offset"]), int(request.url.params["limit"])
+        return httpx.Response(200, json={"blocks": chain[offset:offset + limit], "total": claim["total"]})
+    c = _node(serve)
+    for total in (len(chain), 0, 1, PAGE, 10**12):
+        claim["total"] = total
+        assert [b["hash"] for b in await c.full_chain("a")] == [b["hash"] for b in chain], total
+    claim["total"] = len(chain)
+    count, last = await c.chain_end("a")
+    assert count == len(chain) and last["hash"] == chain[-1]["hash"] and await c.tip("a") == chain[-1]["hash"]
+    for total in (0, 1, PAGE, len(chain) - 1, len(chain) + 1, 10**12):
+        claim["total"] = total
+        for call in (c.chain_end, c.tip):
+            with pytest.raises(XeError) as e:
+                await call("a")
+            assert e.value.status == 0 and "malformed" in e.value.message, total
+    await c.aclose()
+    # an account with no chain: an empty page, or 404
+    c = _node(lambda request: httpx.Response(200, json={"blocks": [], "total": 0}))
+    assert await c.chain_end("a") == (0, None) and await c.tip("a") == "0" and await c.full_chain("a") == []
+    await c.aclose()
+    c = _node(lambda request: httpx.Response(404, json={"error": "account not found"}))
+    assert await c.chain_end("a") == (0, None) and await c.tip("a") == "0"
+    await c.aclose()
+    c = _node(lambda request: httpx.Response(503, json={"error": "syncing"}))
+    with pytest.raises(XeError) as e:
+        await c.tip("a")
+    assert e.value.status == 503, "a node that cannot answer is not an empty account"
+    await c.aclose()
+
+
+def test_an_envelope_from_a_node_is_an_envelope_or_a_chaterror():
+    from xe.chat import MAX_MESSAGE_BYTES, ChatError, Envelope, new_envelope, verify_envelope
+    kp = KeyPair.generate()
+    env = new_envelope(kp, "b" * 64, "hello", 0)
+    back = Envelope.from_json(json.loads(json.dumps(env.to_json())))
+    assert back == env
+    verify_envelope(back, 0)
+    assert Envelope.from_json({}).to_json() == Envelope.from_json({k: None for k in env.to_json()}).to_json()
+    good = env.to_json()
+    hostile = [None, [], "x", 5, True, [good]]
+    for key in ("id", "from", "pub_key", "to", "signature", "message"):
+        hostile += [{**good, key: v} for v in (5, 1.5, [], {}, True, "a" * (MAX_MESSAGE_BYTES + 1))]
+    for key in ("timestamp", "pow_nonce"):
+        hostile += [{**good, key: v} for v in ("1", 1.5, True, -1, 2**64, [], {})]
+    hostile.append({**good, "timestamp": 2**63})
+    # text that is not text, or that no text column takes: an envelope's fields are stored as they come
+    for key in ("id", "from", "pub_key", "to", "signature", "message"):
+        hostile += [{**good, key: "a\x00b"}, {**good, key: "a\ud800b"}]
+    for item in hostile:
+        with pytest.raises(ChatError):
+            Envelope.from_json(item)
+
+

@@ -75,7 +75,7 @@ async def _verify_fee(ctx: Context, db: AsyncSession, fee_block_hash: str, autho
         raise HTTPException(400, f"fee must be sent to {fee_acct}")
     if (b.get("account") or "").lower() != author:
         raise HTTPException(400, "fee must be sent from the proposing account")
-    if int(b.get("amount", 0)) < fee:
+    if b.get("amount", 0) < fee:
         raise HTTPException(400, f"fee is {fee} µXE; block sends {b.get('amount')}")
     if b.get("finalized") is not True:
         # A seen-but-unfinalised send can still be dropped by the node (xeprotocol/xe#55, XE-0034).
@@ -109,7 +109,7 @@ async def submit(ctx: Context, db: AsyncSession, v: Verified) -> Proposal:
     db.add(pr)
     if fee:
         db.add(FeeLedger(fee_block_hash=fee_block_hash, proposal_hash=h, payer=v.account,
-                         amount=int(fee_block.get("amount", 0)), state="seen", tx_hashes={}))
+                         amount=fee_block.get("amount", 0), state="seen", tx_hashes={}))
     await ctx.events.append(db, "proposal.opened", v.actor, {
         "proposal": h, "title": title, "body": body, "ops": ops, "author": v.account, "fee_block_hash": fee_block_hash,
         "opened_at": now, "snapshot_at": snapshot_time(now), "closes_at": pr.closes_at, "rules": rules,

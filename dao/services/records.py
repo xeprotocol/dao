@@ -224,7 +224,7 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
     try:   # tip advancing
         tip = await ctx.chain.statechain_tip()
         detail["statechain_tip"] = {"index": tip.get("index"), "hash": tip.get("hash"), "timestamp": tip.get("timestamp")}
-        age_s = (now - int(tip.get("timestamp", 0))) / 1e9
+        age_s = (now - tip["timestamp"]) / 1e9
         detail["statechain_tip_age_s"] = round(age_s)
         if age_s > TIP_STALE_S:
             detail["tip_stale"] = True

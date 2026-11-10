@@ -155,9 +155,10 @@ async def require_unpaused(db: AsyncSession) -> None:
 
 
 async def live_keyset(ctx: Context) -> dict:
+    """`sys.dao_keyset` as the node serves it now: lower-case keys and an integer threshold, both checked
+    by the client. A keyset without a threshold is malformed, not a 2-of-n."""
     ks = await ctx.chain.dao_keyset()
-    keys = [k.lower() for k in (ks.get("keys") or [])]
-    return {"keys": keys, "threshold": int(ks.get("threshold", 2))}
+    return {"keys": [k.lower() for k in ks["keys"]], "threshold": ks["threshold"]}
 
 
 async def create(ctx: Context, db: AsyncSession, *, kind: str, title: str, ops: list[dict], actor: str,

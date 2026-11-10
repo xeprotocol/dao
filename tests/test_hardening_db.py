@@ -60,6 +60,86 @@ class FakeChain:
     async def dao_keyset(self):
         return {"keys": ["k1", "k2", "k3"], "threshold": 2}
 
+    async def statechain_tip(self):
+        raise XeError(404, "no tip")
+
+
+class LedgerChain(FakeChain):
+    """Account chains as a node keeps them, for the harness's own writes: a submitted block lands at the
+    tip if it is built on the tip and is refused otherwise; a receive takes its send off the pending list.
+
+    `on_submit(block)` stands in for a node that misbehaves. It is awaited before anything else and may
+    raise (the node refused, or never answered), return "drop" (the node says yes and keeps nothing) or
+    return "lose-answer" (the block lands and the answer does not arrive). `finalized` is what a block is
+    stored as; `finalize()` makes everything final."""
+
+    def __init__(self, finalized=True):
+        super().__init__()
+        self.ledger, self.pending, self.submits, self.finalized, self.on_submit = {}, [], [], finalized, None
+
+    def fund(self, account, amount, source="0" * 64, finalized=True):
+        """A receive of `amount` XE at the account's tip, as if the node had taken it earlier."""
+        chain = self.ledger.setdefault(account, [])
+        b = {"type": "receive", "account": account, "previous": chain[-1]["hash"] if chain else "0", "asset": "XE",
+             "balance": (chain[-1]["balance"] if chain else 0) + amount, "timestamp": time.time_ns(), "source": source,
+             "hash": os.urandom(32).hex(), "finalized": finalized}
+        chain.append(b)
+        return b
+
+    def land(self, block, finalized=True):
+        self.ledger.setdefault(block["account"], []).append({**block, "finalized": finalized})
+
+    def finalize(self):
+        for chain in self.ledger.values():
+            for b in chain:
+                b["finalized"] = True
+
+    def of(self, account, type_=None):
+        return [b for b in self.ledger.get(account, []) if type_ is None or b["type"] == type_]
+
+    async def chain(self, account, offset=0, limit=1000):
+        blocks = self.ledger.get(account, [])
+        return {"blocks": blocks[offset:offset + limit], "total": len(blocks)}
+
+    async def chain_end(self, account):
+        chain = self.ledger.get(account)
+        return (len(chain), chain[-1]) if chain else (0, None)
+
+    async def tip(self, account):
+        _, last = await self.chain_end(account)
+        return last["hash"] if last else "0"
+
+    async def balances(self, account):
+        _, last = await self.chain_end(account)
+        return {"XE": last["balance"]} if last else {}
+
+    async def block(self, h):
+        for chain in self.ledger.values():
+            for b in chain:
+                if b["hash"] == h:
+                    return b
+        return await super().block(h)
+
+    async def full_chain(self, account):
+        return list(self.ledger.get(account, []))
+
+    async def pending_for(self, account):
+        return list(self.pending)
+
+    async def submit_block(self, b):
+        d = b.to_json()
+        self.submits.append(d)
+        how = await self.on_submit(d) if self.on_submit else None
+        if how == "drop":
+            return {"ok": True}
+        if await self.tip(d["account"]) != d["previous"]:
+            raise XeError(400, "block rejected: previous is not the account's tip")
+        self.land(d, self.finalized)
+        self.pending = [p for p in self.pending if p["send_hash"] != d.get("source")]
+        if how == "lose-answer":
+            raise XeError(0, "ReadTimeout")
+        return d
+
 
 class FakeSigner:
     def __init__(self, scopes=("harness",)):
@@ -69,7 +149,7 @@ class FakeSigner:
         return s in self._kp
 
     def address(self, s):
-        return FEE_ACCT if s == "fee" else self._kp[s].address
+        return self._kp[s].address
 
     def public_key(self, s):
         return self._kp[s].pub_key_hex
@@ -91,7 +171,7 @@ def _ctx(chain=None, fee=True):
                              pinned_rules=lambda: {"fee_micro_xe": 1000, "window_days": 7, "participating_wallet": {},
                                                    "excluded_accounts": [], "agents": {}})
     return SimpleNamespace(chain=chain or FakeChain(), signer=signer, events=events, config=config,
-                           node=SimpleNamespace(chat_pow_difficulty=0))
+                           node=SimpleNamespace(chat_pow_difficulty=0, pow_difficulty=0, network_id="xe-test"))
 
 
 def _v(account=AUTHOR, payload=None, ts=None, sig=None):
@@ -335,7 +415,7 @@ async def test_http_inbox_refuses_control_characters_and_requires_pow(db):
     ctx = _ctx()
     with pytest.raises(HTTPException) as e:
         await inbox.http_submit(ctx, db, _v(payload={"message": "hi\x00there"}))
-    assert e.value.status_code == 400 and "control character" in e.value.detail
+    assert e.value.status_code == 400 and "control or format character" in e.value.detail
     ctx.node.chat_pow_difficulty = 0x0100000000000000
     with pytest.raises(HTTPException) as e:
         await inbox.http_submit(ctx, db, _v(payload={"message": "hi"}))
@@ -1804,3 +1884,37 @@ async def test_proposal_ops_must_be_ones_some_resolution_could_authorise(db):
         with pytest.raises(HTTPException) as e:
             await portal.submit(ctx, db, _v(payload={"title": "t", "body": "b", "fee_block_hash": "c" * 64, "ops": ops}))
         assert e.value.status_code == 400
+# ---- XE-2209: one bad item from the node costs one item ----------------------------------------------------
+
+async def test_a_chat_item_that_is_not_an_envelope_is_skipped_by_both_readers(db, monkeypatch):
+    import inspect
+
+    from dao import worker as worker_mod
+    from xe.chat import new_envelope
+    ctx = _ctx()
+    ctx.signer = FakeSigner(("harness", "fee", "dao"))
+    me = ctx.signer.address("dao")
+    kp = KeyPair.generate()
+    good1, good2 = (new_envelope(kp, me, f"hello {i}", difficulty=0).to_json() for i in range(2))
+    elsewhere = new_envelope(kp, "e" * 64, "not for the dao", difficulty=0).to_json()
+    bad = [{"id": 5}, {**good1, "id": "x1", "timestamp": "soon"}, {**good1, "id": "x2", "message": ["a"]},
+           {**good1, "id": "x3", "pow_nonce": -1}, {**good1, "id": "x4", "timestamp": 2**70}, {**good1, "id": "x" * 65},
+           {**good1, "id": "x5", "from": None, "to": 7}, {}, None, [good1], "envelope"]
+    for item in bad + [elsewhere]:
+        assert await inbox.receive(ctx, db, item) is None, item
+    assert (await db.execute(select(InboxMessage))).scalars().all() == []
+
+    async def messages(proof, since):
+        return [bad[0], good1, *bad[1:], elsewhere, good2, good1]
+
+    async def proof(ctx_):
+        return {}
+    ctx.chain.chat_messages = messages
+    monkeypatch.setattr(inbox, "read_proof", proof)
+    assert await inbox.backfill(ctx, db) == 2
+    assert {m.id for m in (await db.execute(select(InboxMessage))).scalars().all()} == {good1["id"], good2["id"]}
+    assert await inbox.backfill(ctx, db) == 0, "what is held is not stored again"
+    # the stream reader hands each item to the same function and parses nothing itself
+    assert "inbox.receive(" in inspect.getsource(worker_mod.Worker.chat_loop) and not hasattr(worker_mod, "Envelope")
+
+

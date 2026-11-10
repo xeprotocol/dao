@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 
-from xe.chat import Envelope
 from xe.client import XeError
 from xe.directory import new_registration
 
@@ -236,7 +235,6 @@ class Worker:
         if not ctx.signer.has("dao"):
             log.info("no dao key; chat listener off")
             return
-        me = ctx.signer.address("dao")
         while not self.stop.is_set():
             try:
                 # The backfill cursor comes from the stored inbox (inbox.chat_cursor), not from this loop: a
@@ -251,11 +249,8 @@ class Worker:
                 async for d in ctx.chain.chat_events(proof):
                     if self.stop.is_set():
                         break
-                    env = Envelope.from_json(d)
-                    if env.to != me:
-                        continue
                     async with session() as db:
-                        await inbox.store_envelope(ctx, db, env)
+                        await inbox.receive(ctx, db, d)
                         await db.commit()
             except (XeError, OSError, asyncio.TimeoutError) as e:
                 log.warning("chat stream dropped: %s", e)

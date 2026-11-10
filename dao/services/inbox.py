@@ -257,16 +257,25 @@ async def backfill(ctx: Context, db: AsyncSession) -> int:
     if not ctx.signer.has("dao"):
         return 0
     proof = await read_proof(ctx)
-    msgs = await ctx.chain.chat_messages(proof, await chat_cursor(db))
-    me = dao_account(ctx)
     n = 0
-    for d in msgs or []:
-        env = Envelope.from_json(d)
-        if env.to != me:
-            continue
-        if await store_envelope(ctx, db, env):
+    for d in await ctx.chain.chat_messages(proof, await chat_cursor(db)):
+        if await receive(ctx, db, d):
             n += 1
     return n
+
+
+async def receive(ctx: Context, db: AsyncSession, item) -> InboxMessage | None:
+    """One item from the node's chat feed (the stream or a backfill): stored if it is an envelope addressed
+    to the DAO that is not already held. An item that is not an envelope at all is logged and skipped, so
+    one bad item costs itself and nothing behind it (XE-2209); both readers come through here."""
+    try:
+        env = Envelope.from_json(item)
+    except ChatError as e:
+        log.info("chat item skipped: %s", e)
+        return None
+    if env.to != ctx.signer.address("dao"):
+        return None
+    return await store_envelope(ctx, db, env)
 
 
 async def list_messages(db: AsyncSession, status: str | None = None, limit: int = 100) -> list[InboxMessage]:

@@ -193,16 +193,16 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
         raise
     if not blocks:
         return empty
-    first_ts = int(blocks[0].get("timestamp", 0))
+    first_ts = blocks[0].get("timestamp", 0)
     window: list[tuple[int, str]] = []   # (amount, source) for each windowed receive of our asset
     prev = 0
     for b in blocks:
-        if int(b.get("timestamp", 0)) > at_ns:
+        if b.get("timestamp", 0) > at_ns:
             break
         if b.get("asset") != asset:
             continue
-        new_bal = int(b.get("balance", 0))
-        if b.get("type") in ARRIVALS and int(b.get("timestamp", 0)) > at_ns - CAUSAL_CHECK_NS:
+        new_bal = b.get("balance", 0)
+        if b.get("type") in ARRIVALS and b.get("timestamp", 0) > at_ns - CAUSAL_CHECK_NS:
             window.append((max(new_bal - prev, 0), b.get("source") or ""))
         prev = new_bal
     by_amount: dict[str, int] = {}
@@ -217,20 +217,20 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
     excluded: list[str] = []
     counted = 0
     for b in blocks:
-        ts = int(b.get("timestamp", 0))
+        ts = b.get("timestamp", 0)
         if ts > at_ns:
             break
         ours = b.get("asset") == asset
         if ours and b.get("type") in ARRIVALS and ts > at_ns - CAUSAL_CHECK_NS and not causal.get(b.get("source") or "", False):
             excluded.append(b.get("hash", ""))
-            new_bal = int(b.get("balance", 0))
+            new_bal = b.get("balance", 0)
             tainted += max(new_bal - bal, 0)
             bal = new_bal
             continue
         counted += 1
         if not ours:
             continue
-        new_bal = int(b.get("balance", 0))
+        new_bal = b.get("balance", 0)
         if new_bal < bal:
             tainted = max(tainted - (bal - new_bal), 0)
         bal = new_bal
@@ -256,7 +256,7 @@ async def _sends_at_or_before(chain: XeClient, send_hashes: list[str], at_ns: in
                 if e.status == 404:
                     return False
                 raise
-        return int(src.get("timestamp", 0)) <= at_ns
+        return src.get("timestamp", 0) <= at_ns
 
     found = await asyncio.gather(*(one(h) for h in send_hashes))
     return dict(zip(send_hashes, found))
