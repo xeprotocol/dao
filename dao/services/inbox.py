@@ -348,10 +348,13 @@ async def chat_cursor(db: AsyncSession) -> int:
     """Where a backfill asks the node from: the newest stored chat envelope's timestamp less a margin wider
     than the node's clock skew allowance, or a day ago if nothing is stored. The cursor is derived from
     what is on disk, never from what was seen: an envelope that failed to store, or one dated five minutes
-    ahead by its sender, cannot move it past honest messages (XE-1651, XE-1666, XE-1768). Over-fetching is
-    harmless; `store_envelope` skips ids it holds."""
-    newest = (await db.execute(select(func.max(InboxMessage.timestamp)).where(InboxMessage.channel == "chat"))).scalar_one()
+    ahead by its sender, cannot move it past honest messages (XE-1651, XE-1666, XE-1768). A stored
+    timestamp further ahead than any node accepts is not a time anything arrived and is not counted: the
+    sender picks an envelope's timestamp, and one dated next year would otherwise hold the cursor there.
+    Over-fetching is harmless; `store_envelope` skips ids it holds."""
     now = time.time_ns()
+    newest = (await db.execute(select(func.max(InboxMessage.timestamp)).where(
+        InboxMessage.channel == "chat", InboxMessage.timestamp <= now + MAX_ENVELOPE_SKEW_NS))).scalar_one()
     return max(now - CURSOR_START_NS, int(newest) - CURSOR_MARGIN_NS) if newest else now - CURSOR_START_NS
 
 

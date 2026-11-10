@@ -1924,6 +1924,11 @@ async def test_chat_cursor_comes_from_the_stored_inbox_with_a_margin(db, monkeyp
     cursor = await inbox.chat_cursor(db)
     assert cursor == now + 300 * inbox.NS - inbox.CURSOR_MARGIN_NS, "http rows do not move the chat cursor"
     assert cursor <= now - 600 * inbox.NS, "an honest message dated inside the skew window is still fetched"
+    # an envelope dated further ahead than any node accepts is stored, and is not a time anything arrived
+    db.add(InboxMessage(id="f1", channel="chat", from_account="a" * 64, to_account="d" * 64, pub_key="p" * 64, body="x",
+                        timestamp=now + 365 * 86400 * inbox.NS, signature="s", pow_nonce=0, verified=False, status="new"))
+    await db.commit()
+    assert await inbox.chat_cursor(db) == cursor
     asked = []
 
     async def messages(proof, since):
