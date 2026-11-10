@@ -221,9 +221,11 @@ async def rederive_open(ctx: Context, db: AsyncSession) -> int:
     for pr in (await db.execute(select(Proposal).where(Proposal.status == "open"))).scalars().all():
         try:
             n += len(await rederive_stale(ctx, db, pr))
-        except XeError as e:
+        except XeError as e:   # the rows re-derived before the node failed are kept: each stands on its own
             log.warning("proposal %s: could not re-derive stale votes: %s", pr.hash[:12], e)
             break
+        except Exception:   # this proposal's rows, not the node: the proposals behind it are not held up
+            log.exception("proposal %s: re-deriving its stale votes raised", pr.hash[:12])
     return n
 
 
@@ -334,21 +336,30 @@ async def close_due(ctx: Context, db: AsyncSession) -> list[Proposal]:
                                  .with_for_update(skip_locked=True))).scalars().all())
     closed = []
     for pr in due:
+        h = pr.hash
         try:
-            await rederive_stale(ctx, db, pr)
+            async with db.begin_nested():   # one proposal's close is one step: what it wrote goes with it if it fails
+                await _close(ctx, db, pr)
         except XeError as e:   # stale weight is not tallied; this proposal closes on a later pass
-            log.warning("proposal %s: could not re-derive stale votes: %s", pr.hash[:12], e)
+            log.warning("proposal %s: could not re-derive stale votes: %s", h[:12], e)
+            continue
+        except Exception:   # this proposal stays open and is tried again; the ones behind it still close
+            log.exception("proposal %s: closing it raised", h[:12])
             continue
         closed.append(pr)
-        res = tally(pr, await votes_for(db, pr.hash))
-        pr.result = res
-        pr.status = "closed"
-        await ctx.events.append(db, "proposal.closed", "harness", {"proposal": pr.hash, "title": pr.title, "result": res}, ref=f"proposal:{pr.hash}")
-        fee = (await db.execute(select(FeeLedger).where(FeeLedger.proposal_hash == pr.hash))).scalar_one_or_none()
-        if fee and fee.state == "seen":
-            action = pr.rules.get("fee_on_quorum", "refund") if res["quorum_met"] else pr.rules.get("fee_below_quorum", "burn")
-            fee.state = f"due_{action}"
     return closed
+
+
+async def _close(ctx: Context, db: AsyncSession, pr: Proposal) -> None:
+    await rederive_stale(ctx, db, pr)
+    res = tally(pr, await votes_for(db, pr.hash))
+    pr.result = res
+    pr.status = "closed"
+    await ctx.events.append(db, "proposal.closed", "harness", {"proposal": pr.hash, "title": pr.title, "result": res}, ref=f"proposal:{pr.hash}")
+    fee = (await db.execute(select(FeeLedger).where(FeeLedger.proposal_hash == pr.hash))).scalar_one_or_none()
+    if fee and fee.state == "seen":
+        action = pr.rules.get("fee_on_quorum", "refund") if res["quorum_met"] else pr.rules.get("fee_below_quorum", "burn")
+        fee.state = f"due_{action}"
 
 
 async def _decision_resolution(db: AsyncSession, pr: Proposal, res_id: str, *, passed: bool = True) -> Resolution:

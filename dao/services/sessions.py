@@ -13,6 +13,7 @@ The harness holds no keyset key. It only assembles, counts, and submits.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import secrets
 import time
@@ -30,6 +31,8 @@ from ..canonical import canonical_json, sha256_hex
 from ..context import Context
 from ..models import Anchor, SigningSession
 from . import pause
+
+log = logging.getLogger("dao.sessions")
 
 KINDS = {"registry", "anchor", "parameter", "keyset"}
 KEYSET_KEY = "sys.dao_keyset"
@@ -261,11 +264,14 @@ async def approve(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified
             return s
         try:
             await rebuild(ctx, db, s, actor="harness")
-        except XeError as e:
-            # The approval is on the record; building the block needs the node and the node did not answer.
-            # The worker's timer pass builds it when the node is back (XE-1713).
+        except Exception as e:
+            # The approval is on the record, and building the block is a second step that does not take it
+            # back, whatever stopped it: the node not answering (XE-1713), a pause that began since it was
+            # read above, anything else. The worker's timer pass builds the block when it can be built.
+            log.warning("session %s: approved, block not built: %s", s.id, e)
             await ctx.events.append(db, "session.build_deferred", "harness",
-                                    {"session_id": s.id, "error": str(e)[:300]}, ref=f"session:{s.id}")
+                                    {"session_id": s.id, "error": (getattr(e, "detail", None) or str(e))[:300]},
+                                    ref=f"session:{s.id}")
     return s
 
 

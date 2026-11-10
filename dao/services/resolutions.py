@@ -7,6 +7,7 @@ resolution with ops opens a signing session; one without ops is simply recorded.
 
 from __future__ import annotations
 
+import logging
 import secrets
 import time
 from datetime import datetime, timezone
@@ -22,9 +23,12 @@ from ..auth import Verified
 from ..canonical import DOMAIN_RESOLUTION, digest
 from ..context import Context
 from ..db import serialize
-from ..models import Resolution
-from ..text import clean_text
+from ..log import EventLog
+from ..models import Proposal, Resolution
+from ..text import clean_text, field_text
 from . import sessions
+
+log = logging.getLogger("dao.resolutions")
 
 RESERVED_MATTERS = {
     "amend_articles", "amend_operating_agreement", "admit_member", "remove_member", "dissolve",
@@ -130,13 +134,17 @@ async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, dec
             "resolution_id": r.id, "number": r.number, "title": r.title, "matter": r.matter, "for": fors, "against": againsts,
         }, ref=f"resolution:{r.id}")
         if r.ops:
+            # The node not answering leaves the session owed, and the pass and the signature stand (XE-1710).
+            # A refusal is different, and is the answer to the deciding signature itself: ops that no longer
+            # fit the seats as they stand (a seat changed since the proposal) raise the 400 that names the
+            # cause, the route records nothing, and the resolution stays open until it is withdrawn. Whether
+            # such a resolution should instead get a recorded end is a product decision that has been left as
+            # it is (XE-2030).
             try:
-                await open_session(ctx, db, r)
+                async with db.begin_nested():
+                    await open_session(ctx, db, r)
             except XeError as e:
-                # The deciding signature and the passed status are on the record; opening the session needs
-                # the node's keyset and the node did not answer. The worker opens it when it does (XE-1710).
-                await ctx.events.append(db, "resolution.session_deferred", "harness",
-                                        {"resolution_id": r.id, "error": str(e)[:300]}, ref=f"resolution:{r.id}")
+                await _owed(ctx, db, r, "resolution.session_deferred", str(e)[:300])
     elif againsts > n_members - needed:
         r.status = "rejected"
         r.signatures = live
@@ -158,16 +166,48 @@ async def open_session(ctx: Context, db: AsyncSession, r: Resolution) -> None:
     r.session_id = s.id
 
 
+async def open_owed_session(ctx: Context, db: AsyncSession, r: Resolution) -> bool:
+    """Worker: open the session an already passed resolution is owed, if it can be opened now. The
+    resolution is passed and stays passed: opening its session is a separate act, and nothing that act can
+    raise undoes the pass or stops the pass over the resolutions behind it. The node not answering
+    (XE-1710) and the ops no longer fitting the seats as they stand (a seat changed after the pass, while
+    the session was still owed; XE-1967) are both left on the record as what is owed, and tried again on
+    every pass: the first clears when the node is back, the second if the seats change back. Anything
+    else that stops it is recorded as refused in the same way, because "nothing" means nothing.
+    Everything the attempt wrote is undone with it (a savepoint), so a failure leaves no half-made session."""
+    try:
+        async with db.begin_nested():
+            await open_session(ctx, db, r)
+        return True
+    except XeError as e:
+        kind, error = "resolution.session_deferred", str(e)[:300]
+    except HTTPException as e:
+        kind, error = "resolution.session_refused", str(e.detail)[:300]
+    except Exception as e:
+        log.exception("resolution %s: opening its session raised", r.id)
+        kind, error = "resolution.session_refused", f"{type(e).__name__}: {e}"[:300]
+    await _owed(ctx, db, r, kind, error)
+    return False
+
+
+async def _owed(ctx: Context, db: AsyncSession, r: Resolution, kind: str, error: str) -> None:
+    """Record why a passed resolution's session is still owed. Written when the reason changes kind, not on
+    every pass and not on every rewording: a node that words its failure differently each time (a request
+    id, a timestamp) would otherwise add an event to the log every minute for as long as it was down."""
+    last = await EventLog.page(db, limit=1, ref=f"resolution:{r.id}", public_only=False)
+    if not last or last[0].kind != kind:
+        await ctx.events.append(db, kind, "harness", {"resolution_id": r.id, "error": error}, ref=f"resolution:{r.id}")
+
+
 async def open_deferred_sessions(ctx: Context, db: AsyncSession) -> int:
-    """Worker: passed resolutions with ops whose session could not be opened at the deciding signature."""
+    """Worker: passed resolutions with ops whose session could not be opened at the deciding signature.
+    Each is tried on its own; one that cannot be opened does not hold up the ones behind it."""
     q = (select(Resolution).where(Resolution.status == "passed", Resolution.ops.isnot(None), Resolution.session_id == "")
-         .with_for_update(skip_locked=True))
+         .order_by(Resolution.number.asc()).with_for_update(skip_locked=True))
     n = 0
     for r in (await db.execute(q)).scalars().all():
-        if not r.ops:
-            continue
-        await open_session(ctx, db, r)
-        n += 1
+        if r.ops and await open_owed_session(ctx, db, r):
+            n += 1
     return n
 
 

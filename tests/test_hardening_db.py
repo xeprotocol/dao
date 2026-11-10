@@ -1870,6 +1870,22 @@ async def test_unreadable_chain_weighs_nothing_agent_class_is_live_and_open_tall
         raise XeError(0, "ReadTimeout")
     ctx.chain.full_chain = down
     assert await portal.close_due(ctx, db) == [] and pr2.status == "open"
+    # a proposal that cannot be closed, whatever stops it, does not hold up the one behind it (XE-1967's rule here)
+    pr3 = Proposal(hash="a" * 64, title="t", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64, author_signature="s",
+                   author_timestamp=now, fee_block_hash="a" * 64, status="open", opened_at=now - D, closes_at=now - 1,
+                   rules=ctx.config.pinned_rules(), analysis=[])
+    db.add(pr3)
+    await db.commit()
+    for stops_it in (XeError(0, "ReadTimeout"), RuntimeError("not the node")):
+        async def stopped(a, e=stops_it):
+            raise e
+        ctx.chain.full_chain = stopped
+        pr3.status, pr3.result = "open", None
+        await db.commit()
+        assert [p.hash for p in await portal.close_due(ctx, db)] == [pr3.hash], stops_it
+        await db.commit()
+        await db.refresh(pr2)
+        assert pr2.status == "open" and pr3.status == "closed", stops_it
 
 
 # ---- XE-1650: a proposal's ops are ones a resolution could carry -------------------------------------------
@@ -1980,6 +1996,147 @@ async def test_a_set_aside_signature_is_replaced_by_the_seats_next_one_and_a_liv
     assert r4.status == "passed" and [s["seat"] for s in r4.signatures] == ["founder-b"], \
         "the one member who can sign has signed; the signature from the seat that lost the right is not what passed it, and is not shown as if it had"
     assert [s["seat"] for s in resolutions.to_dict(r4, ctx.config)["signatures"]] == ["founder-b"]
+
+
+# ---- XE-1967: a passed resolution is passed; a step that fails is one step ------------------------------------
+
+async def test_a_passed_resolution_stays_passed_and_a_failed_step_stops_nothing_behind_it(db, monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from dao import worker as worker_mod
+    from dao.models import PauseRecord
+    from dao.services import resolutions
+    from dao.worker_schedule import last_runs
+    ctx = _ctx()
+    k1, k2 = KeyPair.generate().pub_key_hex, KeyPair.generate().pub_key_hex
+    both = ("sign_statechain", "pause", "sign_resolutions")
+    ctx.config.members = ctx.config.human_seats = [_member("founder-a", both, k1), _member("founder-b", both, k2)]
+    ctx.config.windows, ctx.config.pause = {}, {}
+    keyset_ops = sessions.normalise_ops([{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2], "threshold": 2}}])
+    param_ops = sessions.normalise_ops([{"action": "set", "key": "dao.x", "value": 1}])
+    r1 = Resolution(id="r1", number=1, title="rotate", body="b", matter="change_keyset", ops=keyset_ops, proposed_by="founder-a",
+                    status="open", signatures=[])
+    r2 = Resolution(id="r2", number=2, title="param", body="b", matter="parameter", ops=param_ops, proposed_by="founder-a",
+                    status="open", signatures=[])
+    db.add_all([r1, r2])
+    await db.flush()
+
+    def vote(r, seat, key):
+        return _signed_by(seat, key, {"resolution_id": r.id, "body_hash": resolutions.body_hash(r), "decision": "for"}, both)
+
+    async def events(kind):
+        return (await db.execute(select(Event).where(Event.kind == kind).order_by(Event.index))).scalars().all()
+
+    # 1. between the proposal and the deciding signature founder-b's seat loses the right to sign blocks, so
+    # the keyset the resolution writes is one the seats can no longer meet. The deciding signature is
+    # refused with the cause (XE-2030: left as it is, by decision), and the route records none of it
+    await resolutions.decide(ctx, db, r1, vote(r1, "founder-a", k1), "for")
+    await db.commit()
+    as_proposed = ctx.config.human_seats
+    changed = [_member("founder-a", both, k1), _member("founder-b", ("pause", "sign_resolutions"), k2)]
+    ctx.config.human_seats = changed
+    with pytest.raises(HTTPException) as e:
+        await resolutions.decide(ctx, db, r1, vote(r1, "founder-b", k2), "for")
+    assert e.value.status_code == 400 and "held by a seat" in e.value.detail
+    await db.rollback()   # what the route does with a handler that raised
+    await db.refresh(r1), await db.refresh(r2)
+    assert r1.status == "open" and [s["seat"] for s in r1.signatures] == ["founder-a"] and await events("resolution.passed") == []
+    assert (await db.execute(select(SigningSession))).scalars().all() == [], "nothing half-made is left behind"
+
+    # 2. the node not answering is not a refusal: the pass and the signature stand, and the session is owed
+    async def no_answer(*a, **k):
+        raise XeError(0, "ConnectError: connection refused")
+    ctx.config.human_seats = as_proposed
+    ctx.chain.dao_keyset = no_answer
+    await resolutions.decide(ctx, db, r1, vote(r1, "founder-b", k2), "for")
+    await resolutions.decide(ctx, db, r2, vote(r2, "founder-a", k1), "for")
+    await resolutions.decide(ctx, db, r2, vote(r2, "founder-b", k2), "for")
+    assert r1.status == r2.status == "passed" and r1.session_id == r2.session_id == ""
+    assert len(r1.signatures) == 2 and len(await events("resolution.session_deferred")) == 2
+
+    # 3. the seats change while r1's session is still owed, so it is now one that cannot be opened. The worker
+    # tries each on its own, every pass: that one does not hold up the one behind it (XE-1967), and what is
+    # owed is written once, not once a pass
+    ctx.config.human_seats = changed
+    assert await resolutions.open_deferred_sessions(ctx, db) == 0
+    refused = await events("resolution.session_refused")
+    assert [x.payload["resolution_id"] for x in refused] == ["r1"] and "held by a seat" in refused[0].payload["error"]
+    ctx.chain.dao_keyset = FakeChain.dao_keyset.__get__(ctx.chain)
+    assert await resolutions.open_deferred_sessions(ctx, db) == 1 and r2.session_id and r1.session_id == ""
+    assert await resolutions.open_deferred_sessions(ctx, db) == 0
+    assert len(await events("resolution.session_refused")) == 1 and len(await events("resolution.session_deferred")) == 2
+    # a failure the node words differently each time is still one thing owed, written once; and a failure
+    # that is neither the node's nor a refusal (a bug, a bad row) is recorded and stops nothing either
+    said = iter(range(100))
+
+    async def reworded(*a, **k):
+        raise XeError(0, f"ConnectError: request {next(said)} refused")
+
+    async def broken(*a, **k):
+        raise KeyError("a bug in opening the session")
+    r3 = Resolution(id="r3", number=3, title="param", body="b", matter="parameter", ops=param_ops, proposed_by="founder-a",
+                    status="passed", signatures=[])
+    db.add(r3)
+    await db.flush()
+    ctx.chain.dao_keyset = reworded
+    for _ in range(3):
+        assert await resolutions.open_deferred_sessions(ctx, db) == 0
+    assert [x.payload["resolution_id"] for x in await events("resolution.session_deferred")] == ["r1", "r2", "r3"]
+    ctx.chain.dao_keyset = broken
+    assert await resolutions.open_deferred_sessions(ctx, db) == 0 and await resolutions.open_deferred_sessions(ctx, db) == 0
+    refused = await events("resolution.session_refused")
+    assert [e.payload["resolution_id"] for e in refused] == ["r1", "r3"] and "KeyError" in refused[1].payload["error"]
+    ctx.chain.dao_keyset = FakeChain.dao_keyset.__get__(ctx.chain)
+    assert await resolutions.open_deferred_sessions(ctx, db) == 1 and r3.session_id
+    # the seats change back: the session it was owed all along
+    ctx.config.human_seats = ctx.config.members
+    assert await resolutions.open_deferred_sessions(ctx, db) == 1
+    assert (await sessions.get(db, r1.session_id)).kind == "keyset"
+    await db.commit()
+
+    # 4. a job step: committed if it returns, rolled back if it raises anything, and the job goes on
+    async def half_done():
+        db.add(HealthCheck(ts=1, ok=True, detail={}))
+        await db.flush()
+        raise ValueError("after a write")
+
+    async def whole():
+        db.add(HealthCheck(ts=2, ok=True, detail={}))
+        return "done"
+    assert await worker_mod.Worker._step(db, "half", half_done) is None
+    assert await worker_mod.Worker._step(db, "whole", whole) == "done"
+    await db.rollback()
+    assert [h.ts for h in (await db.execute(select(HealthCheck))).scalars().all()] == [2]
+
+    sm = async_sessionmaker(db.bind, expire_on_commit=False)
+
+    @asynccontextmanager
+    async def fake_session():
+        async with sm() as s:
+            yield s
+    monkeypatch.setattr(worker_mod, "session", fake_session)
+    now = time.time_ns()
+    db.add(PauseRecord(id="p1", determined_by="founder-a", ground="g", determination="d" * 20, started_at=now - 10 * 3600 * 10**9,
+                       expires_at=now - 3600 * 10**9, indefinite=False, extensions=[], lifted_by=[], status="active"))
+    db.add(SeenSignature(sig="e" * 128, timestamp=now - 10 * MAX_SKEW_NS))
+    await db.commit()
+    ran = []
+
+    def failing(name, exc):
+        async def step(*a, **k):
+            ran.append(name)
+            raise exc
+        return step
+    # the first three steps of the timers job each fail a different way; the three behind them still run
+    monkeypatch.setattr(portal, "close_due", failing("close", HTTPException(400, "a step that answers like a route")))
+    monkeypatch.setattr(portal, "rederive_open", failing("rederive", KeyError("a bug")))
+    monkeypatch.setattr(resolutions, "open_deferred_sessions", failing("owed", XeError(0, "node down")))
+    await worker_mod.Worker(ctx).job_timers()
+    assert ran == ["close", "rederive", "owed"]
+    lapsed = (await db.execute(select(PauseRecord).where(PauseRecord.id == "p1").execution_options(populate_existing=True))).scalar_one()
+    assert lapsed.status == "expired", "the pause clock ran"
+    assert (await db.execute(select(SeenSignature))).scalars().all() == [], "the purge ran"
+    assert "timers" in await last_runs(db)
 
 
 # ---- XE-2209: one bad item from the node costs one item ----------------------------------------------------

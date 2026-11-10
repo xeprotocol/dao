@@ -66,6 +66,22 @@ class Worker:
                 await ctx.events.append(db, "directory.register_failed", "harness", {"error": str(e)[:300]}, public=False)
             await db.commit()
 
+    @staticmethod
+    async def _step(db, name: str, fn):
+        """One step of a job. A job is a list of steps that do not depend on each other, and one of them
+        failing never stops the ones behind it: the step is committed if it returns, rolled back and logged
+        if it raises anything at all, and the job goes on either way. The first version of this guard named
+        the one exception a step was expected to raise, and a step that raised another ended the job at that
+        line on every pass, with the pause clock, the timelock and the purge behind it (XE-1967)."""
+        try:
+            out = await fn()
+            await db.commit()
+            return out
+        except Exception as e:
+            await db.rollback()
+            log.warning("%s: %s: %s", name, type(e).__name__, e)
+            return None
+
     async def job_fees(self):
         async with session() as db:
             if await pause.is_paused(db):
@@ -89,44 +105,42 @@ class Worker:
 
     async def job_timers(self):
         async with session() as db:
-            closed = await portal.close_due(self.ctx, db)
+            closed = await self._step(db, "close proposals", lambda: portal.close_due(self.ctx, db))
             if closed:
                 log.info("closed %d proposals", len(closed))
-            await db.commit()
-            if await portal.rederive_open(self.ctx, db):   # open tallies catch up with a rule or seat change (XE-1664)
-                await db.commit()
-            try:
-                if await resolutions.open_deferred_sessions(self.ctx, db):   # sessions owed to passed resolutions (XE-1710)
-                    await db.commit()
-            except XeError as e:
-                await db.rollback()
-                log.warning("deferred sessions: %s", e)
-            await pause.tick(self.ctx, db)
-            # promote approved sessions whose timelock has run, once no pause is in force
-            now = time.time_ns()
-            if not await pause.is_paused(db):
-                await db.commit()
-                ks = None
-                for sid in await self._session_ids(db, "approving"):
-                    # Each row is taken FOR UPDATE and committed on its own, so a member's cancel or approval
-                    # either waits for this pass or is seen by it; never overwritten (XE-0763).
-                    s = await self._take(db, sid, "approving")
-                    if s is None or (s.not_before and now < s.not_before):
-                        await db.rollback()
-                        continue
-                    try:
-                        ks = ks or await sessions.live_keyset(self.ctx)
-                        if sessions.approvals_met(s, ks):
-                            await sessions.rebuild(self.ctx, db, s)
-                        await db.commit()
-                    except Exception as e:  # one session or a node hiccup must not hold up closing votes
-                        await db.rollback()
-                        log.warning("promote session %s: %s", sid, e)
-            purged = await purge_seen_signatures(db)
+            # open tallies catch up with a rule or seat change (XE-1664)
+            await self._step(db, "re-derive open tallies", lambda: portal.rederive_open(self.ctx, db))
+            # sessions owed to passed resolutions (XE-1710)
+            await self._step(db, "sessions owed to resolutions", lambda: resolutions.open_deferred_sessions(self.ctx, db))
+            await self._step(db, "pause clock", lambda: pause.tick(self.ctx, db))
+            await self._step(db, "promote sessions", lambda: self._promote(db))
+            purged = await self._step(db, "purge signature claims", lambda: purge_seen_signatures(db))
             if purged:
                 log.debug("purged %d expired signature claims", purged)
             await mark_run(db, "timers")
             await db.commit()
+
+    async def _promote(self, db) -> None:
+        """Promote approved sessions whose timelock has run, once no pause is in force."""
+        if await pause.is_paused(db):
+            return
+        now = time.time_ns()
+        ks = None
+        for sid in await self._session_ids(db, "approving"):
+            # Each row is taken FOR UPDATE and committed on its own, so a member's cancel or approval
+            # either waits for this pass or is seen by it; never overwritten (XE-0763).
+            s = await self._take(db, sid, "approving")
+            if s is None or (s.not_before and now < s.not_before):
+                await db.rollback()
+                continue
+            try:
+                ks = ks or await sessions.live_keyset(self.ctx)
+                if sessions.approvals_met(s, ks):
+                    await sessions.rebuild(self.ctx, db, s)
+                await db.commit()
+            except Exception as e:  # one session or a node hiccup must not hold up the ones behind it
+                await db.rollback()
+                log.warning("promote session %s: %s", sid, e)
 
     @staticmethod
     async def _session_ids(db, status: str) -> list[str]:
