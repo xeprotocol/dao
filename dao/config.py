@@ -239,6 +239,82 @@ def load_config(config_dir: Path) -> Config:
         for p in sorted(prompts_dir.glob("*.md")):
             prompts[p.stem] = p.read_text(encoding="utf-8")
             files[f"prompts/{p.name}"] = p
+    cfg = _read_config(d, files, prompts)
+    require_distinct_seats(cfg)
+    return cfg
+
+
+def require_distinct_seats(cfg: Config) -> None:
+    """Refuse a Schedule C whose seats are not each one identity (`seat_conflicts`), with one kind of error
+    whatever is wrong with it. Called when the config is loaded, and again by `build_context` once the
+    keyfile has said which accounts the company holds, since a seat must not be one of those either."""
+    try:
+        conflicts = seat_conflicts(cfg)
+    except (KeyError, TypeError, AttributeError) as e:   # a seat that is not a mapping, or has no id, or a number for one
+        raise ValueError(f"schedule_c.yaml: a seat entry is malformed ({type(e).__name__}: {e})") from e
+    if conflicts:
+        raise ValueError("schedule_c.yaml: " + "; ".join(conflicts))
+
+
+def seat_conflicts(cfg: Config) -> list[str]:
+    """Every seat is one identity: its id, its page handle, its key and its account each name that seat and
+    no other. Everything that resolves a seat takes the first match (`seat_by_key`, `seat`, `seat_page`) and
+    everything that counts seats counts the list (thresholds, quorum of members), so two seats sharing an
+    identity leave one that is counted and can never act, or two people signing into one slot, and nothing
+    says so (XE-2073). A Schedule C like that is refused at load, by the API, the worker and the CLI alike,
+    since all three come through `load_config`. A blank key or account is a seat not yet filled, not a
+    conflict.
+
+    An id is the seat's handle everywhere (its page, the log, a stored signature), so it is there, and it
+    is lower-case letters, digits and hyphens: `seat_page` looks a seat up by the lower-cased path, and an
+    id it cannot spell is a seat with no page. An agent seat's page is also reached by its role, so the
+    role has to make a handle. And a seat's account is not one of the company's own (treasury, fee, dao):
+    those are excluded from every vote and are what the harness itself signs as, so a seat on one of them
+    is two identities in one account."""
+    out: list[str] = []
+    handles: dict[str, str] = {}
+    keys: dict[str, str] = {}
+    accounts: dict[str, str] = {}
+    hex64 = re.compile(r"[0-9a-f]{64}")
+
+    def claim(taken: dict[str, str], value: str, seat: str, what: str) -> bool:
+        if value and taken.setdefault(value, seat) != seat:
+            out.append(f"{what} {value[:16]} is used by both {taken[value]} and {seat}")
+            return False
+        return True
+
+    def handle(seat_id, seat: str) -> bool:
+        if not isinstance(seat_id, str) or not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", seat_id):
+            out.append(f"{seat}: id must be lower-case letters, digits and hyphens")
+            return False
+        return claim(handles, seat_id, seat, "seat id")
+
+    for name, account in sorted(cfg.accounts.items()):
+        accounts.setdefault(account, f"the company's {name} account")   # two names for one company account is not a seat's business
+    accounts.pop("", None)
+    for i, h in enumerate(cfg.human_seats):
+        seat = f"human seat {i + 1} ({h.id})"
+        handle(h.id, seat)
+        if h.public_key and not hex64.fullmatch(h.public_key):
+            out.append(f"{seat}: public_key is not 64 hex characters")
+            continue
+        if claim(keys, h.public_key, seat, "public key"):   # a shared key is a shared account; said once
+            claim(accounts, h.account, seat, "account")
+    for i, a in enumerate(cfg.agent_seats):
+        seat = f"agent seat {i + 1} ({a.id})"
+        handle(a.id, seat)
+        if not a.slug:
+            out.append(f"{seat}: role is blank, so the seat has no page")
+        elif a.slug != a.id:
+            claim(handles, a.slug, seat, "seat page")
+        if a.account and not hex64.fullmatch(a.account):
+            out.append(f"{seat}: account is not 64 hex characters")
+            continue
+        claim(accounts, a.account, seat, "account")
+    return out
+
+
+def _read_config(d: Path, files: dict[str, Path], prompts: dict[str, str]) -> Config:
     return Config(
         dir=d,
         schedule_b=_load_yaml(files["schedule_b.yaml"]),

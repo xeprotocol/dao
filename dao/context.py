@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from xe.client import XeClient
 from xe.pow import CHAT_POW_DIFFICULTY, DEFAULT_DIFFICULTY, parse_difficulty
 
-from .config import Config, load_config
+from .config import Config, load_config, require_distinct_seats
 from .log import EventLog
 from .settings import Settings, get_settings
 from .signer import Signer, SignerError
@@ -94,6 +94,7 @@ def build_context() -> Context:
     if not signer.has("harness"):
         raise SystemExit(f"{settings.signer_keyfile} has no 'harness' key; the log cannot be signed")
     config.signer_accounts = {n: signer.address(n) for n in ("dao", "fee") if signer.has(n)}
+    require_distinct_seats(config)   # again, now the company's own accounts are known (XE-2073)
     chain = XeClient(settings.xe_node_url)
     events = EventLog(signer)
     return Context(settings=settings, config=config, signer=signer, chain=chain, events=events)

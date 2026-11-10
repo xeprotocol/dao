@@ -1394,6 +1394,71 @@ def test_an_envelope_from_a_node_is_an_envelope_or_a_chaterror():
             Envelope.from_json(item)
 
 
+# ---- XE-2073: a seat is one identity ---------------------------------------------------------------------
+
+def test_a_schedule_c_whose_seats_share_an_identity_is_refused_at_load(tmp_path):
+    import shutil
+
+    import yaml
+
+    from dao.config import seat_conflicts
+    cfg = load_config(ROOT / "config")
+    assert seat_conflicts(cfg) == [], "the committed Schedule C loads"
+    k1, k2 = KeyPair.generate(), KeyPair.generate()
+
+    def conflicts(humans=(), agents=(), company=None):
+        c = load_config(ROOT / "config")
+        c.schedule_c["human_seats"] = [{"id": i, "kind": "member", "public_key": k} for i, k in humans]
+        c.schedule_c["agent_seats"] = [{"id": i, "role": r, "account": a} for i, r, a in agents]
+        c.signer_accounts = company or {}
+        return seat_conflicts(c)
+
+    assert conflicts([("a", k1.pub_key_hex), ("b", k2.pub_key_hex), ("c", ""), ("d", "")],
+                     [("x", "Research", "c" * 64), ("y", "Legal & Compliance", ""), ("z", "Ops", "")]) == [], \
+        "blank keys and accounts are seats not yet filled"
+    cases = {
+        "seat id": conflicts([("a", k1.pub_key_hex), ("a", k2.pub_key_hex)]),
+        "seat id, by case": conflicts([("a", ""), ("A", "")]),
+        "public key": conflicts([("a", k1.pub_key_hex), ("b", k1.pub_key_hex.upper())]),
+        "agent id": conflicts(agents=[("x", "Research", ""), ("x", "Legal", "")]),
+        "agent page": conflicts(agents=[("x", "Legal & Compliance", ""), ("y", "legal and compliance", "")]),
+        "agent page against agent id": conflicts(agents=[("research", "Ops", ""), ("y", "Research", "")]),
+        "human id against agent id": conflicts([("x", "")], [("x", "Research", "")]),
+        "human id against agent page": conflicts([("research", "")], [("x", "Research", "")]),
+        "agent account": conflicts(agents=[("x", "A", "c" * 64), ("y", "B", "C" * 64)]),
+        "agent account against a human's": conflicts([("a", k1.pub_key_hex)], [("x", "Ops", k1.address.upper())]),
+        "key that is not a key": conflicts([("a", "zz")]),
+        "blank id": conflicts([("", k1.pub_key_hex)]),
+        "id the seat page cannot spell": conflicts([("Founder A", "")]),
+        "agent id that is not a handle": conflicts(agents=[("x/y", "Research", "")]),
+        "agent with no role, so no page": conflicts(agents=[("x", "", "")]),
+        "agent account that is not an account": conflicts(agents=[("x", "Research", "zz")]),
+        "human seat on a company account": conflicts([("a", k1.pub_key_hex)], company={"dao": k1.address.upper()}),
+        "agent seat on a company account": conflicts(agents=[("x", "Research", "c" * 64)], company={"fee": "c" * 64}),
+    }
+    for what, found in cases.items():
+        assert len(found) == 1, (what, found)
+    assert conflicts([("a", k1.pub_key_hex)], company={"dao": "d" * 64, "fee": "d" * 64}) == [], \
+        "one company account under two names is not a seat conflict"
+    # a seat entry that is not a seat at all is the same refusal, not a traceback of its own kind
+    from dao.config import require_distinct_seats
+    for bad in ([{"kind": "member"}], ["founder-a"], [{"id": 7}], [{"id": "a", "may": 5}]):
+        c = load_config(ROOT / "config")
+        c.schedule_c["human_seats"] = bad
+        with pytest.raises(ValueError) as e:
+            require_distinct_seats(c)
+        assert "schedule_c.yaml" in str(e.value), bad
+    # and the load itself refuses it, which is the path the API, the worker and the CLI all take
+    d = tmp_path / "config"
+    shutil.copytree(ROOT / "config", d)
+    doc = yaml.safe_load((d / "schedule_c.yaml").read_text())
+    doc["human_seats"][1]["id"] = doc["human_seats"][0]["id"]
+    (d / "schedule_c.yaml").write_text(yaml.safe_dump(doc))
+    with pytest.raises(ValueError) as e:
+        load_config(d)
+    assert "schedule_c.yaml" in str(e.value) and doc["human_seats"][0]["id"] in str(e.value)
+
+
 # ---- XE-2210: the snapshot preview is the vote's derivation ------------------------------------------------
 
 async def test_the_snapshot_preview_answers_what_the_vote_would(monkeypatch):
