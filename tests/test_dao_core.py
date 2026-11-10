@@ -448,9 +448,12 @@ def test_signature_and_key_hex_must_be_canonical():
 def test_node_difficulty_is_a_u64_hex_or_the_default():
     """XE-0775: the node's advertised difficulty is parsed strictly, and a lying node leaves the defaults."""
     import asyncio
-    from xe.pow import parse_difficulty
-    assert parse_difficulty("fffff80000000000", 7) == 0xFFFFF80000000000
-    assert parse_difficulty("0", 7) == 0 and parse_difficulty(None, 7) == 7 and parse_difficulty("", 7) == 7
+    from xe.pow import DEFAULT_DIFFICULTY, parse_difficulty
+    # the format: 1-16 hex digits in either case, read as a u64. Which well-formed values are then taken
+    # (none easier than the default, "0" included, and none far harder) is the band's test, further down.
+    for well_formed in ("fffff80000000000", "FFFFF80000000000"):
+        assert parse_difficulty(well_formed, DEFAULT_DIFFICULTY) == 0xFFFFF80000000000
+    assert parse_difficulty("7", 7) == 7 and parse_difficulty(None, 7) == 7 and parse_difficulty("", 7) == 7
     for bad in ("zz", "-1", "+ff", "0x10", " ff", "f_f", "1" * 17, 12, True, [], {}):
         with pytest.raises(ValueError):
             parse_difficulty(bad, 7)
