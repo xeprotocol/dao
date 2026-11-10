@@ -156,9 +156,13 @@ async def eligibility(ctx: Context, pr: Proposal, account: str, is_agent: bool) 
     """What an account's vote on this proposal is worth: its snapshot, why it does not participate (if it
     does not), whether it participates, its weight. Derived from the proposal's pinned rules and snapshot
     time, at cast and again at close for any row derived under a different snapshot (XE-1617)."""
-    rules = pr.rules
+    return await eligibility_at(ctx, pr.rules, snapshot_time(pr.opened_at), account, is_agent)
+
+
+async def eligibility_at(ctx: Context, rules: dict, at: int, account: str, is_agent: bool) -> tuple[dict, list[str], bool, int]:
+    """The derivation itself, for a set of pinned rules and a snapshot time. The vote, the re-derivation at
+    close and the public preview all call this one function."""
     pw = rules.get("participating_wallet", {})
-    at = snapshot_time(pr.opened_at)
     reasons = []
     try:
         snap = await account_snapshot(ctx.chain, account, at, rules.get("weight_asset", "XE"))

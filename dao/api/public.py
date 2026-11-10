@@ -175,20 +175,26 @@ async def decisions(db: Db, limit: int = Query(50, ge=1, le=200)):
 
 
 @router.get("/snapshot/{account}")
-async def snapshot(request: Request, account: str, ctx: Ctx, at: int | None = Query(None, ge=0)):
-    """What a wallet's weight and participation would be at time `at` (ns), default now. Reads the wallet's
-    whole chain from the node, so it is metered like a vote."""
-    from ..chainops import account_snapshot
-    if not portal.HEX64.fullmatch(account.lower()):
+async def snapshot(request: Request, account: str, ctx: Ctx, db: Db, proposal: str | None = Query(None, max_length=64)):
+    """What a wallet's vote is worth. With `proposal` (a proposal hash): on that proposal, under the rules
+    and the snapshot time pinned to it when it opened. Without: on a proposal opened now, under the rules
+    it would pin. Either way it is the vote's own derivation (`portal.eligibility`), given what the vote
+    is given, so the preview and the vote cannot answer different questions (XE-2210). The earlier form
+    took a time and applied today's rules to it, which is the question of no vote: a proposal keeps the
+    rules it opened under, and a preview of it under later ones would promise a weight the vote does not
+    give. Reads the wallet's whole chain from the node, so it is metered like a vote."""
+    account = account.lower()
+    if not portal.HEX64.fullmatch(account):
         raise HTTPException(400, "account must be 64 hex characters")
     enforce_ip(request, SNAPSHOT)
-    rules = ctx.config.pinned_rules()
-    at = at or time.time_ns()
-    snap = await account_snapshot(ctx.chain, account.lower(), at)
-    pw = rules["participating_wallet"]
-    return {"account": account.lower(), "at": at, **snap,
-            "participating": snap["exists"] and snap["balance"] >= int(pw.get("min_balance_micro_xe", 0))
-            and account.lower() not in set(rules["excluded_accounts"])}
+    is_agent = account in ctx.config.agent_accounts
+    if proposal is None:
+        snap, reasons, participating, weight = await portal.eligibility_at(
+            ctx, ctx.config.pinned_rules(), portal.snapshot_time(time.time_ns()), account, is_agent)
+    else:
+        snap, reasons, participating, weight = await portal.eligibility(ctx, await portal.get(db, proposal), account, is_agent)
+    return {"account": account, **snap, "weight": weight, "participating": participating,
+            "not_participating_because": reasons}
 
 
 # ---- inbox ------------------------------------------------------------------------------------

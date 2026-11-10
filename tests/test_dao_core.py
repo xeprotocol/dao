@@ -1394,6 +1394,67 @@ def test_an_envelope_from_a_node_is_an_envelope_or_a_chaterror():
             Envelope.from_json(item)
 
 
+# ---- XE-2210: the snapshot preview is the vote's derivation ------------------------------------------------
+
+async def test_the_snapshot_preview_answers_what_the_vote_would(monkeypatch):
+    """For every kind of account and any snapshot time, including time zero, the public preview of a
+    proposal returns what `portal.eligibility` derives for a vote on it: one function, two callers, given
+    the same proposal, so the same pinned rules and the same snapshot."""
+    from dao.api import public
+    from dao.chainops import SNAPSHOT_LEAD_NS
+    from dao.services import portal
+    T = 100 * H
+    holder, agent, excluded, poor, stranger = "a" * 64, "b" * 64, "c" * 64, "d" * 64, "e" * 64
+
+    def held(xe, xusd):
+        return [{"type": "receive", "asset": "XE", "balance": xe, "timestamp": T - 10 * H, "hash": f"x{xe}", "source": "early"},
+                {"type": "receive", "asset": "XUSD", "balance": xusd, "timestamp": T - 9 * H, "hash": f"u{xusd}", "source": "early"}]
+    chain = _Lattice({holder: held(1, 7_000_000), agent: held(2, 8_000_000), excluded: held(3, 9_000_000), poor: held(9_000_000, 4)},
+                     {"early": {"timestamp": T - 20 * H}})
+    rules = {"participating_wallet": {"min_balance_micro_xe": 1_000_000}, "weight_asset": "XUSD", "excluded_accounts": [excluded],
+             "agents": {}}
+    # the rules have changed since the proposals below opened: today's weigh XE and exclude nobody. A preview
+    # of a proposal is under the rules that proposal pinned, as its votes are, not under these
+    today = {"participating_wallet": {"min_balance_micro_xe": 1}, "weight_asset": "XE", "excluded_accounts": [], "agents": {}}
+    ctx = SimpleNamespace(chain=chain, config=SimpleNamespace(pinned_rules=lambda: today, agent_accounts={agent}))
+    proposals = {f"{i:064x}": SimpleNamespace(rules=rules, opened_at=at + SNAPSHOT_LEAD_NS) for i, at in enumerate((T, T - 15 * H, 0))}
+
+    async def get(db, h):
+        if h not in proposals:
+            raise HTTPException(404, "proposal not found")
+        return proposals[h]
+    monkeypatch.setattr(portal, "get", get)
+    n = 0
+    for account in (holder, agent, excluded, poor, stranger):
+        for h, pr in proposals.items():
+            n += 1
+            request = SimpleNamespace(client=SimpleNamespace(host=f"10.0.0.{n}"))
+            preview = await public.snapshot(request, account.upper(), ctx, None, proposal=h)
+            snap, reasons, participating, weight = await portal.eligibility(ctx, pr, account, account in ctx.config.agent_accounts)
+            assert preview == {"account": account, **snap, "weight": weight, "participating": participating,
+                               "not_participating_because": reasons}, (account[0], h[-1])
+            assert preview["at"] == pr.opened_at - SNAPSHOT_LEAD_NS
+    request = SimpleNamespace(client=SimpleNamespace(host="10.0.1.1"))
+    at_T, _, at_zero = proposals
+    p = await public.snapshot(request, holder, ctx, None, proposal=at_T)
+    assert p["balance"] == p["weight"] == 7_000_000 and p["participating"], "the asset that proposal weighs, not today's"
+    assert (await public.snapshot(request, poor, ctx, None, proposal=at_T))["not_participating_because"] == ["balance below the participation minimum at snapshot"]
+    assert (await public.snapshot(request, excluded, ctx, None, proposal=at_T))["weight"] == 0
+    zero = await public.snapshot(request, holder, ctx, None, proposal=at_zero)
+    assert zero["at"] == 0 and not zero["exists"] and not zero["participating"], "a snapshot at time zero is time zero, not now"
+    # with no proposal named: a proposal opened now, under the rules it would pin, at the snapshot it would take
+    now = await public.snapshot(request, holder, ctx, None, proposal=None)
+    assert abs(now["at"] - (time.time_ns() - SNAPSHOT_LEAD_NS)) < 60 * 10**9 and now["balance"] == now["weight"] == 1
+    assert (await public.snapshot(request, excluded, ctx, None, proposal=None))["weight"] == 3, "today's rules exclude nobody"
+    with pytest.raises(HTTPException) as e:
+        await public.snapshot(request, holder, ctx, None, proposal="f" * 64)
+    assert e.value.status_code == 404
+    for bad in ("xyz", "a" * 63, "a" * 65):
+        with pytest.raises(HTTPException) as e:
+            await public.snapshot(request, bad, ctx, None, proposal=at_T)
+        assert e.value.status_code == 400
+
+
 async def test_a_block_signature_from_a_key_no_longer_in_the_keyset_is_counted_nowhere(monkeypatch):
     """XE-2713: whether a block has its signatures is one count, of signatures from keys in the keyset
     now, asked by every site that sends a block to the chain or decides why the chain refused it."""
