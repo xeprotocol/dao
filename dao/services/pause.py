@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import signatures
 from ..auth import Verified
 from ..context import Context
 from ..models import PauseRecord
@@ -95,29 +96,36 @@ def _draft_post(ctx: Context, ground: str) -> str:
             f"and what happens next.")
 
 
+def _signers(ctx: Context) -> dict[str, str]:
+    """The seats whose signature a pause counts: current members who hold the pause right, each with the
+    key it holds today. The set that is counted is the set the routes let sign, so consent can always be
+    reached (XE-1013)."""
+    return {s.id: s.public_key for s in ctx.config.members if s.can("pause")}
+
+
 def _consent(ctx: Context, sigs: list[dict]) -> tuple[bool, int, list[str]]:
-    """Every current member who holds the pause right must have signed: the set that is counted is the set
-    the routes let sign, so consent can always be reached (XE-1013). A signature from a seat that has since
-    left the company carries nothing (XE-0646, as XE-0600 for resolutions): (met, live_count, set_aside_seats)."""
-    current = {s.id: s.public_key for s in ctx.config.members if s.can("pause")}
-    # ... and made with the key the seat holds today, as for resolutions (XE-1761).
-    live = [s for s in sigs if current.get(s["seat"]) and current[s["seat"]] == (s.get("public_key") or "").lower()]
-    set_aside = sorted({s["seat"] for s in sigs} - {s["seat"] for s in live})
-    return len(live) >= len(current), len(live), set_aside
+    """Every seat in `_signers` must hold a signature that counts (`dao.signatures`): (met, live_count,
+    set_aside_seats)."""
+    seats = _signers(ctx)
+    live, set_aside = signatures.counting(seats, sigs)
+    return len(live) >= len(seats), len(live), set_aside
+
+
+def _signed(ctx: Context, sigs: list[dict], v: Verified, refusal: str) -> list[dict]:
+    return signatures.add(_signers(ctx), sigs, {"seat": v.seat.id, "public_key": v.pub_key, "signature": v.signature,
+                                                "timestamp": v.timestamp}, refusal)
 
 
 async def extend(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) -> PauseRecord:
     """Extensions need every current member: the first signature is recorded, the last applies it."""
     require_in_force(r)
     pending = [e for e in r.extensions if not e.get("applied")]
-    sigs = (pending[0]["signatures"] if pending else [])
-    if any(s["seat"] == v.seat.id for s in sigs):
-        raise HTTPException(409, "this member already signed this extension")
-    sigs = [*sigs, {"seat": v.seat.id, "public_key": v.pub_key, "signature": v.signature, "timestamp": v.timestamp}]
+    sigs = _signed(ctx, pending[0]["signatures"] if pending else [], v, "this member already signed this extension")
     entry = {"signatures": sigs, "applied": False, "reason": clean_text(v.payload.get("reason"), "reason", max_len=2000, required=False)}
     met, n_live, set_aside = _consent(ctx, sigs)
     if met:
         entry["applied"] = True
+        entry["signatures"] = signatures.counting(_signers(ctx), sigs)[0]   # what it was applied with, and no others
         base = max(r.expires_at, time.time_ns())
         r.expires_at = base + int(ctx.config.pause.get("extension_days", 7)) * D
         entry["new_expires_at"] = r.expires_at
@@ -132,12 +140,11 @@ async def extend(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) ->
 async def lift(ctx: Context, db: AsyncSession, r: PauseRecord, v: Verified) -> PauseRecord:
     """Lifting early needs every current member, like an extension."""
     require_in_force(r)
-    if any(s["seat"] == v.seat.id for s in r.lifted_by):
-        raise HTTPException(409, "already signed")
-    r.lifted_by = [*r.lifted_by, {"seat": v.seat.id, "public_key": v.pub_key, "signature": v.signature, "timestamp": v.timestamp}]
+    r.lifted_by = _signed(ctx, r.lifted_by, v, "already signed")
     met, n_live, set_aside = _consent(ctx, r.lifted_by)
     if met:
         r.status = "lifted"
+        r.lifted_by = signatures.counting(_signers(ctx), r.lifted_by)[0]   # what it was lifted with, and no others
         r.lifted_at = time.time_ns()
         await ctx.events.append(db, "pause.lifted", v.actor, {"pause_id": r.id, "lifted_at": r.lifted_at,
                                                                **({"set_aside": set_aside} if set_aside else {})}, ref=f"pause:{r.id}")
@@ -194,12 +201,17 @@ async def history(db: AsyncSession, limit: int = 50) -> list[PauseRecord]:
     return list((await db.execute(select(PauseRecord).order_by(PauseRecord.started_at.desc()).limit(limit))).scalars().all())
 
 
-def to_dict(r: PauseRecord) -> dict:
+def to_dict(ctx: Context, r: PauseRecord) -> dict:
+    """Signature counts are the counts the gate uses. What is still being collected on an active pause (an
+    extension not yet applied, the lift) shows the signatures that count now, so a reader never sees "2"
+    beside a step that is waiting for a second signature; what is done shows what it was done with."""
+    def count(sigs: list[dict], pending: bool) -> int:
+        return _consent(ctx, sigs)[1] if pending and r.status == "active" else len(sigs)
     return {
         "id": r.id, "status": r.status, "determined_by": r.determined_by, "ground": r.ground,
         "determination": r.determination, "started_at": r.started_at, "expires_at": r.expires_at,
-        "indefinite": r.indefinite, "extensions": [{"applied": e.get("applied"), "signatures": len(e.get("signatures", [])),
-                                                    "new_expires_at": e.get("new_expires_at"), "reason": e.get("reason", "")}
-                                                   for e in r.extensions],
-        "lifted_at": r.lifted_at, "lift_signatures": len(r.lifted_by), "post_text": r.post_text, "posted_at": r.posted_at,
+        "indefinite": r.indefinite,
+        "extensions": [{"applied": e.get("applied"), "signatures": count(e.get("signatures", []), not e.get("applied")),
+                        "new_expires_at": e.get("new_expires_at"), "reason": e.get("reason", "")} for e in r.extensions],
+        "lifted_at": r.lifted_at, "lift_signatures": count(r.lifted_by, True), "post_text": r.post_text, "posted_at": r.posted_at,
     }

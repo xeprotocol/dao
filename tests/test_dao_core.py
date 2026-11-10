@@ -1293,3 +1293,39 @@ def test_an_envelope_from_a_node_is_an_envelope_or_a_chaterror():
             Envelope.from_json(item)
 
 
+async def test_a_block_signature_from_a_key_no_longer_in_the_keyset_is_counted_nowhere(monkeypatch):
+    """XE-2713: whether a block has its signatures is one count, of signatures from keys in the keyset
+    now, asked by every site that sends a block to the chain or decides why the chain refused it."""
+    from dao.services import sessions
+    k1, k2, gone = (KeyPair.generate() for _ in range(3))
+    block_hash = "ab" * 32
+
+    def sig(kp):
+        return kp.sign_hex(bytes.fromhex(block_hash))
+    ks = {"keys": [k1.pub_key_hex, k2.pub_key_hex], "threshold": 2}
+    s = SimpleNamespace(id="s1", status="signing", not_before=0, block={"index": 3, "prev_hash": "tip"}, block_hash=block_hash,
+                        block_signatures=[{"public_key": gone.pub_key_hex, "signature": sig(gone)}])
+    submitted = []
+
+    async def nothing(*a, **k):
+        return None
+
+    async def keyset():
+        return ks
+
+    async def tip():
+        return {"hash": "tip", "index": 2, "timestamp": 1}
+
+    async def submit(ctx_, db_, s_):
+        submitted.append(len(s_.block_signatures))
+    ctx = SimpleNamespace(chain=SimpleNamespace(dao_keyset=keyset, statechain_tip=tip), events=SimpleNamespace(append=nothing))
+    monkeypatch.setattr(sessions, "require_unpaused", nothing)
+    monkeypatch.setattr(sessions, "submit", submit)
+    # two signatures on the block, one of them from a key rotated out: two of two is not met, at any site
+    await sessions.sign(ctx, None, s, k1.pub_key_hex, sig(k1), "member:a")
+    assert len(s.block_signatures) == 2 and not submitted
+    assert not sessions.signatures_met(s, ks) and not sessions.ready_to_submit(s, ks)
+    assert await sessions._moved_under(ctx, s) == "session.keyset_moved"
+    # the second live signature is the one that sends it
+    await sessions.sign(ctx, None, s, k2.pub_key_hex, sig(k2), "member:b")
+    assert submitted == [3] and sessions.ready_to_submit(s, ks) and await sessions._moved_under(ctx, s) is None

@@ -111,10 +111,10 @@ async def pause_state(ctx: Ctx, db: Db):
     a = await pause_svc.active(db)
     return {
         "paused": a is not None,
-        "active": pause_svc.to_dict(a) if a else None,
+        "active": pause_svc.to_dict(ctx, a) if a else None,
         "rules": ctx.config.pause,
         "notice": ctx.config.copy_legal.get("pause_notice", "").strip(),
-        "history": [pause_svc.to_dict(r) for r in await pause_svc.history(db)],
+        "history": [pause_svc.to_dict(ctx, r) for r in await pause_svc.history(db)],
     }
 
 

@@ -496,7 +496,7 @@ def _seat(payload, pr=None):
     return v
 
 
-def _member(seat, rights=("pause",), key="p" * 64):
+def _member(seat, rights=("pause", "sign_resolutions"), key="p" * 64):
     return SimpleNamespace(id=seat, is_member=True, public_key=key, can=lambda r, _rs=frozenset(rights): r in _rs)
 
 
@@ -665,7 +665,8 @@ async def test_resolution_counts_only_current_members(db):
     ev = (await db.execute(select(Event).where(Event.kind == "resolution.signed"))).scalars().all()[-1]
     assert ev.payload["for"] == 1 and ev.payload["set_aside"] == ["gone"]
     await resolutions.decide(ctx, db, r, member("founder-b", "for"), "for")
-    assert r.status == "passed"
+    assert r.status == "passed" and sorted(s["seat"] for s in r.signatures) == ["founder-a", "founder-b"], \
+        "passed, and the record holds the signatures that passed it: not the one that never counted"
 
 
 # ---- XE-0646: a pause counts only current members' signatures -----------------------------------
@@ -693,7 +694,8 @@ async def test_pause_lift_ignores_a_departed_members_signature(db):
     ev = (await db.execute(select(Event).where(Event.kind == "pause.lift_signed"))).scalars().all()[-1]
     assert ev.payload["signatures"] == 1 and ev.payload["set_aside"] == ["gone"]
     await pause.lift(ctx, db, r, member("founder-b"))
-    assert r.status == "lifted"
+    assert r.status == "lifted" and sorted(s["seat"] for s in r.lifted_by) == ["founder-a", "founder-b"], \
+        "lifted, and the record holds the signatures it was lifted with: not the one that never counted"
     # the same rule for an extension
     r2 = PauseRecord(id="p2", determined_by="founder-a", ground="g", determination="d" * 20, started_at=now,
                      expires_at=now + 10 ** 12, indefinite=False, lifted_by=[], status="active",
@@ -769,7 +771,10 @@ async def test_change_keyset_opens_a_keyset_session_and_bad_ops_are_refused_when
     ctx.config.members = [_member("founder-a")]
     ctx.config.windows = {}
     k1, k2, k3 = (KeyPair.generate().pub_key_hex for _ in range(3))
-    ctx.config.human_seats = [SimpleNamespace(public_key=k1), SimpleNamespace(public_key=k2)]   # k3 is nobody's
+    k5 = KeyPair.generate().pub_key_hex
+    # k3 is nobody's; k5 is held by a seat that may not sign a state-chain block, which is the same thing (XE-2028)
+    ctx.config.human_seats = [_member("a", ("sign_statechain",), k1), _member("b", ("sign_statechain",), k2),
+                              _member("c", ("pause", "sign_resolutions"), k5)]
     good = [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2, k3], "threshold": 2}}]
 
     def proposer(payload):
@@ -797,6 +802,8 @@ async def test_change_keyset_opens_a_keyset_session_and_bad_ops_are_refused_when
     await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k3], "threshold": 2}}], "held by a seat")
     k4 = KeyPair.generate().pub_key_hex
     await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k3, k4], "threshold": 2}}], "held by a seat")
+    await refused("change_keyset", [{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k5], "threshold": 2}}], "held by a seat")
+    assert sessions.seat_keys_of(ctx.config) == {k1, k2}
 
     r = await resolutions.propose(ctx, db, proposer({"title": "rotate", "body": "b", "matter": "change_keyset", "ops": good}))
     await db.flush()
@@ -1870,7 +1877,7 @@ async def test_unreadable_chain_weighs_nothing_agent_class_is_live_and_open_tall
 async def test_proposal_ops_must_be_ones_some_resolution_could_authorise(db):
     ctx = _ctx()
     k1, k2, k3 = (KeyPair.generate().pub_key_hex for _ in range(3))
-    ctx.config.human_seats = [SimpleNamespace(public_key=k1), SimpleNamespace(public_key=k2)]
+    ctx.config.human_seats = [_member("a", ("sign_statechain",), k1), _member("b", ("sign_statechain",), k2)]
     seat_keys = sessions.seat_keys_of(ctx.config)
     sessions.check_proposal_ops(sessions.normalise_ops([{"action": "set", "key": "dao.param.x", "value": 1}]), seat_keys)
     sessions.check_proposal_ops(sessions.normalise_ops([{"action": "set", "key": "sys.dao_keyset", "value": {"keys": [k1, k2], "threshold": 2}}]), seat_keys)
@@ -1884,6 +1891,97 @@ async def test_proposal_ops_must_be_ones_some_resolution_could_authorise(db):
         with pytest.raises(HTTPException) as e:
             await portal.submit(ctx, db, _v(payload={"title": "t", "body": "b", "fee_block_hash": "c" * 64, "ops": ops}))
         assert e.value.status_code == 400
+
+
+# ---- XE-1966: a seat whose stored signature no longer counts has not signed ----------------------------------
+
+def _signed_by(seat, key, payload, rights=("pause",)):
+    v = _v(payload=payload)
+    v.seat, v.pub_key = _member(seat, rights, key), key
+    return v
+
+
+async def test_a_set_aside_signature_is_replaced_by_the_seats_next_one_and_a_live_one_is_not(db):
+    """The rule on every record that keeps member signatures (a resolution, a pause extension, a pause
+    lift): the seat whose stored signature was set aside signs again and the new one takes its place; a
+    seat whose signature counts cannot sign twice; and the threshold is then reachable."""
+    from dao.models import PauseRecord
+    from dao.services import pause, resolutions
+    ctx = _ctx()
+    old, new, kb = "0" * 64, "a" * 64, "b" * 64
+    ctx.config.members = [_member("founder-a", key=new), _member("founder-b", key=kb)]
+    ctx.config.windows, ctx.config.pause = {}, {}
+    now = time.time_ns()
+    stale = {"seat": "founder-a", "public_key": old, "signature": "made-with-the-old-key", "timestamp": 1}
+    r = Resolution(id="r1", number=1, title="t", body="b", matter="note", ops=None, proposed_by="founder-a", status="open",
+                   signatures=[{**stale, "decision": "against"}])
+    p = PauseRecord(id="p1", determined_by="founder-a", ground="g", determination="d" * 20, started_at=now, expires_at=now + 10**12,
+                    indefinite=False, status="active", lifted_by=[stale], extensions=[{"applied": False, "signatures": [stale]}])
+    db.add_all([r, p])
+    await db.flush()
+    sites = [
+        ("resolutions.decide", lambda v: resolutions.decide(ctx, db, r, v, "for"),
+         {"resolution_id": "r1", "body_hash": resolutions.body_hash(r), "decision": "for"},
+         lambda: r.signatures, lambda: r.status == "passed"),
+        ("pause.extend", lambda v: pause.extend(ctx, db, p, v), {"pause_id": "p1", "reason": "more time"},
+         lambda: p.extensions[-1]["signatures"], lambda: p.extensions[-1]["applied"]),
+        ("pause.lift", lambda v: pause.lift(ctx, db, p, v), {"pause_id": "p1"},
+         lambda: p.lifted_by, lambda: p.status == "lifted"),
+    ]
+    for name, sign, payload, sigs, done in sites:
+        assert [s["public_key"] for s in sigs()] == [old], name
+        await sign(_signed_by("founder-a", new, payload))
+        assert [(s["seat"], s["public_key"]) for s in sigs()] == [("founder-a", new)], f"{name}: replaced, not added beside"
+        assert not done(), name
+        with pytest.raises(HTTPException) as e:
+            await sign(_signed_by("founder-a", new, payload))
+        assert e.value.status_code == 409 and len(sigs()) == 1, f"{name}: a signature that counts is not given twice"
+        await sign(_signed_by("founder-b", kb, payload))
+        assert done(), f"{name}: every member has signed, so it is decided"
+        assert sorted(s["seat"] for s in sigs()) == ["founder-a", "founder-b"], name
+    # the same seat rotating again after it signed: the signature it gave is set aside and it signs once more
+    r2 = Resolution(id="r2", number=2, title="t", body="b", matter="note", ops=None, proposed_by="founder-a", status="open", signatures=[])
+    db.add(r2)
+    await db.flush()
+    payload = {"resolution_id": "r2", "body_hash": resolutions.body_hash(r2), "decision": "for"}
+    await resolutions.decide(ctx, db, r2, _signed_by("founder-a", new, payload), "for")
+    newer = "c" * 64
+    ctx.config.members = [_member("founder-a", key=newer), _member("founder-b", key=kb)]
+    assert resolutions.live_signatures(ctx, r2.signatures) == ([], ["founder-a"])
+    await resolutions.decide(ctx, db, r2, _signed_by("founder-a", newer, payload), "for")
+    assert [(s["seat"], s["public_key"]) for s in r2.signatures] == [("founder-a", newer)] and r2.status == "open"
+    await resolutions.decide(ctx, db, r2, _signed_by("founder-b", kb, payload), "for")
+    assert r2.status == "passed"
+    # What is shown is what is counted. An open record shows the signatures that count now and names the
+    # seats set aside; a decided one shows the signatures it was decided with.
+    r3 = Resolution(id="r3", number=3, title="t", body="b", matter="amend_articles", ops=None, proposed_by="founder-a", status="open",
+                    signatures=[{**stale, "decision": "for"}, {"seat": "founder-b", "public_key": kb, "signature": "s", "decision": "for", "timestamp": 2}])
+    shown = resolutions.to_dict(r3, ctx.config)
+    assert [s["seat"] for s in shown["signatures"]] == ["founder-b"] and shown["set_aside"] == ["founder-a"] and shown["needed"] == 2
+    assert [s["seat"] for s in resolutions.to_dict(r2, ctx.config)["signatures"]] == ["founder-a", "founder-b"]
+    p2 = PauseRecord(id="p2", determined_by="founder-a", ground="g", determination="d" * 20, started_at=now, expires_at=now + 10**12,
+                     indefinite=False, status="active", lifted_by=[stale, {**stale, "seat": "founder-b", "public_key": kb}],
+                     extensions=[{"applied": True, "signatures": [stale, stale]}, {"applied": False, "signatures": [stale]}])
+    shown = pause.to_dict(ctx, p2)
+    assert shown["lift_signatures"] == 1 and [e["signatures"] for e in shown["extensions"]] == [2, 0]
+    assert pause.to_dict(ctx, p)["lift_signatures"] == 2, "a lifted pause shows what it was lifted with"
+    # The seats counted are the seats the route lets sign (as for a pause, XE-1013). A member without the
+    # right to sign resolutions is not waited for, and a signature from a seat that has since lost the
+    # right is set aside like one from a seat that has left.
+    ctx.config.members = [_member("founder-a", key=newer), _member("founder-b", key=kb), _member("founder-c", rights=("pause",))]
+    assert resolutions.to_dict(r3, ctx.config)["needed"] == 2, "every member who can sign, not every member"
+    r4 = Resolution(id="r4", number=4, title="t", body="b", matter="amend_articles", ops=None, proposed_by="founder-a", status="open", signatures=[])
+    db.add(r4)
+    await db.flush()
+    payload = {"resolution_id": "r4", "body_hash": resolutions.body_hash(r4), "decision": "for"}
+    await resolutions.decide(ctx, db, r4, _signed_by("founder-a", newer, payload), "for")
+    ctx.config.members = [_member("founder-a", rights=("pause",), key=newer), _member("founder-b", key=kb)]
+    await resolutions.decide(ctx, db, r4, _signed_by("founder-b", kb, payload), "for")
+    assert r4.status == "passed" and [s["seat"] for s in r4.signatures] == ["founder-b"], \
+        "the one member who can sign has signed; the signature from the seat that lost the right is not what passed it, and is not shown as if it had"
+    assert [s["seat"] for s in resolutions.to_dict(r4, ctx.config)["signatures"]] == ["founder-b"]
+
+
 # ---- XE-2209: one bad item from the node costs one item ----------------------------------------------------
 
 async def test_a_chat_item_that_is_not_an_envelope_is_skipped_by_both_readers(db, monkeypatch):

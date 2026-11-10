@@ -42,7 +42,7 @@ async def propose_resolution(req: SignedRequest, ctx: Ctx, db: Db):
 
 @router.post("/resolutions/{res_id}/sign", status_code=201)
 async def sign_resolution(res_id: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_RESOLUTION), ctx.config, right="sign_resolutions", members_only=True)
+    v = require_seat(await verify_and_claim(db, req, DOMAIN_RESOLUTION), ctx.config, right=resolutions.SIGN_RIGHT, members_only=True)
     r = await resolutions.get(db, res_id, lock=True)
     await resolutions.decide(ctx, db, r, v, field_text(v.payload, "decision"))
     await db.commit()
@@ -103,7 +103,7 @@ async def open_anchor(req: SignedRequest, ctx: Ctx, db: Db):
 @router.post("/sessions/{sid}/approve", status_code=201)
 async def approve_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
     """payload = {session_id, ops_digest}; signed under the ops-approval domain by a keyset key."""
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_OPS_APPROVAL), ctx.config, right="sign_statechain")
+    v = require_seat(await verify_and_claim(db, req, DOMAIN_OPS_APPROVAL), ctx.config, right=sessions.SIGN_RIGHT)
     s = await sessions.get(db, sid, lock=True)
     await sessions.approve(ctx, db, s, v)
     await db.commit()
@@ -114,7 +114,7 @@ async def approve_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
 async def rebuild_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
     """Rebuild the block at the live tip. Only when the tip has moved: a rebuild discards every signature
     collected so far, so at an unchanged tip one seat could loop it and stall signing (XE-0882)."""
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right="sign_statechain")
+    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right=sessions.SIGN_RIGHT)
     bind(v, session_id=sid)
     s = await sessions.get(db, sid, lock=True)
     await sessions.rebuild_if_stale(ctx, db, s, actor=v.actor)
@@ -126,7 +126,7 @@ async def rebuild_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
 async def sign_session_block(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
     """payload = {block_hash, block_signature}. The outer SignedRequest proves the seat; the inner
     block_signature is the raw ed25519 signature over the block hash bytes that goes on chain."""
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right="sign_statechain")
+    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right=sessions.SIGN_RIGHT)
     bind(v, session_id=sid)
     s = await sessions.get(db, sid, lock=True)
     if field_text(v.payload, "block_hash") != s.block_hash:
@@ -153,7 +153,7 @@ async def start_pause(req: SignedRequest, ctx: Ctx, db: Db):
     v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right="pause", members_only=True)
     r = await pause_svc.start(ctx, db, v)
     await db.commit()
-    return pause_svc.to_dict(r)
+    return pause_svc.to_dict(ctx, r)
 
 
 @router.post("/pause/{pid}/extend")
@@ -163,7 +163,7 @@ async def extend_pause(pid: str, req: SignedRequest, ctx: Ctx, db: Db):
     r = await _pause(db, pid)
     await pause_svc.extend(ctx, db, r, v)
     await db.commit()
-    return pause_svc.to_dict(r)
+    return pause_svc.to_dict(ctx, r)
 
 
 @router.post("/pause/{pid}/lift")
@@ -173,7 +173,7 @@ async def lift_pause(pid: str, req: SignedRequest, ctx: Ctx, db: Db):
     r = await _pause(db, pid)
     await pause_svc.lift(ctx, db, r, v)
     await db.commit()
-    return pause_svc.to_dict(r)
+    return pause_svc.to_dict(ctx, r)
 
 
 @router.post("/pause/{pid}/post")
@@ -183,7 +183,7 @@ async def pause_post(pid: str, req: SignedRequest, ctx: Ctx, db: Db):
     r = await _pause(db, pid)
     await pause_svc.set_post(ctx, db, r, v)
     await db.commit()
-    return pause_svc.to_dict(r)
+    return pause_svc.to_dict(ctx, r)
 
 
 async def _pause(db, pid: str):

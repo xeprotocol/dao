@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.client import XeError
 
+from .. import signatures
 from ..auth import Verified
 from ..canonical import DOMAIN_RESOLUTION, digest
 from ..context import Context
@@ -31,13 +32,21 @@ RESERVED_MATTERS = {
     "change_schedule_b", "change_schedule_c", "spend", "borrow", "contract",
 }
 ORDINARY_MATTERS = {"note", "registry", "anchor", "parameter", "respond", "adopt_open_vote", "decline_open_vote", "other"}
+SIGN_RIGHT = "sign_resolutions"   # the seat right that lets a member sign a resolution (`dao.api.members`)
+
+
+def _signers(cfg) -> dict[str, str]:
+    """The seats whose signature a resolution counts: the current members who hold the right to sign one,
+    each with the key it holds today. The set that is counted is the set the route lets sign, as it is
+    for a pause (XE-1013): a member without the right is not waited for, and a signature given by a seat
+    that has since lost the right is set aside like one from a seat that has left."""
+    return {s.id: s.public_key for s in cfg.members if s.can(SIGN_RIGHT)}
 
 
 def _matter_rule(cfg, matter: str) -> tuple[int, str]:
-    members = cfg.members
-    n = len(members)
+    n = len(_signers(cfg))
     if matter in RESERVED_MATTERS:
-        return n, "all members"
+        return max(n, 1), "all members"
     return (n // 2) + 1, "majority of members"
 
 
@@ -89,15 +98,8 @@ def body_hash(r: Resolution) -> str:
 
 
 def live_signatures(ctx: Context, sigs: list[dict]) -> tuple[list[dict], list[str]]:
-    """The stored signatures that count now: from a seat that is a current member, made with the key that
-    seat holds today. A seat that has left carries nothing (XE-0600); so does a key the seat has rotated
-    away from, exactly as a session counts approvals against the live keyset: a leaked or retired key must
-    not keep casting its seat's vote on items signed while it was live (XE-1761). Returns (live, set_aside
-    seat ids)."""
-    current = {s.id: s.public_key for s in ctx.config.members}
-    live = [s for s in sigs if current.get(s["seat"]) and current[s["seat"]] == (s.get("public_key") or "").lower()]
-    set_aside = sorted({s["seat"] for s in sigs} - {s["seat"] for s in live})
-    return live, set_aside
+    """The stored signatures that count now, and the seats whose signature was set aside (`dao.signatures`)."""
+    return signatures.counting(_signers(ctx.config), sigs)
 
 
 async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, decision: str) -> Resolution:
@@ -108,10 +110,9 @@ async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, dec
         raise HTTPException(400, "decision must be 'for' or 'against'")
     if v.payload.get("resolution_id") != r.id or v.payload.get("body_hash") != body_hash(r) or v.payload.get("decision") != decision:
         raise HTTPException(400, "signed payload does not match this resolution")
-    if any(s["seat"] == v.seat.id for s in r.signatures):
-        raise HTTPException(409, "this member has already signed")
-    r.signatures = [*r.signatures, {"seat": v.seat.id, "public_key": v.pub_key, "signature": v.signature,
-                                    "decision": decision, "timestamp": v.timestamp}]
+    r.signatures = signatures.add(_signers(ctx.config), r.signatures, {
+        "seat": v.seat.id, "public_key": v.pub_key, "signature": v.signature, "decision": decision, "timestamp": v.timestamp,
+    }, "this member has already signed")
     needed, rule = _matter_rule(ctx.config, r.matter)
     live, set_aside = live_signatures(ctx, r.signatures)
     fors = sum(1 for s in live if s["decision"] == "for")
@@ -120,9 +121,10 @@ async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, dec
         "resolution_id": r.id, "decision": decision, "for": fors, "against": againsts, "needed": needed, "rule": rule,
         **({"set_aside": set_aside} if set_aside else {}),
     }, ref=f"resolution:{r.id}")
-    n_members = len(ctx.config.members)
+    n_members = len(_signers(ctx.config))
     if fors >= needed:
         r.status = "passed"
+        r.signatures = live   # a decided resolution holds the signatures that decided it, and no others
         r.decided_at = datetime.now(timezone.utc)
         await ctx.events.append(db, "resolution.passed", "harness", {
             "resolution_id": r.id, "number": r.number, "title": r.title, "matter": r.matter, "for": fors, "against": againsts,
@@ -137,6 +139,7 @@ async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, dec
                                         {"resolution_id": r.id, "error": str(e)[:300]}, ref=f"resolution:{r.id}")
     elif againsts > n_members - needed:
         r.status = "rejected"
+        r.signatures = live
         r.decided_at = datetime.now(timezone.utc)
         await ctx.events.append(db, "resolution.rejected", "harness", {
             "resolution_id": r.id, "number": r.number, "for": fors, "against": againsts,
@@ -203,11 +206,18 @@ async def list_resolutions(db: AsyncSession, status: str | None = None, limit: i
 
 
 def to_dict(r: Resolution, cfg) -> dict:
+    """An open resolution shows the signatures that count now beside the number needed now, and names the
+    seats whose stored signature was set aside, so what a reader adds up is what `decide` adds up. One that
+    is decided shows the signatures it holds, which are the ones that were counted when it was decided
+    (`decide` keeps no others). `needed` is today's number either way; the number a decision was held to
+    is in its `resolution.signed` event."""
     needed, rule = _matter_rule(cfg, r.matter)
+    shown, set_aside = signatures.counting(_signers(cfg), r.signatures) if r.status == "open" else (r.signatures, [])
     return {
         "id": r.id, "number": r.number, "title": r.title, "body": r.body, "body_hash": body_hash(r), "matter": r.matter,
         "reserved": r.matter in RESERVED_MATTERS, "ops": r.ops, "proposed_by": r.proposed_by, "status": r.status,
-        "signatures": [{"seat": s["seat"], "decision": s["decision"], "timestamp": s["timestamp"]} for s in r.signatures],
+        "signatures": [{"seat": s["seat"], "decision": s["decision"], "timestamp": s["timestamp"]} for s in shown],
+        **({"set_aside": set_aside} if set_aside else {}),
         "needed": needed, "rule": rule, "related_proposal": r.related_proposal, "session_id": r.session_id,
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "decided_at": r.decided_at.isoformat() if r.decided_at else None,

@@ -33,6 +33,7 @@ from . import pause
 
 KINDS = {"registry", "anchor", "parameter", "keyset"}
 KEYSET_KEY = "sys.dao_keyset"
+SIGN_RIGHT = "sign_statechain"   # the seat right that lets a key approve ops and sign a block
 KEY_HEX_RE = re.compile(r"[0-9a-f]{64}")
 MAX_KEYSET = 16
 MAX_OPS = 32
@@ -69,8 +70,11 @@ def check_proposal_ops(ops: list[dict], seat_keys: set[str] | None = None) -> No
 
 
 def seat_keys_of(config) -> set[str]:
-    """The public keys the DAO's human seats hold: the only keys a keyset may ask signatures from."""
-    return {s.public_key for s in config.human_seats if s.public_key}
+    """The keys a keyset may ask signatures from: those held by a human seat the routes let approve and
+    sign a state-chain block (`SIGN_RIGHT`, the right `dao.api.members` requires on both). A seat that
+    holds a key and not the right can do neither, so a keyset whose threshold leans on it is one the
+    seats cannot meet (XE-2028, the same deadlock as XE-1705 by another door)."""
+    return {s.public_key for s in config.human_seats if s.public_key and s.can(SIGN_RIGHT)}
 
 
 def _check_keyset(value, seat_keys: set[str] | None = None) -> None:
@@ -225,6 +229,14 @@ def approvals_met(s: SigningSession, ks: dict) -> bool:
     return sum(1 for a in s.approvals if a["public_key"] in live) >= int(ks["threshold"])
 
 
+def signatures_met(s: SigningSession, ks: dict) -> bool:
+    """The same count on the block's signatures: enough of them from keys that are in the keyset now. Every
+    place that asks whether the block can go to the chain asks this, so a signature from a key rotated out
+    since it was given is counted nowhere (XE-2713)."""
+    live = {k.lower() for k in ks["keys"]}
+    return sum(1 for x in s.block_signatures if x["public_key"] in live) >= int(ks["threshold"])
+
+
 async def approve(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified) -> SigningSession:
     """`v.payload` must be {"session_id", "ops_digest"} and signed by a keyset key (checked via the
     member-action domain by the router); here we additionally require keyset membership."""
@@ -338,7 +350,7 @@ async def sign(ctx: Context, db: AsyncSession, s: SigningSession, pub_key: str, 
     await ctx.events.append(db, "session.block_signed", actor, {
         "session_id": s.id, "block_hash": s.block_hash, "signatures": len(s.block_signatures), "required": ks["threshold"],
     }, ref=f"session:{s.id}")
-    if len(s.block_signatures) >= ks["threshold"]:
+    if signatures_met(s, ks):
         await submit(ctx, db, s)
     return s
 
@@ -387,8 +399,8 @@ KEYSET_MOVED = ("keyset", "signer", "signature")
 
 
 def ready_to_submit(s: SigningSession, ks: dict) -> bool:
-    """A signing session holding a threshold of signatures over its block: its submit is owed to the chain."""
-    return s.status == "signing" and bool(s.block) and len(s.block_signatures) >= int(ks["threshold"])
+    """A signing session holding a threshold of live signatures over its block: its submit is owed to the chain."""
+    return s.status == "signing" and bool(s.block) and signatures_met(s, ks)
 
 
 async def submit(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSession:
