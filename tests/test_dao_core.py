@@ -877,6 +877,28 @@ def test_same_ops_compares_values_by_meaning_not_bytes():
     assert not same_ops(a, [{"action": "set", "key": "dao.x", "value": '{"a":2,"b":2}'}, b[1]])
     assert not same_ops(a, [{"action": "set", "key": "dao.z", "value": '{"a":2,"b":1}'}, b[1]])
     assert not same_ops(None, a) and not same_ops(a, None)
+
+
+def test_same_ops_allows_key_order_and_nothing_else():
+    """XE-2077: the comparison is of the text that goes on the chain, with object keys sorted. Values Python
+    calls equal and the chain does not are different ops, at every depth and in every position."""
+    from dao.services.portal import same_ops
+    op = lambda v: [{"action": "set", "key": "dao.x", "value": v}]  # noqa: E731
+    different = ["1", "1.0", "true", '"1"', "[1]", "0", "0.0", "false", "null", '""', "{}", "[]", '"true"', "2"]
+    for i, x in enumerate(different):
+        for y in different[i + 1:]:
+            assert not same_ops(op(x), op(y)) and not same_ops(op(y), op(x)), (x, y)
+            assert not same_ops(op('{"a":{"b":[%s]}}' % x), op('{"a":{"b":[%s]}}' % y)), (x, y)
+        assert same_ops(op(x), op(x))
+    assert same_ops(op('{"a":{"y":1,"x":[{"q":1,"p":2}]},"b":2}'), op('{"b":2,"a":{"x":[{"p":2,"q":1}],"y":1}}'))
+    assert same_ops(op('{ "a" : 1.0 }'), op('{"a":1e0}')) and same_ops(op('"\\u0061"'), op('"a"')), \
+        "one value spelled two ways is one value"
+    assert not same_ops(op("[1,2]"), op("[2,1]")), "array order is content"
+    assert not same_ops(op("not json"), op("not json")), "a value that is not JSON authorises nothing"
+    assert not same_ops(op("NaN"), op("NaN"))
+    assert not same_ops([{"action": "set", "key": "dao.x"}], [{"action": "set", "key": "dao.x"}])
+
+
 # ---- XE-2209 / XE-1935 / XE-2305 / XE-2353: what the node sends is input, bounded and typed in one place ----
 
 def _node(handler):

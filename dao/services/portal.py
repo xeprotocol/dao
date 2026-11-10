@@ -8,6 +8,7 @@ quorum. Nothing here executes anything: a passed proposal becomes a decision ite
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -377,11 +378,20 @@ async def _decision_resolution(db: AsyncSession, pr: Proposal, res_id: str, *, p
     return r
 
 
+def _key_sorted(value_text: str) -> str:
+    """An op value's text with its object keys sorted at every depth and nothing else changed."""
+    return json.dumps(strict_loads(value_text), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
 def same_ops(a: list[dict] | None, b: list[dict] | None) -> bool:
-    """Whether two op lists write the same state: same actions and keys in order, and values that parse to
-    the same JSON. Values are stored as the exact bytes their author wrote (key order kept, because those
-    bytes go on the chain), so byte equality would refuse `{"a":1,"b":2}` against `{"b":2,"a":1}`, which
-    authorise the same thing (XE-1649, XE-1725)."""
+    """Whether two op lists write the same state: same actions and keys in order, and values that are the
+    same JSON text once object keys are sorted. Values are stored as the exact bytes their author wrote (key
+    order kept, because those bytes go on the chain), so byte equality would refuse `{"a":1,"b":2}` against
+    `{"b":2,"a":1}`, which authorise the same thing (XE-1649, XE-1725). Each value is re-written in one
+    spelling (keys sorted, no whitespace, one form per number and string) and the texts are compared, so
+    the same JSON value spelled two ways is equal and nothing else is. Parsed values are not compared,
+    because Python calls `1`, `1.0` and `true` equal and the chain does not: a resolution writing `1` does
+    not authorise a proposal writing `true` (XE-2077)."""
     if a is None or b is None or len(a) != len(b):
         return False
     for x, y in zip(a, b):
@@ -389,9 +399,9 @@ def same_ops(a: list[dict] | None, b: list[dict] | None) -> bool:
             return False
         if x.get("action") == "set":
             try:
-                if strict_loads(x["value"]) != strict_loads(y["value"]):
+                if _key_sorted(x["value"]) != _key_sorted(y["value"]):
                     return False
-            except (KeyError, ValueError):
+            except (KeyError, TypeError, ValueError):
                 return False
     return True
 
