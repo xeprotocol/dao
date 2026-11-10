@@ -2522,6 +2522,72 @@ async def test_a_reply_has_one_envelope_and_the_nodes_store_says_whether_it_went
     assert "peer unreachable" in again.error
 
 
+# ---- XE-2357: delivery moves a message only out of the status delivery set ---------------------------------
+
+async def test_a_members_status_on_a_message_is_not_undone_by_its_reply_going_out_or_being_given_up(db):
+    from datetime import datetime, timedelta, timezone
+    ctx = _ctx()
+    ctx.signer = FakeSigner(("harness", "fee", "dao"))
+    now = time.time_ns()
+    cases, sent = [], []
+    for delivered in (True, False):   # both callers: the send that succeeds, the reply given up after a week
+        for status in ("replying", "new", "read", "closed", "spam"):
+            m = InboxMessage(id=f"{status}-{'sent' if delivered else 'given-up'}", channel="chat", from_account="a" * 64,
+                             to_account="d" * 64, pub_key="p" * 64, body="q", timestamp=now, signature="s", pow_nonce=0,
+                             verified=True, status="new")
+            db.add(m)
+            await db.flush()
+            o = await inbox.queue_reply(ctx, db, m, f"answer to {m.id}", from_seat="cto")
+            assert m.status == "replying" and m.reply_id == o.id
+            m.status = status   # what a member did with the message after the reply was queued
+            if not delivered:
+                o.created_at = datetime.now(timezone.utc) - timedelta(days=inbox.OUTBOX_RETRY_DAYS + 1)
+            cases.append((m, o, delivered, status))
+    await db.commit()
+
+    async def send(env):
+        sent.append(env["message"])
+    ctx.chain.chat_send = send
+    assert await inbox.flush_outbox(ctx, db) == 5
+    for m, o, delivered, status in cases:
+        assert o.status == ("sent" if delivered else "failed"), m.id
+        assert (o.body in sent) == delivered, m.id
+        was_replying = status == "replying"
+        assert m.status == (("answered" if delivered else "new") if was_replying else status), m.id
+        assert m.reply_id == (o.id if delivered else ""), f"{m.id}: reply_id names only a reply that went out"
+    moved = sorted(e.payload["id"] for e in (await db.execute(select(Event).where(Event.kind == "inbox.status"))).scalars().all())
+    assert moved == ["replying-given-up", "replying-sent"], "the record shows only the moves delivery made"
+    # a reply that is no longer the message's reply moves nothing either way
+    m, o = cases[0][0], cases[0][1]
+    m.status, m.reply_id = "replying", "a-later-reply"
+    await db.flush()
+    for delivered in (True, False):
+        await inbox._reply_outcome(ctx, db, o, delivered=delivered)
+        assert m.status == "replying" and m.reply_id == "a-later-reply"
+    # XE-2629: a follow-up that is given up does not unsend the answer before it. The message is answered,
+    # by the reply that went out; given up with nothing delivered before it, it is new again.
+    m, first = cases[0][0], cases[0][1]
+    m.status, m.reply_id = "answered", first.id
+    second = await inbox.queue_reply(ctx, db, m, "a follow-up", from_seat="cto")
+    assert m.status == "replying" and m.reply_id == second.id
+    second.created_at = datetime.now(timezone.utc) - timedelta(days=inbox.OUTBOX_RETRY_DAYS + 1)
+    await db.commit()
+    assert await inbox.flush_outbox(ctx, db) == 0
+    assert second.status == "failed" and m.status == "answered" and m.reply_id == first.id
+    last = (await db.execute(select(Event).where(Event.kind == "inbox.status").order_by(Event.index.desc()).limit(1))).scalar_one()
+    assert last.payload == {"id": m.id, "status": "answered", "reply": first.id}
+    # the status delivery reads is the one on disk: a member's change made in another session since this
+    # one loaded the message is not overwritten from a stale copy
+    third = await inbox.queue_reply(ctx, db, m, "another", from_seat="cto")
+    await db.commit()
+    async with async_sessionmaker(db.bind, expire_on_commit=False)() as other:
+        await other.execute(text("UPDATE inbox_messages SET status = 'closed' WHERE id = :id"), {"id": m.id})
+        await other.commit()
+    assert m.status == "replying", "this session still holds what it loaded"
+    assert await inbox.flush_outbox(ctx, db) == 1
+    assert third.status == "sent" and m.status == "closed" and m.reply_id == third.id
+
+
 # ---- XE-2209: one bad item from the node costs one item ----------------------------------------------------
 
 async def test_a_chat_item_that_is_not_an_envelope_is_skipped_by_both_readers(db, monkeypatch):

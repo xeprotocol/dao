@@ -305,16 +305,31 @@ def _in_play(o: OutboxMessage) -> bool:
 
 async def _reply_outcome(ctx: Context, db: AsyncSession, o: OutboxMessage, *, delivered: bool) -> None:
     """The inbox message a member's reply answers follows the reply: `answered` once it has gone out, back
-    to `new` if it never will (XE-1776, XE-1846). Acknowledgements leave the message as it is."""
+    to `new` if it never will (XE-1776, XE-1846). Acknowledgements leave the message as it is.
+
+    Delivery moves a message only out of `replying`, the one status delivery itself set. Any other status
+    was put there by a member after the reply was queued (closed, spam, read, or back to new), and a
+    member's decision is not undone by the outbox, in either direction (XE-2357). `reply_id` never names a
+    reply that did not go out: when one is given up it names the last reply that was delivered, if there
+    is one, and the message is `answered` by that reply, since a follow-up that failed does not unsend
+    the answer before it (XE-2629); with none, the link is dropped and the message is `new` again."""
     if o.from_seat == "harness":
         return
-    m = (await db.execute(select(InboxMessage).where(InboxMessage.id == o.in_reply_to))).scalar_one_or_none()
+    # the row as it is now, not as this session last saw it: a member may have changed it since
+    m = (await db.execute(select(InboxMessage).where(InboxMessage.id == o.in_reply_to).with_for_update()
+                          .execution_options(populate_existing=True))).scalar_one_or_none()
     if m is None or m.reply_id != o.id:
         return
-    m.status = "answered" if delivered else "new"
+    answer = o
     if not delivered:
-        m.reply_id = ""
-    await ctx.events.append(db, "inbox.status", "harness", {"id": m.id, "status": m.status, "reply": o.id},
+        answer = (await db.execute(select(OutboxMessage).where(
+            OutboxMessage.in_reply_to == m.id, OutboxMessage.status == "sent", OutboxMessage.from_seat != "harness")
+            .order_by(OutboxMessage.sent_at.desc()).limit(1))).scalar_one_or_none()
+        m.reply_id = answer.id if answer else ""
+    if m.status != "replying":
+        return
+    m.status = "answered" if answer else "new"
+    await ctx.events.append(db, "inbox.status", "harness", {"id": m.id, "status": m.status, "reply": answer.id if answer else o.id},
                             ref=f"inbox:{m.id}")
 
 
