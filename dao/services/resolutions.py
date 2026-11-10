@@ -93,7 +93,11 @@ def session_kind(matter: str) -> str:
     the rotation block to the current keyset's threshold like any other, and the harness signs nothing."""
     if matter == "change_keyset":
         return "keyset"
-    return matter if matter in sessions.KINDS else "parameter"
+    # Every other matter opens a `parameter` session, `registry` and `anchor` included. A session of those
+    # two kinds is a record session: the next state of a record the harness itself composes, one open at a
+    # time (`records._sole_open`). A resolution's ops are the members' own words, and a session carrying
+    # them under a record kind would hold that slot, or be opened beside the one that does (XE-2439).
+    return "parameter"
 
 
 def body_hash(r: Resolution) -> str:

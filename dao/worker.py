@@ -13,6 +13,7 @@ import signal
 import time
 from datetime import datetime, timezone
 
+from fastapi import HTTPException
 from sqlalchemy import select
 
 from xe.client import XeError
@@ -229,11 +230,17 @@ class Worker:
         async with session() as db:
             if await pause.is_paused(db):
                 return
-            pending = await sessions.open_sessions(db, kind="anchor")
-            if pending:
-                log.info("anchor session %s still open; not opening another", pending[0].id)
-            else:
+            # One open anchor session at a time is `records.open_anchor_session`'s rule, held under its lock
+            # (XE-2439); this job asks, and takes the refusal as the answer.
+            try:
                 await records.open_anchor_session(self.ctx, db)
+            except HTTPException as e:
+                if e.status_code != 409:
+                    raise
+                # The members already have an anchor session to sign, so this week's is that one. The run is
+                # marked: asking again every tick until it is signed would change nothing. If it is cancelled
+                # instead, a member opens the next by hand or the job does in a week; health shows the age.
+                log.info("anchor: %s", e.detail)
             await mark_run(db, "anchor")
             await db.commit()
 

@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 from fractions import Fraction
 
+from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -88,7 +89,22 @@ async def onchain_registry(ctx: Context) -> dict | None:
     return await _shared("registry", read)
 
 
+async def _sole_open(db: AsyncSession, kind: str) -> None:
+    """A record session (anchor, registry) is opened only while no other of its kind is open. Each writes
+    the next state of one record: an anchor takes the next number and names the one before it, the registry
+    replaces the whole entry. Two open at once can land in either order, which leaves `dao.anchor.2` on the
+    chain over a `prev_anchor` that never was (XE-2439). The rule is asked here, under a lock, by the one
+    function per kind that opens such a session, so the worker's job and the members' route both inherit
+    it; the first version asked it in the job alone. Sessions opened by a resolution are not record
+    sessions and are not limited."""
+    await serialize(db, f"session.open.{kind}")
+    pending = await sessions.open_sessions(db, kind=kind)
+    if pending:
+        raise HTTPException(409, f"{kind} session {pending[0].id} is still open; it is finished or cancelled before another is opened")
+
+
 async def open_registry_session(ctx: Context, db: AsyncSession, actor: str) -> dict:
+    await _sole_open(db, "registry")
     ops = [{"action": "set", "key": "dao.registry", "value": registry_value(ctx)}]
     s = await sessions.create(ctx, db, kind="registry", title="Write dao.registry", ops=ops, actor=actor)
     return sessions.to_dict(s)
@@ -98,8 +114,8 @@ async def open_registry_session(ctx: Context, db: AsyncSession, actor: str) -> d
 
 async def latest_anchor(db: AsyncSession, *, written: bool = False) -> Anchor | None:
     """The newest anchor; `written=True` for only those that reached the chain. Numbering counts the one in
-    flight, and `open_anchor_session` serialises on the number, so two sessions never take the same n
-    (XE-1435); health counts only what was written (XE-0990)."""
+    flight, and `open_anchor_session` opens one at a time, so two sessions never take the same n (XE-1435)
+    and none is written over a gap (XE-2439); health counts only what was written (XE-0990)."""
     q = select(Anchor).order_by(Anchor.n.desc()).limit(1)
     if written:
         q = q.where(Anchor.statechain_index.isnot(None))
@@ -107,7 +123,7 @@ async def latest_anchor(db: AsyncSession, *, written: bool = False) -> Anchor | 
 
 
 async def open_anchor_session(ctx: Context, db: AsyncSession, actor: str = "harness") -> dict:
-    await serialize(db, "anchor.n")   # two opens at once take consecutive numbers (XE-1435)
+    await _sole_open(db, "anchor")   # one at a time: the second of two opens waits, then is refused
     head = await EventLog.head(db)
     last = await latest_anchor(db)
     n = (last.n + 1) if last else 1

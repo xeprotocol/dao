@@ -1373,20 +1373,36 @@ async def test_concurrent_allocations_take_consecutive_numbers_and_a_reused_fee_
     await db.commit()
     sm = async_sessionmaker(db.bind, expire_on_commit=False)
 
-    # anchors: the first open holds the number until it commits; the second waits, then takes the next one
-    async def open_other():
-        async with sm() as other:
-            out = await records.open_anchor_session(ctx, other, actor="founder-b")
-            await other.commit()
-            return out["title"]
-    first = await records.open_anchor_session(ctx, db)
-    second = asyncio.create_task(open_other())
-    await asyncio.sleep(0.3)
-    assert not second.done(), "the second open must wait for the first to commit"
-    await db.commit()
-    assert first["title"].startswith("Anchor 1:") and (await second).startswith("Anchor 2:")
-    ns = sorted(a.n for a in (await db.execute(select(Anchor))).scalars().all())
-    assert ns == [1, 2]
+    # record sessions, both kinds, from the job and the route alike: the first open holds its place until it
+    # commits; the second waits, then is refused, because one of its kind is open (XE-1435, XE-2439)
+    openers = {"anchor": lambda s, actor: records.open_anchor_session(ctx, s, actor=actor),
+               "registry": lambda s, actor: records.open_registry_session(ctx, s, actor=actor)}
+    ctx.config.registry, ctx.config.charter_hash = {}, "c" * 64
+    for kind, open_ in openers.items():
+        async def open_other():
+            async with sm() as other:
+                try:
+                    await open_(other, "seat:founder-b")
+                except HTTPException as e:
+                    return e.status_code, e.detail
+                await other.commit()
+                return "opened a second"
+        first = await open_(db, "harness")
+        second = asyncio.create_task(open_other())
+        await asyncio.sleep(0.3)
+        assert not second.done(), f"the second {kind} open must wait for the first to commit"
+        await db.commit()
+        code, detail = await second
+        assert code == 409 and first["id"] in detail, (kind, detail)
+        assert [s.id for s in await sessions.open_sessions(db, kind=kind)] == [first["id"]]
+        # once the first is finished (here, cancelled) the next one opens
+        v = _v(payload={"session_id": first["id"]})
+        v.seat = _member("founder-a")
+        await sessions.cancel(ctx, db, await sessions.get(db, first["id"], lock=True), v, "superseded")
+        await db.commit()
+        assert (await open_(db, "harness"))["id"] != first["id"]
+        await db.commit()
+    assert [a.n for a in (await db.execute(select(Anchor))).scalars().all()] == [1], "the cancelled anchor left no row; its number is reused"
 
     # resolution numbers: the same, through _next_number
     async def number_other():
