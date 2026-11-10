@@ -42,7 +42,7 @@ class Worker:
             d = await records.health(self.ctx, db, record=True)
             if not d["ok"]:
                 await self.ctx.events.append(db, "health.degraded", "harness", {k: v for k, v in d.items() if k != "node"}, public=True)
-            await mark_run(db, "health", {"ok": d["ok"]})
+            await mark_run(db, "health", {"ok": d["ok"]}, every_s=records.cadence_s(self.ctx))
             await db.commit()
 
     async def job_directory(self):

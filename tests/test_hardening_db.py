@@ -1059,13 +1059,18 @@ async def test_health_degrades_on_unexpected_keyset_log_tamper_stale_tip_faults_
         assert not d["ok"] and d["errors"] == [err], (leg, d)
     state["fail"] = set()
     assert (await _check(ctx, db))["ok"]
-    # an anchor older than the allowance degrades
-    db.add(Anchor(n=1, event_index=0, head_hash="h" * 64, session_id="a1",
+    # an anchor older than the allowance degrades; an anchor counts once it is on the chain (XE-0990)
+    db.add(Anchor(n=1, event_index=0, head_hash="h" * 64, session_id="a1", statechain_index=5, statechain_hash="s" * 64,
                   created_at=datetime.now(timezone.utc) - timedelta(seconds=records.ANCHOR_OVERDUE_S + 60)))
     await db.flush()
     d = await _check(ctx, db)
     assert not d["ok"] and d["anchor_overdue"] and d["last_anchor"]["n"] == 1
-    db.add(Anchor(n=2, event_index=1, head_hash="i" * 64, session_id="a2"))
+    fresh = Anchor(n=2, event_index=1, head_hash="i" * 64, session_id="a2")
+    db.add(fresh)
+    await db.flush()
+    d = await _check(ctx, db)
+    assert not d["ok"] and d["last_anchor"]["n"] == 1, "a newer anchor still waiting for signatures is not one written"
+    fresh.statechain_index, fresh.statechain_hash = 6, "t" * 64
     await db.flush()
     assert (await _check(ctx, db))["ok"]
     # a session approving for longer than a day is reported
@@ -2591,6 +2596,64 @@ async def test_a_members_status_on_a_message_is_not_undone_by_its_reply_going_ou
     assert m.status == "replying", "this session still holds what it loaded"
     assert await inbox.flush_outbox(ctx, db) == 1
     assert third.status == "sent" and m.status == "closed" and m.reply_id == third.id
+
+
+# ---- XE-2374: the health check keeps to its cadence, so a healthy worker scores full ------------------------
+
+async def test_a_job_marked_on_its_grid_does_not_drift_by_the_time_its_runs_take(db, monkeypatch):
+    """`uptime_30d` counts checks against the cadence exactly. A check marked when it finished runs a
+    cadence after that, so every interval is a run and a scheduler tick too long and a worker with nothing
+    wrong scores under 100%. Marked on its grid, the checks in a window are the window over the cadence."""
+    from dao import worker_schedule as ws
+    clock = {"now": 1_000_000 * ws.NS}
+    monkeypatch.setattr(ws, "time", SimpleNamespace(time_ns=lambda: clock["now"]))
+    every, tick, late = 600, 15, 20   # the scheduler looks every 15 seconds; a run takes 20
+
+    async def run(job, **kw):
+        runs = 0
+        clock["now"] = 1_000_000 * ws.NS
+        end = clock["now"] + 100 * every * ws.NS
+        last = (await ws.last_runs(db)).get(job)
+        while clock["now"] < end:
+            if ws.due_interval(last, every):
+                clock["now"] += late * ws.NS
+                await ws.mark_run(db, job, **kw)
+                await db.flush()
+                last = (await ws.last_runs(db)).get(job)   # read back only when it was written: 4,000 ticks, 100 runs
+                runs += 1
+            clock["now"] += tick * ws.NS
+        return runs
+    assert await run("on-grid", every_s=every) == 100
+    assert await run("from-the-end") < 100, "marked at the end of each run, the same job loses runs to its own duration"
+    # a worker that was down does not run a burst to catch up: the grid starts again from now
+    clock["now"] += 10 * every * ws.NS
+    await ws.mark_run(db, "on-grid", every_s=every)
+    await db.flush()
+    assert (await ws.last_runs(db))["on-grid"] == clock["now"]
+    assert not ws.due_interval(clock["now"], every)
+
+
+# ---- XE-2199: the DAO's start is the earliest thing it recorded -------------------------------------------
+
+async def test_the_daos_start_is_its_first_event_or_its_first_health_check_whichever_is_earlier(db):
+    from dao.services import records
+    ctx, _ = _health_ctx()
+    assert await records.started_at(db) is None
+    assert await records.uptime_30d(ctx, db) == {"checks": 0, "ok": 0, "expected": 0, "fraction": None}
+    # health checks and an empty log: the checks are measured from the first of them, not thrown away
+    now = time.time_ns()
+    first = now - 2 * D
+    db.add_all([HealthCheck(ts=first, ok=True, detail={}), HealthCheck(ts=now - D, ok=False, detail={})])
+    await db.flush()
+    assert await records.started_at(db) == first
+    up = await records.uptime_30d(ctx, db)
+    assert up["checks"] == 2 and up["ok"] == 1 and up["expected"] == 2 * 144 and up["fraction"] == 1 / 288
+    # an event later than the first check does not move the start; an earlier one does
+    await ctx.events.append(db, "worker.started", "harness", {}, ts=now - D)
+    assert await records.started_at(db) == first
+    earlier = await ctx.events.append(db, "worker.started", "harness", {}, ts=now - 3 * D)
+    assert await records.started_at(db) == earlier.ts
+    assert (await records.uptime_30d(ctx, db))["expected"] == 3 * 144
 
 
 # ---- XE-2209: one bad item from the node costs one item ----------------------------------------------------

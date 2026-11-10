@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime, timezone
+from fractions import Fraction
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -317,11 +318,14 @@ async def last_health(db: AsyncSession) -> dict | None:
 
 
 async def started_at(db: AsyncSession) -> int | None:
-    """When the DAO started: the first event in its log, in ns. The clock every "since the beginning"
+    """When the DAO started, in ns: the earliest thing it recorded, which is the first event in its log, or
+    the first health check where that is earlier or the log is empty. The clock every "since the beginning"
     measure runs from, so a leg that has no rows of its own (no anchor written, no health check recorded)
-    is measured against the DAO's age rather than against nothing (XE-1618, XE-1620)."""
-    first = (await db.execute(select(func.min(Event.ts)))).scalar_one()
-    return int(first) if first is not None else None
+    is measured against the DAO's age rather than against nothing (XE-1618, XE-1620). None only when
+    nothing was ever recorded: a reader that sees None has no rows to discard (XE-2199)."""
+    firsts = [(await db.execute(select(func.min(col)))).scalar_one() for col in (Event.ts, HealthCheck.ts)]
+    firsts = [int(x) for x in firsts if x is not None]
+    return min(firsts) if firsts else None
 
 
 async def uptime_30d(ctx: Context, db: AsyncSession) -> dict:
@@ -335,7 +339,7 @@ async def uptime_30d(ctx: Context, db: AsyncSession) -> dict:
     total = len(rows)
     good = sum(1 for _, ok, _ in rows if ok)
     first = await started_at(db)
-    if first is None:
+    if first is None:   # nothing was ever recorded, so there is nothing to count
         return {"checks": 0, "ok": 0, "expected": 0, "fraction": None}
     expected = max(total, expected_checks([(int(ts), int(c) if c else None) for ts, _, c in rows], max(since, first), now, cadence_s(ctx)))
     return {"checks": total, "ok": good, "expected": expected, "fraction": (good / expected) if expected else None}
@@ -345,13 +349,15 @@ def expected_checks(rows: list[tuple[int, int | None]], start_ns: int, now_ns: i
     """How many checks the window should hold: each stretch of it is divided by the cadence that was in
     force then, as the check that opened the stretch recorded it, so a cadence change rewrites nothing
     behind it (XE-1639). A row without a recorded cadence (written before this was kept) uses the current
-    one; the stretch before the first check uses that check's cadence."""
+    one; the stretch before the first check uses that check's cadence. The stretches are summed exactly and
+    the window is rounded once: rounding each stretch to a whole check called every gap of up to a cadence
+    and a half one check, so a worker running at two-thirds speed scored full (XE-2374)."""
     if now_ns <= start_ns:
         return 0
     edges = [(start_ns, (rows[0][1] if rows and rows[0][1] else default_s))]
     edges += [(ts, c or default_s) for ts, c in rows if ts > start_ns]
-    expected = 0
+    expected = Fraction(0)
     for i, (ts, cadence) in enumerate(edges):
         end = edges[i + 1][0] if i + 1 < len(edges) else now_ns
-        expected += int((end - ts) / (max(int(cadence), 1) * 1_000_000_000) + 0.5)   # nearest whole check
-    return expected
+        expected += Fraction(end - ts, max(int(cadence), 1) * 1_000_000_000)
+    return int(expected + Fraction(1, 2))   # nearest whole check, over the whole window

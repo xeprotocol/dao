@@ -899,6 +899,28 @@ def test_same_ops_allows_key_order_and_nothing_else():
     assert not same_ops([{"action": "set", "key": "dao.x"}], [{"action": "set", "key": "dao.x"}])
 
 
+# ---- XE-2374: the window is rounded once ------------------------------------------------------------------
+
+def test_expected_checks_are_summed_exactly_and_rounded_once():
+    """A worker that checks every cadence-and-a-half ran two-thirds of its checks, at any cadence and whether
+    or not the rows recorded one. Rounding each gap to a whole check scored it full."""
+    from dao.services.records import expected_checks
+    S = 10**9
+    day = 86400 * S
+    for cadence in (60, 600, 3600):
+        want = 86400 // cadence
+        for factor in (1.0, 1.25, 1.4, 1.5, 2.0, 3.3):
+            step = int(cadence * factor) * S
+            for recorded in (cadence, None):
+                rows = [(t, recorded) for t in range(0, day, step)]
+                assert expected_checks(rows, 0, day, cadence) == want, (cadence, factor, recorded)
+    # mixed cadences with slow stretches: 12 hours owed at ten minutes, then 12 hours owed hourly
+    rows = [(t, 600) for t in range(0, day // 2, 900 * S)] + [(t, 3600) for t in range(day // 2, day, 5400 * S)]
+    assert expected_checks(rows, 0, day, 600) == 72 + 12
+    # a window shorter than half a check owes none; one past half owes one
+    assert expected_checks([], 0, 299 * S, 600) == 0 and expected_checks([], 0, 301 * S, 600) == 1
+
+
 # ---- XE-2209 / XE-1935 / XE-2305 / XE-2353: what the node sends is input, bounded and typed in one place ----
 
 def _node(handler):

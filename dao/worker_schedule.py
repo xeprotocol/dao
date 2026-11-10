@@ -77,13 +77,22 @@ async def last_runs(db: AsyncSession) -> dict[str, int]:
     return {r.job: r.last_run_ts for r in rows}
 
 
-async def mark_run(db: AsyncSession, job: str, detail: dict | None = None) -> None:
+async def mark_run(db: AsyncSession, job: str, detail: dict | None = None, every_s: int | None = None) -> None:
+    """Record that a job ran. Without `every_s` the mark is the time the run ended, so an interval job runs
+    its interval after it last finished. With it the job keeps to a grid: the mark is the time the run fell
+    due (the last mark plus the interval), so the seconds a run takes and the scheduler's tick are not
+    added to every interval. The health check is marked this way because its runs are counted against the
+    cadence (`records.uptime_30d`), and a worker that ran every 615 seconds for a 600 second cadence would
+    publish 97.6% for a month in which nothing was wrong. A run more than an interval late starts a new
+    grid from now, so a worker that was down does not run a burst to catch up."""
+    now = time.time_ns()
     row = (await db.execute(select(ScheduleRun).where(ScheduleRun.job == job))).scalar_one_or_none()
     if row is None:
-        db.add(ScheduleRun(job=job, last_run_ts=time.time_ns(), detail=detail or {}))
-    else:
-        row.last_run_ts = time.time_ns()
-        row.detail = detail or {}
+        db.add(ScheduleRun(job=job, last_run_ts=now, detail=detail or {}))
+        return
+    due = row.last_run_ts + every_s * NS if every_s else now
+    row.last_run_ts = due if now - (every_s or 0) * NS < due <= now else now
+    row.detail = detail or {}
 
 
 def due_interval(last_ts: int | None, every_s: int) -> bool:
