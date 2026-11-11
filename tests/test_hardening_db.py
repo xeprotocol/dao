@@ -1652,7 +1652,8 @@ async def test_a_refused_submit_whose_block_landed_is_submitted_and_a_rebuild_ne
     ctx.chain.state_blocks[1] = {"index": 1, "hash": "h" * 64}
     await sessions.submit(ctx, db, s2)
     assert s2.status == "submitted" and s2.submitted_index == 1 and s2.submitted_hash == "h" * 64
-    assert (await records.latest_anchor(db)).session_id == "s2"
+    written = await records.latest_anchor(db, written=True)
+    assert written is not None and written.session_id == "s2" and written.statechain_index == 1
     # 3. the node refused and the chain cannot be read: the session stays signing with the error on record
     s3 = await _signing(db, "s3", index=2, n=2)
 
@@ -1922,7 +1923,8 @@ async def test_cancelling_a_session_whose_block_landed_records_it_submitted(db):
     ctx.chain.state_blocks[3] = {"index": 3, "hash": "h" * 64}
     out = await sessions.cancel(ctx, db, s, v, "looks stuck")
     assert out.status == "submitted" and s.submitted_index == 3
-    assert (await records.latest_anchor(db)).session_id == "c1", "the anchor row stays"
+    written = await records.latest_anchor(db, written=True)
+    assert written is not None and written.session_id == "c1" and written.statechain_index == 3
     # a block not on the chain: cancelled, and its anchor row goes
     s2 = await _signing(db, "c2", index=4, n=4)
     await sessions.cancel(ctx, db, s2, v, "withdrawn")
@@ -2733,3 +2735,18 @@ async def test_a_resolution_links_only_a_proposal_that_exists(db):
     assert linked.related_proposal == pr.hash
     for blank in ({}, {"related_proposal": ""}, {"related_proposal": None}):
         assert (await resolutions.propose(ctx, db, proposing(**blank))).related_proposal == ""
+
+
+async def test_submitted_anchor_session_is_immediately_written_for_health_and_register(db):
+    from dao.services import records
+    ctx, _ = _health_ctx()
+    await ctx.events.append(db, "worker.started", "harness", {}, ts=time.time_ns() - 20 * D)
+    s = await _signing(db, "a-now", index=9, n=1)
+    ctx.chain.state_blocks[9] = {"index": 9, "hash": "h" * 64}
+    await sessions.submit(ctx, db, s)
+    await db.flush()
+    rows = await records.anchors(db, 5)
+    assert rows[0]["session_id"] == "a-now" and rows[0]["statechain_index"] == 9
+    assert rows[0]["statechain_hash"] == "h" * 64
+    h = await records.health(ctx, db, record=False)
+    assert not h.get("anchor_overdue") and h["last_anchor"]["n"] == 1
