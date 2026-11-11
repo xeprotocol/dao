@@ -27,7 +27,7 @@ from ..canonical import DOMAIN_PROPOSAL, canonical_json, sha256_hex
 from ..chainops import SNAPSHOT_RULE, account_snapshot, empty_snapshot, snapshot_time
 from ..context import Context
 from ..db import serialize
-from ..models import FeeLedger, Proposal, Resolution, Vote
+from ..models import FeeLedger, Proposal, Resolution, SigningSession, Vote
 from ..text import clean_text, field_text
 from . import sessions
 
@@ -368,9 +368,12 @@ async def _close(ctx: Context, db: AsyncSession, pr: Proposal) -> None:
 
 
 async def _decision_resolution(db: AsyncSession, pr: Proposal, res_id: str, *, passed: bool = True) -> Resolution:
-    """A resolution named by a decision must exist and be about this proposal; for an adoption it must
-    also have passed (XE-0201). A referral names one that is open or passed (XE-1847)."""
-    r = (await db.execute(select(Resolution).where(Resolution.id == res_id))).scalar_one_or_none()
+    """A resolution named by a decision must exist, be about this proposal, and still be live; for a decision
+    other than a referral it must also have passed (XE-0201). A referral names one that is open or passed
+    (XE-1847)."""
+    q = (select(Resolution).where(Resolution.id == res_id)
+         .with_for_update().execution_options(populate_existing=True))
+    r = (await db.execute(q)).scalar_one_or_none()
     if r is None:
         raise HTTPException(400, "resolution_id names no resolution")
     if r.related_proposal != pr.hash:
@@ -379,6 +382,13 @@ async def _decision_resolution(db: AsyncSession, pr: Proposal, res_id: str, *, p
         raise HTTPException(409, f"that resolution is {r.status}, not passed")
     if not passed and r.status not in ("open", "passed"):
         raise HTTPException(409, f"that resolution is {r.status}; a referral names one that is open or passed")
+    if r.session_id:
+        sq = (select(SigningSession).where(SigningSession.id == r.session_id)
+              .with_for_update().execution_options(populate_existing=True))
+        s = (await db.execute(sq)).scalar_one_or_none()
+        if s is None or s.status in ("cancelled", "failed"):
+            state = s.status if s else "missing"
+            raise HTTPException(409, f"that resolution's session is {state}; its ops will not execute")
     return r
 
 
@@ -440,14 +450,25 @@ async def decide(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> P
         # resolution (XE-1847).
         raise HTTPException(400, "refer_to_resolution names the resolution; give its resolution_id")
     resolution = await _decision_resolution(db, pr, res_id, passed=decision != "refer_to_resolution") if res_id else None
+    if resolution is not None and resolution.matter == "adopt_open_vote":
+        if outcome != "passed":
+            msg = f"the vote {outcome or 'has no tally'}; adopt_open_vote needs a passed vote"
+            raise HTTPException(409, msg)
+        if pr.ops and not same_ops(resolution.ops, pr.ops):
+            raise HTTPException(409, "that resolution does not authorise exactly this proposal's ops")
     if decision == "adopt":
         if outcome != "passed":
             raise HTTPException(409, f"the vote {outcome or 'has no tally'}; a proposal is adopted only when it passed")
+        if resolution is not None and resolution.matter == "decline_open_vote":
+            raise HTTPException(409, "that resolution declines this proposal; it cannot authorise adoption")
         if pr.ops:
             if resolution is None:
                 raise HTTPException(409, "a proposal with ops is adopted via a passed resolution; give its resolution_id")
             if not same_ops(resolution.ops, pr.ops):
                 raise HTTPException(409, "that resolution does not authorise exactly this proposal's ops")
+    elif decision == "decline" and resolution and (resolution.matter == "adopt_open_vote" or resolution.ops):
+        msg = "that resolution authorises adoption or ops; it cannot be cited to decline"
+        raise HTTPException(409, msg)
     history = [*pr.decision.get("history", []), {k: x for k, x in pr.decision.items() if k != "history"}] if pr.decision else []
     pr.decision = {"decision": decision, "reasons": reasons, "by": v.seat.id, "timestamp": v.timestamp,
                    "resolution_id": res_id, "outcome": outcome, **({"history": history} if history else {})}

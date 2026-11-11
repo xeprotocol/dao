@@ -26,7 +26,7 @@ from ..db import serialize
 from ..log import EventLog
 from ..models import Proposal, Resolution
 from ..text import clean_text, field_text
-from . import sessions
+from . import portal, sessions
 
 log = logging.getLogger("dao.resolutions")
 
@@ -71,16 +71,32 @@ async def propose(ctx: Context, db: AsyncSession, v: Verified) -> Resolution:
     ops = p.get("ops")
     if matter not in RESERVED_MATTERS | ORDINARY_MATTERS:
         raise HTTPException(400, f"unknown matter {matter!r}")
+    related = field_text(p, "related_proposal", max_len=64).strip().lower()
+    if matter in ("adopt_open_vote", "decline_open_vote") and not related:
+        raise HTTPException(400, f"{matter} names a proposal; give related_proposal")
+    if matter == "decline_open_vote" and ops is not None:
+        raise HTTPException(400, "decline_open_vote may not carry state-chain ops")
     if ops is not None:
         ops = sessions.normalise_ops(ops)
         # Checked now against the session kind the matter will open, so a resolution that cannot execute is
         # refused here and not at its deciding vote (XE-0349).
         sessions.check_ops(session_kind(matter), ops, sessions.seat_keys_of(ctx.config))
     # The link is the resolution's published claim about which open vote it concerns, so it names a proposal
-    # that exists (XE-1945). Whether the resolution may then decide that proposal is `portal.decide`'s question.
-    related = field_text(p, "related_proposal", max_len=64).strip().lower()
-    if related and (await db.execute(select(Proposal.hash).where(Proposal.hash == related))).first() is None:
+    # that exists (XE-1945). Whether a general resolution may then decide that proposal is `portal.decide`'s
+    # question; an open-vote matter is checked against the proposal's ops here so it cannot pass dead.
+    pr = None
+    if related:
+        pr = (await db.execute(select(Proposal).where(Proposal.hash == related))).scalar_one_or_none()
+    if related and pr is None:
         raise HTTPException(400, "related_proposal names no proposal")
+    if matter == "adopt_open_vote":
+        if pr.status != "open" and (pr.result or {}).get("outcome") != "passed":
+            outcome = (pr.result or {}).get("outcome") or "has no tally"
+            raise HTTPException(409, f"the vote {outcome}; adopt_open_vote needs a passed vote")
+        if pr.status == "decided" and (pr.decision or {}).get("decision") == "decline":
+            raise HTTPException(409, "this proposal has already been declined")
+        if pr.ops and not portal.same_ops(ops, pr.ops):
+            raise HTTPException(400, "adopt_open_vote must carry the linked proposal's exact ops")
     r = Resolution(id=secrets.token_hex(8), number=await _next_number(db), title=title, body=body, matter=matter,
                    ops=ops, proposed_by=v.seat.id, status="open", signatures=[], related_proposal=related)
     db.add(r)
