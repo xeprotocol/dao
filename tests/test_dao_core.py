@@ -1596,3 +1596,168 @@ async def test_a_block_signature_from_a_key_no_longer_in_the_keyset_is_counted_n
     # the second live signature is the one that sends it
     await sessions.sign(ctx, None, s, k2.pub_key_hex, sig(k2), "member:b")
     assert submitted == [3] and sessions.ready_to_submit(s, ks) and await sessions._moved_under(ctx, s) is None
+
+
+async def test_a_submitted_anchor_session_marks_its_anchor_row_written_on_every_path(monkeypatch):
+    """Every transition of an anchor session into `submitted` (`submit`, `_refused`, `rebuild`, `cancel`)
+    updates its `Anchor` row in the same transaction, and `worker.job_sessions` reconciles only rows whose
+    `Anchor.statechain_index` is still `None`."""
+    from contextlib import asynccontextmanager
+    from sqlalchemy.dialects import postgresql
+    from dao import worker as worker_mod
+    from dao.models import Anchor, SigningSession
+    from dao.services import pause, records, sessions
+    from xe.client import XeError
+
+    anchors: dict[str, Anchor] = {}
+    updates: list[tuple[str, int, str]] = []
+
+    class _FakeDb:
+        async def execute(self, stmt):
+            sql = str(stmt.compile(dialect=postgresql.dialect()))
+            assert "UPDATE anchors" in sql
+            params = stmt.compile(dialect=postgresql.dialect()).params
+            sid = params["session_id_1"]
+            idx = params["statechain_index"]
+            bh = params["statechain_hash"]
+            updates.append((sid, idx, bh))
+            a = anchors[sid]
+            a.statechain_index = idx
+            a.statechain_hash = bh
+
+    async def noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(sessions, "require_unpaused", noop)
+
+    def make_anchor_session(sid: str, idx: int, kind: str = "anchor") -> SigningSession:
+        bh = f"{idx:064x}"
+        s = SigningSession(
+            id=sid, kind=kind, title="A", ops=[{"action": "set", "key": f"dao.anchor.{idx}", "value": "1"}],
+            ops_digest="f" * 64, status="signing", approvals=[], required_approvals=1,
+            block={"index": idx, "prev_hash": "0" * 64, "timestamp": 1, "hash": bh},
+            block_hash=bh, block_signatures=[], rebuilds=0, not_before=0,
+        )
+        if kind == "anchor":
+            anchors[sid] = Anchor(n=idx, event_index=idx, head_hash="0" * 64, session_id=sid)
+        return s
+
+    db = _FakeDb()
+
+    # 1. submit (accepted + landed on chain)
+    s1 = make_anchor_session("a-submit", 1)
+
+    async def blk_1(i):
+        return {"index": i, "hash": s1.block_hash}
+
+    ctx1 = SimpleNamespace(
+        chain=SimpleNamespace(submit_statechain_block=noop, statechain_block=blk_1),
+        events=SimpleNamespace(append=noop),
+    )
+    await sessions.submit(ctx1, db, s1)
+    assert s1.status == "submitted" and anchors["a-submit"].statechain_index == 1
+    assert anchors["a-submit"].statechain_hash == s1.block_hash
+
+    # 2. submit -> _refused after the block already landed on chain
+    s2 = make_anchor_session("a-refused", 2)
+
+    async def refuse(_blk):
+        raise XeError(400, "publish canceled")
+
+    async def blk_2(i):
+        return {"index": i, "hash": s2.block_hash}
+
+    ctx2 = SimpleNamespace(
+        chain=SimpleNamespace(submit_statechain_block=refuse, statechain_block=blk_2),
+        events=SimpleNamespace(append=noop),
+    )
+    await sessions.submit(ctx2, db, s2)
+    assert s2.status == "submitted" and anchors["a-refused"].statechain_index == 2
+    assert anchors["a-refused"].statechain_hash == s2.block_hash
+
+    # 3. rebuild when the block already landed on chain
+    s3 = make_anchor_session("a-rebuild", 3)
+
+    async def blk_3(i):
+        return {"index": i, "hash": s3.block_hash}
+
+    ctx3 = SimpleNamespace(chain=SimpleNamespace(statechain_block=blk_3), events=SimpleNamespace(append=noop))
+    await sessions.rebuild(ctx3, db, s3)
+    assert s3.status == "submitted" and anchors["a-rebuild"].statechain_index == 3
+
+    # 4. cancel when the block already landed on chain
+    s4 = make_anchor_session("a-cancel", 4)
+
+    async def blk_4(i):
+        return {"index": i, "hash": s4.block_hash}
+
+    ctx4 = SimpleNamespace(chain=SimpleNamespace(statechain_block=blk_4), events=SimpleNamespace(append=noop))
+    await sessions.cancel(ctx4, db, s4, SimpleNamespace(actor="seat:founder-a"), "stuck")
+    assert s4.status == "submitted" and anchors["a-cancel"].statechain_index == 4
+
+    # Non-anchor sessions never touch `anchors`
+    before = len(updates)
+    sp = make_anchor_session("p-submit", 5, kind="parameter")
+
+    async def blk_5(i):
+        return {"index": i, "hash": sp.block_hash}
+
+    ctx5 = SimpleNamespace(
+        chain=SimpleNamespace(submit_statechain_block=noop, statechain_block=blk_5),
+        events=SimpleNamespace(append=noop),
+    )
+    await sessions.submit(ctx5, db, sp)
+    assert sp.status == "submitted" and len(updates) == before
+
+    # worker.job_sessions filters its reconciliation query by `Anchor.statechain_index IS NULL`
+    seen_sql: list[str] = []
+    reconciled: list[tuple[str, int, str]] = []
+    legacy = make_anchor_session("a-legacy", 6)
+    legacy.status, legacy.submitted_index, legacy.submitted_hash = "submitted", 6, legacy.block_hash
+
+    class _Scalars:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class _Res:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return _Scalars(self._rows)
+
+    class _WorkerDb:
+        async def execute(self, stmt):
+            sql = str(stmt.compile(dialect=postgresql.dialect()))
+            seen_sql.append(sql)
+            return _Res([legacy] if "JOIN anchors" in sql else [])
+
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            return None
+
+    @asynccontextmanager
+    async def fake_session():
+        yield _WorkerDb()
+
+    async def fake_paused(_db):
+        return False
+
+    async def fake_note(_db, sid, idx, h):
+        reconciled.append((sid, idx, h))
+
+    monkeypatch.setattr(worker_mod, "session", fake_session)
+    monkeypatch.setattr(worker_mod, "mark_run", noop)
+    monkeypatch.setattr(pause, "is_paused", fake_paused)
+    monkeypatch.setattr(records, "note_anchor_submitted", fake_note)
+
+    w = worker_mod.Worker(SimpleNamespace(events=SimpleNamespace(append=noop)))
+    await w.job_sessions()
+    join_queries = [q for q in seen_sql if "JOIN anchors" in q]
+    assert len(join_queries) == 1 and "anchors.statechain_index IS NULL" in join_queries[0]
+    assert reconciled == [("a-legacy", 6, legacy.block_hash)]

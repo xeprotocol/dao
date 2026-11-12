@@ -19,7 +19,7 @@ import secrets
 import time
 
 from fastapi import HTTPException
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.client import XeError
@@ -392,9 +392,16 @@ async def landed(ctx: Context, s: SigningSession) -> bool:
 
 
 async def _submitted(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSession:
+    """Record a session whose block is on the chain, and mark its anchor row written in the same transaction
+    so health and the public register never lag behind a submitted anchor session."""
     s.status = "submitted"
     s.submitted_index = int(s.block["index"])
     s.submitted_hash = s.block_hash
+    if s.kind == "anchor":
+        await db.execute(
+            update(Anchor).where(Anchor.session_id == s.id)
+            .values(statechain_index=s.submitted_index, statechain_hash=s.submitted_hash)
+        )
     await ctx.events.append(db, "session.submitted", "harness", {
         "session_id": s.id, "kind": s.kind, "index": s.submitted_index, "hash": s.submitted_hash, "ops": s.ops,
     }, ref=f"session:{s.id}")

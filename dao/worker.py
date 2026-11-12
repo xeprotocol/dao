@@ -23,7 +23,7 @@ from .auth import purge_seen_signatures
 from .context import Context, build_context, set_context
 from .db import only_one, session
 from .log import EventLog
-from .models import SigningSession
+from .models import Anchor, SigningSession
 from .services import fees, inbox, pause, portal, records, resolutions, sessions
 from .worker_schedule import due_at, due_interval, job_table, last_runs, mark_run
 
@@ -185,15 +185,21 @@ class Worker:
                         ks = ks or await sessions.live_keyset(self.ctx)
                         if sessions.ready_to_submit(s, ks):
                             await sessions.submit(self.ctx, db, s)
-                    if s.status == "submitted" and s.kind == "anchor":
-                        await records.note_anchor_submitted(db, s.id, s.submitted_index, s.submitted_hash)
                     await db.commit()
                 except Exception as e:
                     await db.rollback()
                     log.warning("session %s: %s", sid, e)
-            # record anchors whose session submitted via the API
-            subm = (await db.execute(select(SigningSession).where(SigningSession.status == "submitted", SigningSession.kind == "anchor"))).scalars().all()
-            for s in subm:
+            # reconcile any pre-existing anchor row whose session was marked submitted without it
+            unwritten = (
+                select(SigningSession)
+                .join(Anchor, Anchor.session_id == SigningSession.id)
+                .where(
+                    SigningSession.status == "submitted",
+                    SigningSession.kind == "anchor",
+                    Anchor.statechain_index.is_(None),
+                )
+            )
+            for s in (await db.execute(unwritten)).scalars().all():
                 await records.note_anchor_submitted(db, s.id, s.submitted_index, s.submitted_hash)
             await mark_run(db, "sessions")
             await db.commit()
