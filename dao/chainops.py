@@ -213,7 +213,7 @@ CAUSAL_LOOKUP_CONCURRENCY = 8
 # Bumped whenever the figure this function derives for the same chain and `at` can change. A vote row
 # stores the result it was derived from; at close, rows derived under another `at` or rule are re-derived
 # before they are tallied (XE-1617).
-SNAPSHOT_RULE = 4
+SNAPSHOT_RULE = 5
 # Block types that raise the asset balance by bringing value from another block, which `source` names.
 ARRIVALS = ("receive", "lease_settle")
 
@@ -233,17 +233,71 @@ def empty_snapshot(at_ns: int, unreadable: str = "") -> dict:
     return d
 
 
+def _attestation_median(b: dict) -> int | None:
+    """The median timestamp of `b`'s timekeeper attestations, None when `b` carries no `attestations` field,
+    or -1 when the field is present with no valid timestamp."""
+    if "attestations" not in b:
+        return None
+    atts = b.get("attestations") or []
+    ts = sorted(a["timestamp"] for a in atts if isinstance(a, dict) and isinstance(a.get("timestamp"), int))
+    return ts[(len(ts) - 1) // 2] if ts else -1
+
+
+def _settle_attested_after(b: dict, at_ns: int) -> bool:
+    """True when a `lease_settle` carries attestations whose median timestamp is after `at_ns` (or empty)."""
+    if b.get("type") != "lease_settle":
+        return False
+    med = _attestation_median(b)
+    return med is not None and (med < 0 or med > at_ns)
+
+
+def _lease_settled_by(lease_hash: str, src: dict, consumer_blocks: list[dict], provider_blocks: list[dict],
+                      at_ns: int) -> bool:
+    """True when lease `src` opened, ran every renewal, and reached effective expiry at or before `at_ns`."""
+    ts = src.get("timestamp", 0)
+    if ts > at_ns:
+        return False
+    start_ns = max(ts, src.get("start_time", 0))
+    for ab in provider_blocks:
+        if ab.get("type") == "lease_accept" and ab.get("source") == lease_hash:
+            med = _attestation_median(ab)
+            if med is not None and med < 0:
+                return False
+            start_ns = max(start_ns, ab.get("timestamp", 0), med or 0)
+    dur_ns = src.get("duration", 0) * 1_000_000_000
+    if start_ns > at_ns or start_ns + dur_ns > at_ns:
+        return False
+    for seg in src.get("renewals") or ():
+        if not isinstance(seg, dict):
+            return False
+        seg_ts = max(seg.get("timestamp", 0), seg.get("start_time", 0))
+        dur_ns += seg.get("duration", 0) * 1_000_000_000
+        if seg_ts > at_ns or start_ns + dur_ns > at_ns:
+            return False
+    for rb in consumer_blocks:
+        if rb.get("type") == "lease_renew" and rb.get("source") == lease_hash:
+            med = _attestation_median(rb)
+            if med is not None and med < 0:
+                return False
+            rb_ts = max(rb.get("timestamp", 0), med or 0)
+            dur_ns += rb.get("duration", 0) * 1_000_000_000
+            if rb_ts > at_ns or start_ns + dur_ns > at_ns:
+                return False
+    return True
+
+
 async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str = "XE") -> dict:
     """Balance of `asset` as of `at_ns`, plus whether the account existed by then.
 
     XE accounts are chains; each block carries the post-state balance for its asset, so the balance at a
     time is the balance on the last counted block of that asset with timestamp <= at_ns. A receive of that
-    asset whose source send is dated after at_ns (see above) is not counted: its amount is carried as
-    `tainted`, which later sends and burns spend first, and what is still tainted at the end is taken off
-    the balance (XE-1003). `snapshot_block` is the last counted block. Node reads are bounded and spent
-    largest receive first (XE-1460, XE-1548, XE-1589, see above); `lookups_capped` says whether the bound
-    was hit. `at` and `rule` record what the figure was derived under, so a stored result can be told
-    from one derived under a different rule (XE-1617).
+    asset whose source send is dated after at_ns, or whose sender in the causal window only had tainted
+    balance to spend, is not counted: its tainted part is carried as `tainted`, which later sends and burns
+    spend first, and what is still tainted at the end is taken off the balance. A `lease_settle`
+    counts only when the lease and all its renewals expired at or before `at_ns`. `snapshot_block`
+    is the last counted block. Node reads are bounded and spent largest arrival first;
+    `lookups_capped` says whether the bound was hit. `at` and `rule` record what the figure was
+    derived under.
     """
     empty = empty_snapshot(at_ns)
     try:
@@ -255,50 +309,203 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
     if not blocks:
         return empty
     first_ts = blocks[0].get("timestamp", 0)
-    window: list[tuple[int, str]] = []   # (amount, source) for each windowed receive of our asset
-    prev = 0
-    for b in blocks:
-        if b.get("timestamp", 0) > at_ns:
-            break
-        if b.get("asset") != asset:
-            continue
-        new_bal = b.get("balance", 0)
-        if b.get("type") in ARRIVALS and b.get("timestamp", 0) > at_ns - CAUSAL_CHECK_NS:
-            window.append((max(new_bal - prev, 0), b.get("source") or ""))
-        prev = new_bal
-    by_amount: dict[str, int] = {}
-    for amount, src in window:
-        by_amount[src] = by_amount.get(src, 0) + amount
-    sources = sorted(by_amount, key=lambda s_: -by_amount[s_])
-    capped = len(sources) > MAX_CAUSAL_LOOKUPS
-    causal = await _sends_at_or_before(chain, sources[:MAX_CAUSAL_LOOKUPS], at_ns)
-    bal = 0        # the asset's on-chain balance after the last block seen
-    tainted = 0    # the part of `bal` that arrived through excluded receives and has not left since
-    snap = ""
-    excluded: list[str] = []
-    counted = 0
-    for b in blocks:
-        ts = b.get("timestamp", 0)
-        if ts > at_ns:
-            break
-        ours = b.get("asset") == asset
-        if ours and b.get("type") in ARRIVALS and ts > at_ns - CAUSAL_CHECK_NS and not causal.get(b.get("source") or "", False):
-            excluded.append(b.get("hash", ""))
+    gate = asyncio.Semaphore(CAUSAL_LOOKUP_CONCURRENCY)
+    blocks_seen: dict[str, dict | None] = {}
+    chains_seen: dict[str, list[dict] | None] = {account: blocks}
+    send_clean: dict[str, int | None] = {}
+    block_budget = MAX_CAUSAL_LOOKUPS
+    chain_budget = MAX_CAUSAL_LOOKUPS
+    capped = False
+
+    async def fetch_one_block(h: str) -> None:
+        async with gate:
+            try:
+                blocks_seen[h] = await chain.block(h)
+            except XeError as e:
+                if e.status == 404:
+                    blocks_seen[h] = None
+                    return
+                raise
+
+    async def ensure_blocks(hashes: list[str]) -> None:
+        nonlocal block_budget, capped
+        unseen = [h for h in hashes if h and h not in blocks_seen]
+        if len(unseen) > block_budget:
+            capped = True
+            unseen = unseen[:block_budget]
+        block_budget -= len(unseen)
+        if unseen:
+            await asyncio.gather(*(fetch_one_block(h) for h in unseen))
+
+    async def fetch_chain(acct: str) -> list[dict] | None:
+        nonlocal chain_budget, capped
+        if acct in chains_seen:
+            return chains_seen[acct]
+        if chain_budget <= 0:
+            capped = True
+            return None
+        chain_budget -= 1
+        async with gate:
+            try:
+                ch = await chain.full_chain(acct)
+            except XeError as e:
+                if e.status in (404, 413):
+                    chains_seen[acct] = None
+                    return None
+                raise
+        chains_seen[acct] = ch
+        for b in ch:
+            if b.get("hash") and b["hash"] not in blocks_seen:
+                blocks_seen[b["hash"]] = b
+        return ch
+
+    async def walk_prev_chain(tip: dict) -> list[dict] | None:
+        seq = [tip]
+        cur = tip
+        while cur.get("previous") not in (None, "", "0"):
+            if cur.get("timestamp", 0) <= at_ns - CAUSAL_CHECK_NS:
+                break
+            prev_h = cur["previous"]
+            await ensure_blocks([prev_h])
+            prev_b = blocks_seen.get(prev_h)
+            if prev_b is None or any(x.get("hash") == prev_h for x in seq):
+                return None
+            seq.append(prev_b)
+            cur = prev_b
+        seq.reverse()
+        return seq
+
+    async def eval_chain(acct_blocks: list[dict], visiting: frozenset[str],
+                         until_hash: str = "") -> tuple[int, int, str, list[str], int]:
+        prefix: list[dict] = []
+        for b in acct_blocks:
+            if b.get("timestamp", 0) > at_ns:
+                break
+            prefix.append(b)
+            if until_hash and b.get("hash") == until_hash:
+                break
+        window: list[tuple[int, str, str]] = []
+        prev = 0
+        for b in prefix:
+            if b.get("asset") != asset:
+                continue
             new_bal = b.get("balance", 0)
-            tainted += max(new_bal - bal, 0)
+            if b.get("type") in ARRIVALS and b.get("timestamp", 0) > at_ns - CAUSAL_CHECK_NS:
+                if not _settle_attested_after(b, at_ns):
+                    window.append((max(new_bal - prev, 0), b.get("source") or "", b.get("type") or ""))
+            prev = new_bal
+        by_amount: dict[str, int] = {}
+        kind_of: dict[str, str] = {}
+        for amount, src_h, kind in window:
+            if src_h:
+                by_amount[src_h] = by_amount.get(src_h, 0) + amount
+                kind_of[src_h] = kind
+        sources = sorted(by_amount, key=lambda s_: -by_amount[s_])
+        await ensure_blocks(sources)
+        clean_pool: dict[str, int | None] = {}
+        for s_hash in sources:
+            src = blocks_seen.get(s_hash)
+            if src is None or src.get("timestamp", 0) > at_ns:
+                clean_pool[s_hash] = 0
+                continue
+            if kind_of.get(s_hash) == "lease_settle" or src.get("type") == "lease":
+                c_acct = src.get("account") or ""
+                c_blocks: list[dict] = []
+                if c_acct:
+                    fetched = await fetch_chain(c_acct)
+                    if fetched is None:
+                        clean_pool[s_hash] = 0
+                        continue
+                    c_blocks = fetched
+                ok = _lease_settled_by(s_hash, src, c_blocks, prefix, at_ns)
+                clean_pool[s_hash] = None if ok else 0
+                continue
+            if src.get("timestamp", 0) <= at_ns - CAUSAL_CHECK_NS:
+                clean_pool[s_hash] = None
+                continue
+            if s_hash in send_clean:
+                clean_pool[s_hash] = send_clean[s_hash]
+                continue
+            sender = src.get("account") or ""
+            prev_h = src.get("previous") or ""
+            if not sender and prev_h in ("", "0"):
+                clean_pool[s_hash] = None
+                continue
+            if sender:
+                if sender in visiting:
+                    clean_pool[s_hash] = 0
+                    continue
+                s_blocks = await fetch_chain(sender)
+                if not s_blocks or not any(sb.get("hash") == s_hash for sb in s_blocks):
+                    clean_pool[s_hash] = 0
+                    continue
+                await eval_chain(s_blocks, visiting | {sender}, until_hash=s_hash)
+                clean_pool[s_hash] = send_clean.get(s_hash, 0)
+            else:
+                if s_hash in visiting:
+                    clean_pool[s_hash] = 0
+                    continue
+                s_blocks = await walk_prev_chain(src)
+                if not s_blocks:
+                    clean_pool[s_hash] = 0
+                    continue
+                await eval_chain(s_blocks, visiting | {s_hash}, until_hash=s_hash)
+                clean_pool[s_hash] = send_clean.get(s_hash, 0)
+        bal = 0
+        tainted = 0
+        snap = ""
+        excluded: list[str] = []
+        counted = 0
+        for b in prefix:
+            ts = b.get("timestamp", 0)
+            ours = b.get("asset") == asset
+            if ours and b.get("type") in ARRIVALS and ts > at_ns - CAUSAL_CHECK_NS:
+                new_bal = b.get("balance", 0)
+                arr_amt = max(new_bal - bal, 0)
+                s_hash = b.get("source") or ""
+                if _settle_attested_after(b, at_ns):
+                    clean_take = 0
+                    bad_zero = True
+                else:
+                    pool = clean_pool.get(s_hash, 0)
+                    if pool is None:
+                        clean_take = arr_amt
+                        bad_zero = False
+                    else:
+                        clean_take = min(arr_amt, pool)
+                        clean_pool[s_hash] = pool - clean_take
+                        bad_zero = pool == 0
+                if clean_take < arr_amt or (arr_amt == 0 and bad_zero):
+                    excluded.append(b.get("hash", ""))
+                    tainted += arr_amt - clean_take
+                    if clean_take == 0:
+                        bal = new_bal
+                        continue
+                counted += 1
+                bal = new_bal
+                snap = b.get("hash", "")
+                continue
+            counted += 1
+            if not ours:
+                continue
+            new_bal = b.get("balance", 0)
+            if new_bal < bal:
+                outflow = bal - new_bal
+                tainted_spent = min(outflow, tainted)
+                clean_out = min(outflow - tainted_spent, max(bal - tainted, 0))
+                if b.get("hash"):
+                    send_clean[b["hash"]] = clean_out
+                tainted -= tainted_spent
+            elif b.get("type") == "send" and b.get("hash"):
+                send_clean[b["hash"]] = 0
             bal = new_bal
-            continue
-        counted += 1
-        if not ours:
-            continue
-        new_bal = b.get("balance", 0)
-        if new_bal < bal:
-            tainted = max(tainted - (bal - new_bal), 0)
-        bal = new_bal
-        snap = b.get("hash", "")
+            snap = b.get("hash", "")
+        return bal, tainted, snap, excluded, counted
+
+    bal, tainted, snap, excluded, counted = await eval_chain(blocks, frozenset({account}))
     return {"exists": first_ts <= at_ns and counted > 0, "balance": max(bal - tainted, 0),
-            "first_block_ts": first_ts, "snapshot_block": snap, "excluded_receives": excluded, "lookups_capped": capped,
-            "at": at_ns, "rule": SNAPSHOT_RULE}
+            "first_block_ts": first_ts, "snapshot_block": snap, "excluded_receives": excluded,
+            "lookups_capped": capped, "at": at_ns, "rule": SNAPSHOT_RULE}
 
 
 async def _sends_at_or_before(chain: XeClient, send_hashes: list[str], at_ns: int) -> dict[str, bool]:
