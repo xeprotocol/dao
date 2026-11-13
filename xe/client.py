@@ -176,14 +176,23 @@ def _typed(v: Any, what: str, *, ints: tuple[str, ...] = (), strs: tuple[str, ..
     return d
 
 
-_BLOCK_INTS = ("balance", "timestamp", "amount")
+_BLOCK_INTS = ("balance", "timestamp", "amount", "duration", "start_time")
 _BLOCK_STRS = ("type", "account", "previous", "asset", "source", "destination", "memo", "pub_key", "hash")
 
 
 def account_block(v: Any) -> dict:
     """An account-chain block as the harness reads one: the fields it computes with are integers, the
     fields it compares are strings. Everything else passes through untouched."""
-    return _typed(v, "block", ints=_BLOCK_INTS, strs=_BLOCK_STRS)
+    d = _typed(v, "block", ints=_BLOCK_INTS, strs=_BLOCK_STRS)
+    if d.get("attestations") is None:
+        d.pop("attestations", None)
+    else:
+        atts = _list(d["attestations"], "block.attestations")
+        d["attestations"] = [
+            _typed(a, "block.attestation", ints=("timestamp",), strs=("public_key", "signature"))
+            for a in atts
+        ]
+    return d
 
 
 # What httpx raises for a request that could not be made or finished. InvalidURL is not an HTTPError: it
