@@ -45,11 +45,20 @@ def test_sign_block_roundtrip():
     assert validate_pow(bytes.fromhex(b.hash), b.pow_nonce, TEST_DIFFICULTY)
 
 
+def _recompacted(d: dict) -> StateBlock:
+    """A captured block with each value written out again compactly. That is the node's bytes only for
+    values whose compact form has one spelling, which the captured ones do; it is not a way to read a
+    block back in general, and the package no longer offers one (XE-10435)."""
+    ops = [StateOp(o["action"], o["key"], compact_json(o["value"]) if o["action"] == "set" else None) for o in d.get("ops", [])]
+    return StateBlock(index=int(d["index"]), prev_hash=d["prev_hash"], ops=ops, timestamp=int(d["timestamp"]),
+                      signatures=list(d.get("signatures") or []), hash=d.get("hash", ""))
+
+
 def test_statechain_oracle_block_hash(statechain):
     """Blocks the node itself marshals (oracle, DAO) carry compact value bytes; re-compacting the API
     output reproduces them exactly."""
     d = statechain["oracle"]
-    blk = StateBlock.from_json(d)
+    blk = _recompacted(d)
     assert hash_state_block(blk) == d["hash"]
     for sig in d["signatures"]:
         verify_state_signature(d["hash"], sig)
@@ -70,7 +79,7 @@ def test_statechain_genesis_hash_is_over_document_bytes(statechain):
     The API serves the values compacted, so genesis cannot be re-hashed from API output alone. Our
     canonical encoding is right; the value bytes must be the document's."""
     d = statechain["genesis"]
-    compact = StateBlock.from_json(d)
+    compact = _recompacted(d)
     assert hash_state_block(compact) != d["hash"], "if this starts matching, the node changed how it hashes genesis"
     ops = [StateOp(o["action"], o["key"], _pretty_nested(o["value"], 4, 3)) for o in d["ops"]]
     doc = StateBlock(index=d["index"], prev_hash=d["prev_hash"], ops=ops, timestamp=d["timestamp"])
@@ -81,7 +90,22 @@ def test_statechain_genesis_hash_is_over_document_bytes(statechain):
 
 def test_statechain_dao_blocks_if_any(statechain):
     for d in statechain.get("dao", []):
-        assert hash_state_block(StateBlock.from_json(d)) == d["hash"]
+        assert hash_state_block(_recompacted(d)) == d["hash"]
+
+
+def test_a_served_block_is_not_rehashed_from_a_parsed_copy_of_its_values():
+    """XE-10435: values that parse and do not write out as they were. A block holding one hashes over
+    the bytes it holds; a copy re-serialised from the parsed value hashes to something else, which is why
+    nothing in the package reads a block back that way."""
+    import json
+
+    import xe.statechain as sc
+    assert not hasattr(StateBlock, "from_json") and not hasattr(sc, "_op_from_wire")
+    for raw in ("1e2", "1.50", '"\\u0041"', '{"a":1,"a":2}', "-0.0e0"):
+        held = StateBlock(index=1, prev_hash="0" * 64, ops=[StateOp("set", "dao.x", raw)], timestamp=1)
+        again = StateBlock(index=1, prev_hash="0" * 64, ops=[StateOp("set", "dao.x", compact_json(json.loads(raw)))], timestamp=1)
+        assert hash_state_block(held) != hash_state_block(again), raw
+        assert f'"value":{raw}' in held.to_wire(), "what is sent is the text that was hashed"
 
 
 def test_compact_json_matches_go_rawmessage():
@@ -145,3 +169,21 @@ def test_directory_registration_roundtrip():
 def test_address_domain():
     pub = bytes(32)
     assert derive_address(pub.hex()) == hashlib.sha256(b"xe/account/v1" + pub).hexdigest()
+
+
+# ---- XE-9785: hex the ledger lowercases is lowercased before it is hashed or compared ---------------------
+
+def test_an_opening_block_hashes_the_same_however_its_pub_key_and_hash_are_spelled(blocks):
+    from xe.encoding import verify_block_hash
+    d = blocks["open"]
+    assert d["pub_key"].upper() != d["pub_key"], "the vector's key has letters in it"
+    shouted = Block.from_json({**d, "pub_key": d["pub_key"].upper()})
+    assert hash_block(shouted, NETWORK_ID) == d["hash"]
+    verify_open_block_signature(shouted, NETWORK_ID)
+    verify_block_hash(Block.from_json({**d, "hash": d["hash"].upper()}), NETWORK_ID)
+    # every other hex field of the canonical section is decoded, so its case never reached the hash
+    for name in ("send", "receive"):
+        b = blocks[name]
+        loud = {k: (v.upper() if k in ("account", "previous", "destination", "source", "representative") and isinstance(v, str) and len(v) == 64 else v)
+                for k, v in b.items()}
+        assert hash_block(Block.from_json(loud), NETWORK_ID) == b["hash"], name

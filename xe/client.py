@@ -39,13 +39,28 @@ MAX_CHAIN_PAGES = 100   # 100,000 blocks: far past any account the harness reads
 # The largest honest response is a full page of account blocks, about 0.6 MiB; a state-chain block is at
 # most 256 KiB. Nothing the harness asks for is close to this.
 MAX_BODY_BYTES = 8 * 1024 * 1024
+# The one read that is a whole store: /chat/messages answers with every envelope the node holds for the
+# account past `since`, in one array with no limit to ask for. A node keeps 1,000 envelopes per account of
+# up to 8,192 message bytes each, and its JSON writes some bytes as six (`<` as \u003c), so the largest
+# answer an honest node can give is about 50 MB. The bound on this read is sized to that. Under the general
+# bound a full store was an answer the harness could never take, and since the store only empties with
+# time, never again: a thousand large envelopes from anyone closed the DAO's chat (XE-11882).
+CHAT_STORE_ENVELOPES = 1000
+MAX_CHAT_STORE_BYTES = CHAT_STORE_ENVELOPES * (6 * 8192 + 2048)
 REQUEST_DEADLINE_S = 60.0   # the whole of one request, headers to last byte; httpx's own timeout bounds each gap
+# The same read gets the time its size needs: 50 MB inside the general minute asks for 7 Mbit/s of every
+# node, and a full store on a slower link was the same closed chat by the other bound.
+CHAT_STORE_DEADLINE_S = 300.0
+MAX_BALANCE_ASSETS = 256    # a balance is stored with every treasury snapshot and shown on the public pages
 STREAM_IDLE_S = 90.0        # the node writes a ping to the chat stream every 20 seconds
 MAX_STREAM_LINE = 64 * 1024  # a chat envelope carries at most 8,192 bytes of message
 MAX_ERROR_CHARS = 500
 MAX_READY_BYTES = 4096      # /ready is a short status object; the health check stores what it is given
 MAX_CHALLENGE_CHARS = 256   # the chat challenge travels back in a query string
 MAX_HASH_CHARS = 128        # a hash is 64 hex characters
+MAX_IDENT_CHARS = 128       # a network id, a node id, a version: short names the harness stores and publishes
+MAX_KEYSET_KEYS = 256       # far past any keyset the protocol takes; a bound on what is kept, not a rule of it
+_KEY_HEX = re.compile(r"[0-9a-fA-F]{64}")
 INT_LIMIT = 2**63           # what a BIGINT column holds; every XE amount and nanosecond timestamp is far below it
 
 
@@ -117,13 +132,25 @@ def _keyset(v: Any, what: str, *, need: bool) -> dict:
     passed through as it is (an account that is not multisig)."""
     ks = _typed(v, what, ints=("threshold",), need=("keys", "threshold") if need else ())
     if "keys" not in ks:
-        return ks
+        return _plain(ks)
     keys = _list(ks["keys"], f"{what}.keys")
-    if any(not isinstance(k, str) for k in keys):
-        raise malformed(f"{what}.keys holds a key that is not a string")
+    if len(keys) > MAX_KEYSET_KEYS:
+        raise malformed(f"{what}.keys holds more than {MAX_KEYSET_KEYS} keys")
+    if any(not isinstance(k, str) or not _KEY_HEX.fullmatch(k) for k in keys):
+        # A keyset is stored with every health check and shown on the public pages. What is kept is keys:
+        # 64 hex characters each, and a bounded number of them (XE-10109, XE-10320).
+        raise malformed(f"{what}.keys holds a key that is not 64 hex characters")
     if not 1 <= ks.get("threshold", 0) <= len(keys):
         raise malformed(f"{what}.threshold is not between 1 and the number of keys")
-    return {**ks, "keys": [k.lower() for k in keys]}
+    return {**_plain(ks), "keys": [k.lower() for k in keys]}
+
+
+def _plain(obj: dict) -> dict:
+    """The short scalar fields of a node object. Whatever else a keyset answer carries beside its keys is
+    not something the harness reads, and it is stored and published with the keys: an unbounded string or
+    a nested megabyte there was the same stored bloat by the field next door (XE-10109)."""
+    return {k: v for k, v in obj.items() if len(str(k)) <= MAX_IDENT_CHARS
+            and (v is None or isinstance(v, (bool, int)) or (isinstance(v, str) and len(v) <= MAX_IDENT_CHARS))}
 
 
 # `\u0000` as JSON spells it: the escape, not the same six characters after an escaped backslash. A raw
@@ -135,11 +162,21 @@ def _refuse_constant(name: str) -> Any:
     raise ValueError(f"{name} is not JSON")
 
 
+def _finite_float(text: str) -> float:
+    f = float(text)
+    if f != f or f in (float("inf"), float("-inf")):
+        raise ValueError(f"{text[:24]} is not a finite number")
+    return f
+
+
 def _parse(raw: bytes) -> Any:
     """JSON from the node, as values the harness can keep. Three things a lenient parser lets through are
     refused here, once, for every read and the chat stream alike: NaN and Infinity (not JSON, and not
     storable as JSON), a NUL character, and a surrogate with no pair (neither is text Postgres or UTF-8
-    will take). A string carrying one would be stored by whoever read it and fail that write.
+    will take). A string carrying one would be stored by whoever read it and fail that write. A number
+    too large to be finite is the first of these by another spelling: `1e400` is valid JSON that Python
+    reads as infinity, so it is refused as it is read, and the keep-check writes with `allow_nan=False`
+    so nothing non-finite passes by a route the reader did not think of (XE-2870).
 
     The body is UTF-8 or it is refused. `json.loads` given bytes guesses UTF-16 and UTF-32 as well, and
     the NUL escape spelt in either would pass a search of the bytes and still parse to a NUL."""
@@ -150,8 +187,8 @@ def _parse(raw: bytes) -> Any:
     if _NUL_ESCAPE.search(text):
         raise XeError(UNREACHABLE, "response carries a NUL character")
     try:
-        v = json.loads(text, parse_constant=_refuse_constant)
-        json.dumps(v, ensure_ascii=False).encode("utf-8")
+        v = json.loads(text, parse_constant=_refuse_constant, parse_float=_finite_float)
+        json.dumps(v, ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (ValueError, RecursionError) as e:   # not JSON, nested deeper than the parser will go, or not text
         raise XeError(UNREACHABLE, f"response is not JSON the harness can keep: {str(e)[:100]}") from e
     return v
@@ -212,16 +249,21 @@ class _Reply:
 class XeClient:
     def __init__(self, base_url: str, timeout: float = 20.0, transport: httpx.AsyncBaseTransport | None = None):
         self.base_url = base_url.rstrip("/")
+        # trust_env=False: the client talks to the one node it was given. httpx otherwise reads the proxy
+        # variables of whatever environment the process runs in while the client is built, so node traffic
+        # (signed blocks, read proofs) follows an HTTP(S)_PROXY nobody set for it, and a NO_PROXY entry
+        # httpx cannot parse stops the process before it starts (XE-3350).
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout, transport=transport,
-                                         headers={"Accept-Encoding": "identity"})
+                                         headers={"Accept-Encoding": "identity"}, trust_env=False)
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
     # ---- plumbing -------------------------------------------------------------------------
 
-    async def _get(self, path: str, **params: Any) -> Any:
-        r = await self._send("GET", path, params={k: v for k, v in params.items() if v is not None})
+    async def _get(self, path: str, *, max_bytes: int | None = None, deadline_s: float | None = None, **params: Any) -> Any:
+        r = await self._send("GET", path, max_bytes=max_bytes, deadline_s=deadline_s,
+                             params={k: v for k, v in params.items() if v is not None})
         if r.status < 300 and not r.body:
             raise malformed("a read came back empty")   # every read returns JSON; nothing at all is not "none"
         return self._unwrap(r)
@@ -230,29 +272,37 @@ class XeClient:
         return self._unwrap(await self._send("POST", path, json=body))
 
     async def _post_raw(self, path: str, body: str) -> Any:
-        return self._unwrap(await self._send("POST", path, content=body.encode("utf-8"),
-                                             headers={"Content-Type": "application/json"}))
+        try:
+            content = body.encode("utf-8")
+        except ValueError as e:   # an unpaired surrogate: never sent, and only an XeError leaves the client (XE-4592)
+            raise XeError(UNREACHABLE, f"request could not be built: {type(e).__name__}: {str(e)[:200]}") from e
+        return self._unwrap(await self._send("POST", path, content=content, headers={"Content-Type": "application/json"}))
 
-    async def _send(self, method: str, path: str, **kw: Any) -> _Reply:
-        """One request, read as it arrives: at most MAX_BODY_BYTES kept, at most REQUEST_DEADLINE_S spent.
+    async def _send(self, method: str, path: str, *, max_bytes: int | None = None, deadline_s: float | None = None,
+                    **kw: Any) -> _Reply:
+        """One request, read as it arrives: at most `max_bytes` kept and at most `deadline_s` spent
+        (MAX_BODY_BYTES and REQUEST_DEADLINE_S unless the read is one whose honest answer is known to be
+        larger).
         httpx's timeout bounds each silence, not the whole, and it buffers whatever is sent; a node that
         drips a byte at a time or answers with a gigabyte is held to these two bounds instead (XE-2305).
         The bytes counted are the bytes on the wire: the request asks for no compression, and an answer
         that is compressed anyway is refused unread, since a few kilobytes can unpack to gigabytes."""
+        limit = MAX_BODY_BYTES if max_bytes is None else max_bytes
+        deadline = REQUEST_DEADLINE_S if deadline_s is None else deadline_s
         try:
-            async with asyncio.timeout(REQUEST_DEADLINE_S):
+            async with asyncio.timeout(deadline):
                 async with self._client.stream(method, path, **kw) as r:
                     _refuse_compressed(r)   # so the bytes below are the bytes sent, not what they unpack to
                     body = bytearray()
                     async for chunk in r.aiter_bytes():
                         body += chunk
-                        if len(body) > MAX_BODY_BYTES:
-                            raise XeError(UNREACHABLE, f"response exceeds {MAX_BODY_BYTES} bytes")
+                        if len(body) > limit:
+                            raise XeError(UNREACHABLE, f"response exceeds {limit} bytes")
                     return _Reply(r.status_code, bytes(body))
         except _TRANSPORT as e:   # connect, read, write, pool timeouts, transport failures, a URL that cannot be sent
             raise XeError(UNREACHABLE, f"{type(e).__name__}: {str(e)[:200]}") from e
         except TimeoutError as e:
-            raise XeError(UNREACHABLE, f"no complete response within {REQUEST_DEADLINE_S:.0f}s") from e
+            raise XeError(UNREACHABLE, f"no complete response within {deadline:.0f}s") from e
         except (ValueError, TypeError) as e:   # a body httpx will not encode (NaN, an unpaired surrogate): never sent
             raise XeError(UNREACHABLE, f"request could not be built: {type(e).__name__}: {str(e)[:200]}") from e
 
@@ -286,7 +336,13 @@ class XeClient:
     async def node(self) -> dict:
         """The node's identity: `network_id`, `id` and `version` are strings where present. The two proof
         of work difficulties pass through for `xe.pow.parse_difficulty`, which is their one parser."""
-        return _typed(await self._get("/node"), "node identity", strs=("network_id", "id", "version"))
+        info = _typed(await self._get("/node"), "node identity", strs=("network_id", "id", "version"))
+        for name in ("network_id", "id", "version"):
+            # Stored with every health check, written into the log at each start and shown on every page:
+            # a name, bounded like every other string kept from the node (XE-10109).
+            if len(info.get(name, "")) > MAX_IDENT_CHARS:
+                raise malformed(f"node identity {name} is longer than {MAX_IDENT_CHARS} characters")
+        return info
 
     async def ready(self) -> tuple[bool, Any]:
         """(ready, what the node said): a short status object, or the first of the text if it is anything
@@ -393,6 +449,10 @@ class XeClient:
             return {}
         bals = _obj(res, "balance").get("balances")
         bals = {} if bals is None else _obj(bals, "balance.balances")
+        if len(bals) > MAX_BALANCE_ASSETS or any(len(str(k)) > MAX_IDENT_CHARS for k in bals):
+            # what is kept is bounded here, as a keyset's keys are: this goes into every snapshot (XE-10109)
+            raise malformed(f"balance holds more than {MAX_BALANCE_ASSETS} assets, or one named in more than "
+                            f"{MAX_IDENT_CHARS} characters")
         return {str(k): _u64(v, f"balance of {str(k)[:16]}") for k, v in bals.items()}
 
     async def block(self, block_hash: str) -> dict:
@@ -420,10 +480,10 @@ class XeClient:
         """Returns the value, or None if the key is not set (a 404). The value is whatever JSON was written;
         a null where the node said the key was found is not "not set"."""
         found, res = await self._found(f"/statechain/kv/{_seg(key)}")
+        if isinstance(res, dict) and set(res.keys()) == {"key", "value"}:
+            res = res["value"]   # the node's envelope is opened first, so the test below is of the value (XE-4592)
         if found and res is None:
             raise malformed("state-chain value is null")
-        if isinstance(res, dict) and set(res.keys()) == {"key", "value"}:
-            return res["value"]
         return res
 
     async def dao_keyset(self) -> dict:
@@ -457,7 +517,8 @@ class XeClient:
     async def chat_messages(self, proof: dict[str, str], since_ns: int = 0) -> list[dict]:
         """The envelopes the node holds for the proving account, as objects. Whether each is an envelope is
         `xe.chat.Envelope.from_json`'s question, asked per item so one bad item costs one item."""
-        msgs = await self._get("/chat/messages", since=since_ns, **proof)
+        msgs = await self._get("/chat/messages", max_bytes=MAX_CHAT_STORE_BYTES, deadline_s=CHAT_STORE_DEADLINE_S,
+                               since=since_ns, **proof)
         msgs = [] if msgs is None else _list(msgs, "chat messages")
         return [m for m in msgs if isinstance(m, dict)]
 

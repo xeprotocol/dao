@@ -2913,3 +2913,23 @@ async def test_time_under_a_pause_does_not_count_toward_giving_a_reply_up(db):
     assert abs(await pause.paused_ns(db, now - D) - D // 4) < 60 * inbox.NS
 
 
+# ---- XE-2775: a value the database cannot hold is the caller's error, as the real driver reports it ---------
+
+async def test_the_statement_handler_recognises_what_asyncpg_raises_for_a_bad_value(db):
+    from sqlalchemy.exc import StatementError
+
+    from dao.main import callers_data
+    from dao.models import Proposal
+    bad = (select(Proposal).where(Proposal.hash == "a\x00b"), select(InboxMessage).where(InboxMessage.id == "\x00"),
+           select(Event).where(Event.kind == "x\x00"), select(Event).where(Event.ref == "proposal:\x00"),
+           select(Proposal).where(Proposal.status == "\x00"), select(Event).where(Event.index == 2**70))
+    for stmt in bad:
+        with pytest.raises(StatementError) as e:
+            await db.execute(stmt)
+        await db.rollback()
+        assert callers_data(e.value), f"{type(e.value).__name__} from {type(e.value.orig).__name__}: {e.value.orig}"
+    for ours in ("SELECT * FROM no_such_table", "SELECT 1 +"):
+        with pytest.raises(StatementError) as e:
+            await db.execute(text(ours))
+        await db.rollback()
+        assert not callers_data(e.value), ours

@@ -180,8 +180,9 @@ def marshal_block_canonical(b: Block) -> bytes:
         if not b.keyset:
             raise EncodingError(f"{t} requires keyset")
         # The ledger lowercases hex before it sorts (normalizeBlockHex), so a mixed-case keyset must sort the
-        # same way here or the hash differs from the node's (XE-0474). Other hex fields decode to the same
-        # bytes whatever their case.
+        # same way here or the hash differs from the node's (XE-0474). The hex fields written through `_hex`
+        # decode to the same bytes whatever their case; `pub_key` in the aux section is hashed as text and
+        # is lowercased there (XE-9785).
         keys = sorted(k.lower() for k in b.keyset["keys"])
         buf += _u32(b.keyset["threshold"]) + _u32(len(keys))
         for k in keys:
@@ -219,8 +220,12 @@ def marshal_block_canonical(b: Block) -> bytes:
 def marshal_block_aux(b: Block) -> bytes:
     buf = bytearray()
     if b.pub_key:
+        # Hashed as text, not decoded, so its case is in the hash. The ledger lowercases it before it
+        # hashes (normalizeBlockHex); so does this, or an opening block whose key is spelled in capitals
+        # hashes one way here and another on the node (XE-9785). The certificate hash and the attestation
+        # fields below are not normalised by the ledger and go in as given.
         buf += _len_prefixed(AUX_TAG_ACCOUNT_PUBKEY)
-        buf += _len_prefixed(b.pub_key.encode("ascii"))
+        buf += _len_prefixed(b.pub_key.lower().encode("ascii"))
     if b.type not in LEASE_FAMILY:
         return bytes(buf)
     buf += _len_prefixed(b.certificate_hash.encode("ascii"))
@@ -254,7 +259,7 @@ def sign_block(b: Block, kp: KeyPair, network_id: str) -> Block:
 
 def verify_block_hash(b: Block, network_id: str) -> None:
     expected = hash_block(b, network_id)
-    if b.hash != expected:
+    if b.hash.lower() != expected:   # the ledger lowercases the hash it is given before it compares (XE-9785)
         raise EncodingError(f"hash mismatch: got {b.hash}, want {expected}")
 
 
@@ -263,6 +268,6 @@ def verify_open_block_signature(b: Block, network_id: str) -> None:
     verify_block_hash(b, network_id)
     if not b.pub_key:
         raise EncodingError("open block must declare pub_key")
-    if derive_address(b.pub_key) != b.account:
+    if derive_address(b.pub_key) != b.account.lower():
         raise EncodingError("pub_key does not derive account address")
     verify_hex_signature(b.pub_key, b.signature, bytes.fromhex(b.hash))

@@ -13,6 +13,9 @@ class Settings(BaseSettings):
 
     database_url: str = Field(default="postgresql+asyncpg://dao:dao@localhost:5432/dao", alias="DATABASE_URL")
     xe_node_url: str = Field(default="https://ldn.core.test.network", alias="XE_NODE_URL")
+    # The network this deployment is for, as the node at XE_NODE_URL names itself (`network_id` at GET /node).
+    # Nothing is signed for any other, and with this unset nothing is signed at all (XE-12620).
+    xe_network_id: str = Field(default="", alias="XE_NETWORK_ID")
     public_base_url: str = Field(default="http://localhost:8000", alias="PUBLIC_BASE_URL")
     config_dir: Path = Field(default=Path("config"), alias="DAO_CONFIG_DIR")
     signer_keyfile: Path = Field(default=Path("secrets/signer.json"), alias="DAO_SIGNER_KEYFILE")

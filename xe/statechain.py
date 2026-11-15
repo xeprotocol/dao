@@ -9,6 +9,12 @@ signature = ed25519(hash_bytes) by a key in sys.dao_keyset (or sys.oracle for or
 The value bytes are the JSON exactly as they appear on the wire (Go json.RawMessage), so the
 DAO always emits compact JSON with no whitespace and escapes <, >, & the way Go's encoder does,
 so that what we hash is what every node re-hashes after re-marshalling.
+
+Blocks are built here and written out; none is read back in. A block a node serves is hashed over the
+value bytes the node stored, and a parsed copy of them cannot be turned back into those bytes (`1e2`,
+`1.50`, an escape spelt out, a repeated key all parse and none re-serialise as they were). The helper that
+did that re-hashed valid blocks to other hashes, nothing called it, and it is gone (XE-10435). Anything
+that needs to check a served block needs the client to hand over each value's raw text first.
 """
 
 from __future__ import annotations
@@ -66,8 +72,13 @@ def _finite_float(text: str) -> float:
 
 def strict_loads(text: str) -> Any:
     """json.loads as Go reads it: `NaN`, `Infinity` and `-Infinity` are not JSON, and neither is a number
-    too large to be finite (`1e400`), which Python's parser would otherwise read as infinity (XE-1919)."""
-    return json.loads(text, parse_constant=_non_finite, parse_float=_finite_float)
+    too large to be finite (`1e400`), which Python's parser would otherwise read as infinity (XE-1919).
+    Text nested deeper than the parser reads is refused as a value, not left to end the caller in a
+    RecursionError that nothing above expects (XE-5877)."""
+    try:
+        return json.loads(text, parse_constant=_non_finite, parse_float=_finite_float)
+    except RecursionError as e:
+        raise StateChainError("value is nested too deeply") from e
 
 
 def canonical_value(raw: Any) -> str:
@@ -95,8 +106,15 @@ class StateOp:
     def from_json(cls, d: dict[str, Any]) -> "StateOp":
         # A value given as JSON text is parsed and re-compacted like any other, never kept as typed: pretty
         # printing or a bare `<` in the text would otherwise be hashed here and compacted by the node (XE-0569).
-        value = canonical_value(d.get("value")) if d["action"] == ACTION_SET else None
-        return cls(d["action"], d["key"], value)
+        # A set op with no `value` is refused, as the node refuses it ("set op must have a value"). Reading
+        # the missing key as None made it the JSON text `null`, which passed every check after this one, so
+        # an omission was stored, shown, voted on and signed as a write of null (XE-3405). A `value` that is
+        # given as null is a value, here as on the node.
+        if d["action"] != ACTION_SET:
+            return cls(d["action"], d["key"], None)
+        if "value" not in d:
+            raise StateChainError("set op requires a value")
+        return cls(d["action"], d["key"], canonical_value(d["value"]))
 
     def to_json(self) -> dict[str, Any]:
         d: dict[str, Any] = {"action": self.action, "key": self.key}
@@ -155,17 +173,6 @@ class StateBlock:
     signatures: list[dict] = field(default_factory=list)  # {"public_key","signature"}
     hash: str = ""
 
-    @classmethod
-    def from_json(cls, d: dict[str, Any]) -> "StateBlock":
-        return cls(
-            index=int(d["index"]),
-            prev_hash=d["prev_hash"],
-            ops=[_op_from_wire(o) for o in d.get("ops", [])],
-            timestamp=int(d["timestamp"]),
-            signatures=list(d.get("signatures") or []),
-            hash=d.get("hash", ""),
-        )
-
     def to_json(self) -> dict[str, Any]:
         return {
             "index": self.index,
@@ -190,15 +197,6 @@ class StateBlock:
             f'{{"index":{self.index},"prev_hash":{json.dumps(self.prev_hash)},"ops":{ops},'
             f'"signatures":{sigs},"hash":{json.dumps(self.hash)},"timestamp":{self.timestamp}}}'
         )
-
-
-def _op_from_wire(o: dict[str, Any]) -> StateOp:
-    """When a block comes back from a node, re-serialise values compactly. Go compacts RawMessage
-    on output, so the node's wire bytes are compact JSON; json.loads/compact_json round-trips them
-    only if key order is preserved, which Python dicts do."""
-    if o["action"] == ACTION_SET:
-        return StateOp(ACTION_SET, o["key"], compact_json(o["value"]))
-    return StateOp(ACTION_DELETE, o["key"], None)
 
 
 def marshal_state_canonical(b: StateBlock) -> bytes:

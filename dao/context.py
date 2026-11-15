@@ -61,8 +61,19 @@ class Context:
                 log.warning("node %s: %s; using default", key, e)
                 return default
 
+        # The network id goes under every signature a company key makes (blocks, the directory entry) and
+        # into what a member's request is signed for. It is the deployment's, set by whoever deployed it,
+        # and what the node says is compared with that and never adopted: a node URL pointed somewhere
+        # else, or a node that says what it likes, would otherwise have the fee and dao keys signing for a
+        # network of its choosing. On any other answer the identity has no network, and with no network
+        # nothing is signed (`chainops.signed`, `job_directory`) and no signed request verifies (XE-12620).
+        reported, expected = str(info.get("network_id", "")), self.settings.xe_network_id
+        if not expected or reported != expected:
+            log.error("the node at %s says it is network %r and this deployment is configured for %r "
+                      "(XE_NETWORK_ID); nothing is signed until they match", self.settings.xe_node_url, reported, expected)
+            reported = ""
         self.node = NodeIdentity(
-            network_id=str(info.get("network_id", "")),
+            network_id=reported,
             node_id=str(info.get("id", "")),
             version=str(info.get("version", "")),
             pow_difficulty=difficulty("pow_difficulty", DEFAULT_DIFFICULTY),

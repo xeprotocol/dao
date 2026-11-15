@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,13 +18,15 @@ from xe.client import XeError
 
 from . import __version__
 from .api import legal, members, public
-from .config import lint_public_copy
+from .config import lint_public_copy, public_template_prose
 from .context import get_context
 from .db import session
 from .mirror import MarkdownMirror
 from .ui import router as ui_router
 
 log = logging.getLogger("dao.app")
+NODE_REFRESH_S = 300
+NODE_RETRY_S = 15   # while the network is not confirmed, every signed request is refused: ask again soon
 HERE = Path(__file__).parent
 
 
@@ -32,7 +35,7 @@ async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     ctx = get_context()
     await ctx.refresh_node()
-    violations = lint_public_copy(ctx.config)
+    violations = lint_public_copy(ctx.config, public_template_prose())   # the pages too, as `dao copy-lint` reads them (XE-5986)
     app.state.copy_violations = violations
     if violations:
         log.warning("public copy lint: %d violation(s): %s", len(violations), violations[:5])
@@ -45,7 +48,20 @@ async def lifespan(app: FastAPI):
             await db.commit()
     except Exception as e:
         log.warning("could not write api.started (database not ready?): %s", e)
+
+    async def keep_identity():
+        # What the pages, the manifest and every signed request's addressee take from `ctx.node` is asked
+        # again on a timer, as the worker does with each health check: read once at start, an API process
+        # that came up while the node was down served no network id until it was restarted (XE-2475).
+        while True:
+            await asyncio.sleep(NODE_REFRESH_S if ctx.node.network_id else NODE_RETRY_S)
+            try:
+                await ctx.refresh_node()
+            except Exception as e:   # refresh_node keeps what it has on any failure; nothing here ends the task
+                log.warning("node identity refresh: %s", e)
+    refresher = asyncio.create_task(keep_identity())
     yield
+    refresher.cancel()
     await ctx.aclose()
 
 
@@ -147,9 +163,30 @@ async def validation_error(request: Request, exc: RequestValidationError):
 async def statement_error(request: Request, exc: StatementError):
     """A parameter the database cannot hold (U+0000 in text, an integer past int64) is the caller's error,
     whichever read or write path carried it (XE-0967). Anything else from the driver is still ours."""
-    if isinstance(exc, DataError) or isinstance(exc.orig, (OverflowError, ValueError)):
+    if callers_data(exc):
+        log.info("unrepresentable parameter on %s %s: %s", request.method, request.url.path,
+                 type(exc.orig).__name__)
         return await http_error(request, StarletteHTTPException(400, "a parameter is not representable"))
     return await unhandled_error(request, exc)
+
+
+def callers_data(exc: StatementError) -> bool:
+    """Whether a statement failed on the value it was given rather than on anything of ours. The first
+    version asked for SQLAlchemy's DataError or a bare ValueError as the cause, and the asyncpg dialect
+    raises neither for the cases the handler was written for: a NUL in a text parameter comes back from
+    Postgres as SQLSTATE 22021 wrapped as a plain DBAPIError, and a value the driver cannot encode is its
+    own error with the ValueError one link further down. So the handler never fired and a NUL in a path
+    still answered 500 (XE-2775). What is read here is what the driver reports: class 22 (data exception)
+    anywhere in the chain of causes, or an encode failure anywhere in it."""
+    if isinstance(exc, DataError):
+        return True
+    e, links = exc.orig, 0
+    while e is not None and links < 6:
+        code = getattr(e, "sqlstate", None) or getattr(e, "pgcode", None)
+        if isinstance(e, (OverflowError, ValueError)) or (isinstance(code, str) and code.startswith("22")):
+            return True
+        e, links = e.__cause__ or e.__context__, links + 1
+    return False
 
 
 @app.exception_handler(IntegrityError)
@@ -173,6 +210,16 @@ async def node_error(request: Request, exc: XeError):
 async def overflow_error(request: Request, exc: OverflowError):
     """The driver raises this bare when an integer parameter does not fit int64; it is the caller's number."""
     return await http_error(request, StarletteHTTPException(400, "a parameter is not representable"))
+
+
+@app.exception_handler(RecursionError)
+async def recursion_error(request: Request, exc: RecursionError):
+    """A body nested deeper than the parser or a walk of it will go is the caller's body: a 400, on every
+    route and whichever step reached the bottom first (the body parser, an op value's text, a digest),
+    not a 500 that reads as a fault of ours (XE-4124, XE-5877). Logged, since a walk of our own data that
+    ended here would be ours to fix."""
+    log.warning("recursion limit on %s %s", request.method, request.url.path)
+    return await http_error(request, StarletteHTTPException(400, "the request is nested too deeply"))
 
 
 @app.exception_handler(Exception)

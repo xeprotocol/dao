@@ -514,6 +514,7 @@ def test_node_difficulty_is_a_u64_hex_or_the_default():
     for body in ({"pow_difficulty": "zz", "chat_pow_difficulty": "-1"}, ["not", "a", "dict"], "nope", {"pow_difficulty": 5}):
         ctx = Context.__new__(Context)
         ctx.chain = SimpleNamespace(node=_const(body))
+        ctx.settings = SimpleNamespace(xe_network_id="xe-test", xe_node_url="http://node")
         from dao.context import NodeIdentity
         ctx.node = NodeIdentity()
         before = (ctx.node.pow_difficulty, ctx.node.chat_pow_difficulty)
@@ -881,8 +882,26 @@ def test_every_corrupt_keyfile_is_a_signer_error(tmp_path):
     for name, text in cases.items():
         p = tmp_path / f"{name}.json"
         p.write_text(text)
-        with pytest.raises(SignerError):
-            Signer.load(p, "pass phrase here")
+        # every way in: the keyfile is opened by `load` and by `add_key` (XE-4282)
+        for opened in (lambda: Signer.load(p, "pass phrase here"), lambda: Signer.add_key(p, "pass phrase here", "agent:x")):
+            with pytest.raises(SignerError):
+                opened()
+        assert p.read_text() == text, "a keyfile that could not be opened is left as it was"
+    from dao import signer as signer_mod
+    for name, contents in (("not-a-dict", [1]), ("no-keys", {"scopes": {}}), ("keys-a-list", {"keys": ["x"]}),
+                           ("scopes-a-list", {"keys": {}, "scopes": []})):
+        p = tmp_path / f"{name}.json"
+        p.write_text(json.dumps(signer_mod.encrypt_keyfile(contents, "pass phrase here")))
+        for opened in (lambda: Signer.load(p, "pass phrase here"), lambda: Signer.add_key(p, "pass phrase here", "agent:x")):
+            with pytest.raises(SignerError):
+                opened()
+    for opened in (Signer.load, lambda path, pw: Signer.add_key(path, pw, "agent:x")):
+        with pytest.raises(SignerError, match="not found"):
+            opened(tmp_path / "absent.json", "pass phrase here")
+        with pytest.raises(SignerError, match="wrong or the file is corrupt"):
+            opened(good, "not the pass phrase")
+        with pytest.raises(SignerError, match="empty"):
+            opened(good, "")
 
 
 # ---- XE-1639: the expected number of checks is counted under the cadence in force at the time --------------
@@ -1085,9 +1104,11 @@ async def test_node_fields_the_harness_computes_with_are_integers_or_the_respons
     for bad in ({"index": 4, "timestamp": 9}, {"index": 4.0, "timestamp": 9, "hash": "h"}, {"index": 4, "timestamp": 9, "hash": 7}, []):
         body["v"] = bad
         await refused(c.statechain_tip)
-    body["v"] = {"keys": ["AB", "cd"], "threshold": 2}
-    assert await c.dao_keyset() == {"keys": ["ab", "cd"], "threshold": 2}
-    for bad in ({"keys": ["ab", 5], "threshold": 1}, {"keys": "ab", "threshold": 1}, {"keys": ["ab"]}, {"keys": ["ab"], "threshold": "x"}):
+    k1, k2 = "ab" * 32, "cd" * 32
+    body["v"] = {"keys": [k1.upper(), k2], "threshold": 2}
+    assert await c.dao_keyset() == {"keys": [k1, k2], "threshold": 2}
+    for bad in ({"keys": [k1, 5], "threshold": 1}, {"keys": k1, "threshold": 1}, {"keys": [k1]}, {"keys": [k1], "threshold": "x"},
+                {"keys": ["ab", "cd"], "threshold": 2}, {"keys": [k1, "zz" * 32], "threshold": 1}):
         body["v"] = bad
         await refused(c.dao_keyset)
     await c.aclose()
@@ -1276,12 +1297,13 @@ async def test_what_the_client_returns_can_be_kept_and_only_a_2xx_is_an_answer()
     await refused(lambda: c.statechain_key("dao.\ud800"), "not text")   # and so does one that is not text
 
     # bounds on what is stored or sent back: a keyset's threshold, the tip's hash, /ready, the chat challenge
-    for ks in ({"keys": ["ab", "cd"], "threshold": 0}, {"keys": ["ab", "cd"], "threshold": 3}, {"keys": [], "threshold": 0}):
+    k1, k2 = "ab" * 32, "cd" * 32
+    for ks in ({"keys": [k1, k2], "threshold": 0}, {"keys": [k1, k2], "threshold": 3}, {"keys": [], "threshold": 0}):
         reply["v"] = json.dumps(ks).encode()
         await refused(c.dao_keyset, "threshold")
         await refused(lambda: c.keyset_of(a), "threshold")
-    reply["v"] = b'{"keys":["AB","cd"],"threshold":2,"address":"x"}'
-    assert await c.keyset_of(a) == {"keys": ["ab", "cd"], "threshold": 2, "address": "x"}
+    reply["v"] = json.dumps({"keys": [k1.upper(), k2], "threshold": 2, "address": "x"}).encode()
+    assert await c.keyset_of(a) == {"keys": [k1, k2], "threshold": 2, "address": "x"}
     reply["v"] = b'{"address":"x"}'
     assert await c.keyset_of(a) == {"address": "x"}, "an account that is not multisig"
     reply["v"] = json.dumps({"index": 4, "timestamp": 9, "hash": "h" * 10_000}).encode()
@@ -1734,6 +1756,97 @@ async def test_the_event_stream_reads_a_backlog_without_waiting_between_full_bat
     assert subscribed == [] and public.STREAMS._n == 0, "the slot and the subscription go with the stream"
 
 
+# ---- XE-3405: a set op carries a value --------------------------------------------------------------------
+
+def test_a_set_op_with_no_value_is_refused_at_every_intake():
+    from xe.statechain import StateChainError, StateOp
+    missing = {"action": "set", "key": "dao.x"}
+    with pytest.raises(StateChainError):
+        StateOp.from_json(missing)
+    with pytest.raises(StateChainError):
+        StateOp("set", "dao.x", None).validate()
+    with pytest.raises(HTTPException) as e:
+        normalise_ops([{"action": "set", "key": "dao.ok", "value": 1}, missing])
+    assert e.value.status_code == 400 and "requires a value" in e.value.detail
+    # a value given as null is a value, as on the node; a delete carries none
+    assert StateOp.from_json({**missing, "value": None}).value == "null"
+    assert normalise_ops([{**missing, "value": None}]) == [{**missing, "value": "null"}]
+    assert normalise_ops([{"action": "delete", "key": "dao.x"}]) == [{"action": "delete", "key": "dao.x"}]
+
+
+async def test_the_chat_store_read_takes_the_most_a_node_can_hold_and_no_more(monkeypatch):
+    """XE-11882: /chat/messages is a whole store in one answer. A full store of large envelopes is past the
+    general bound and inside this read's own, which is still a bound."""
+    import httpx
+
+    from xe import client as xc
+    assert xc.MAX_CHAT_STORE_BYTES >= xc.CHAT_STORE_ENVELOPES * 6 * 8192 > xc.MAX_BODY_BYTES
+    env = {"id": "e", "message": "<" * 8192}
+    full = ("[" + ",".join(json.dumps(env).replace("<", "\\u003c") for _ in range(xc.CHAT_STORE_ENVELOPES)) + "]").encode()
+    assert xc.MAX_BODY_BYTES < len(full) <= xc.MAX_CHAT_STORE_BYTES, "the largest store an honest node serves"
+    c = _node(lambda request: httpx.Response(200, content=full))
+    got = await c.chat_messages({"account": "a"}, 0)
+    assert len(got) == xc.CHAT_STORE_ENVELOPES and got[0]["message"] == "<" * 8192
+    with pytest.raises(xc.XeError) as e:    # the same bytes on any other read are still refused
+        await c.balances("a")
+    assert e.value.status == 0 and "exceeds" in e.value.message
+    await c.aclose()
+    monkeypatch.setattr(xc, "MAX_CHAT_STORE_BYTES", 4096)
+    c = _node(lambda request: httpx.Response(200, content=full))
+    with pytest.raises(xc.XeError) as e:
+        await c.chat_messages({"account": "a"}, 0)
+    assert e.value.status == 0 and "exceeds 4096" in e.value.message
+    await c.aclose()
+
+
+# ---- XE-4285: the keyfile is put in place whole and private, by every writer ---------------------------------
+
+def test_the_keyfile_is_created_private_and_replaced_whole_by_both_writers(tmp_path, monkeypatch):
+    import os
+    import stat
+
+    from dao import signer as signer_mod
+    modes = []
+    real_open, real_replace = os.open, os.replace
+
+    def spy_open(path, flags, mode=0o777, **kw):
+        fd = real_open(path, flags, mode, **kw)
+        if str(path).endswith(".tmp"):
+            modes.append((stat.S_IMODE(os.fstat(fd).st_mode), bool(flags & os.O_EXCL)))
+        return fd
+    monkeypatch.setattr(signer_mod.os, "open", spy_open)
+    monkeypatch.setattr(signer_mod.os, "chmod", lambda *a, **k: pytest.fail("the mode is set at creation, not after"))
+    old_umask = os.umask(0o022)   # the umask the report's window needs: a plain create would be 0644
+    try:
+        p = tmp_path / "keys" / "signer.json"
+        Signer.init_keyfile(p, "correct horse battery staple")
+        first = p.read_bytes()
+        Signer.add_key(p, "correct horse battery staple", "agent:research")
+    finally:
+        os.umask(old_umask)
+    assert modes == [(0o600, True), (0o600, True)], "both writers create the file 0600 and new, before a byte is written"
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600 and p.read_bytes() != first
+    assert [f.name for f in p.parent.iterdir()] == ["signer.json"], "nothing is left beside it"
+    # a write that fails part-way leaves the keyfile that was there, for both writers
+    before = p.read_bytes()
+
+    def no_space(src, dst):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(signer_mod.os, "replace", no_space)
+    with pytest.raises(SignerError, match="could not be written"):
+        Signer.add_key(p, "correct horse battery staple", "agent:second")
+    q = tmp_path / "keys" / "other.json"
+    with pytest.raises(SignerError, match="could not be written"):
+        Signer.init_keyfile(q, "correct horse battery staple")
+    assert p.read_bytes() == before and not q.exists()
+    assert [f.name for f in p.parent.iterdir()] == ["signer.json"]
+    monkeypatch.setattr(signer_mod.os, "replace", real_replace)
+    assert sorted(k.name for k in Signer.load(p, "correct horse battery staple").infos()) == ["agent:research", "dao", "fee", "harness"]
+    # and there is one writer: no other write of the keyfile's path in the module
+    src = Path(signer_mod.__file__).read_text()
+    assert "write_text" not in src and src.count("os.replace(") == 1 and src.count("_write_keyfile(path, contents, passphrase)") == 2
+
+
 # ---- XE-6656 / XE-4124 / XE-5982: what a signed request may carry is settled before anything hashes it -----
 
 def test_a_signed_request_carries_no_float_no_deep_nesting_and_a_u64_nonce():
@@ -1772,6 +1885,191 @@ def test_a_signed_request_carries_no_float_no_deep_nesting_and_a_u64_nonce():
         with pytest.raises(ValueError):
             canonical_json(bad)
     assert canonical_json({"b": 1, "a": 1.5}) == b'{"a":1.5,"b":1}'
+
+
+def test_a_body_nested_past_the_parser_is_the_callers_error_on_any_route():
+    import asyncio
+
+    from dao import main
+    from xe.statechain import StateChainError, strict_loads
+    req = SimpleNamespace(url=SimpleNamespace(path="/v1/anything"), method="POST")
+    resp = asyncio.run(main.recursion_error(req, RecursionError("maximum recursion depth exceeded")))
+    assert resp.status_code == 400 and json.loads(resp.body) == {"error": "the request is nested too deeply", "status": 400}
+    assert RecursionError in main.app.exception_handlers
+    # an op value whose text is nested past the parser is refused as a value (XE-5877)
+    deep = "[" * 200_000 + "]" * 200_000
+    with pytest.raises(StateChainError):
+        strict_loads(deep)
+    with pytest.raises(HTTPException) as e:
+        normalise_ops([{"action": "set", "key": "dao.x", "value": deep}])
+    assert e.value.status_code == 400
+
+
+# ---- XE-2775: a statement that failed on the value it was given is recognised by what the driver reports ---
+
+def test_a_data_error_is_recognised_however_the_driver_wraps_it():
+    from sqlalchemy.exc import DBAPIError, DataError, InterfaceError
+
+    from dao.main import callers_data
+
+    class Pg(Exception):
+        def __init__(self, sqlstate):
+            self.sqlstate = self.pgcode = sqlstate
+
+    def wrapped(orig, cls=DBAPIError):
+        return cls("SELECT 1", {}, orig)
+    assert callers_data(wrapped(Pg("22021"))), "a NUL in text, as Postgres reports it through asyncpg"
+    assert callers_data(wrapped(Pg("22003"))) and callers_data(wrapped(Pg("22001")))
+    assert callers_data(wrapped(Exception("x"), DataError))
+    assert callers_data(wrapped(OverflowError("int too big"))) and callers_data(wrapped(ValueError("bad")))
+    outer = Exception("adapted")
+    outer.__cause__ = ValueError("invalid input for query argument $1")
+    assert callers_data(wrapped(outer, InterfaceError)), "the driver's encode error sits one link down"
+    for ours in (Pg("42P01"), Pg("40001"), Pg("08006"), Pg(None), Exception("x"), RuntimeError("pool closed")):
+        assert not callers_data(wrapped(ours)), ours
+    loop = Exception("a")
+    loop.__cause__ = loop
+    assert not callers_data(wrapped(loop)), "a chain that does not end is not followed for ever"
+
+
+# ---- XE-2870 / XE-3350: what the node client keeps and whom it talks to -------------------------------------
+
+async def test_no_read_keeps_a_number_that_is_not_finite_and_the_client_ignores_ambient_proxies(monkeypatch):
+    import httpx
+
+    from xe import client as xc
+    reads = (lambda c: c.balances("a"), lambda c: c.chain("a"), lambda c: c.statechain_tip(),
+             lambda c: c.node(), lambda c: c.block("h"), lambda c: c.chat_messages({"account": "a"}, 0),
+             lambda c: c.chat_send({}), lambda c: c.pending_for("a"), lambda c: c.chat_challenge())
+    for body in (b'{"XE":1e400}', b'[{"amount":-1e400}]', b'{"a":{"b":[1e999]}}', b"1e400", b'{"XE":NaN}', b"[Infinity]"):
+        c = _node(lambda request: httpx.Response(200, content=body))
+        for read in reads:
+            with pytest.raises(xc.XeError) as e:
+                await read(c)
+            assert e.value.status == 0, body
+        await c.aclose()
+    assert xc._parse(b'{"a":1.5,"b":1e2}') == {"a": 1.5, "b": 100.0}, "a finite float is a number like any other"
+    # the proxy variables of the environment are not read: not for routing, and not to fail on
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(var, "http://proxy.invalid:3128")
+    monkeypatch.setenv("NO_PROXY", "[::1],localhost")
+    c = xc.XeClient("https://node.invalid")
+    assert c._client.trust_env is False
+    await c.aclose()
+
+
+# ---- XE-12620: the network is the deployment's, and what the node says is compared with it ------------------
+
+def test_the_node_identity_has_a_network_only_when_the_node_reports_the_configured_one():
+    import asyncio
+
+    from dao import chainops
+    from dao.context import Context, NodeIdentity
+    from xe.client import XeError
+
+    def ctx_for(reported, expected):
+        ctx = Context.__new__(Context)
+        ctx.chain = SimpleNamespace(node=_const({"network_id": reported, "id": "n1", "version": "xe/1"}))
+        ctx.settings = SimpleNamespace(xe_network_id=expected, xe_node_url="http://node")
+        ctx.node = NodeIdentity()
+        return ctx
+    for reported, expected, got in (("testnet-0005", "testnet-0005", "testnet-0005"), ("mainnet", "testnet-0005", ""),
+                                    ("testnet-0006", "testnet-0005", ""), ("testnet-0005", "", ""), ("", "", ""),
+                                    ("TESTNET-0005", "testnet-0005", "")):
+        ctx = ctx_for(reported, expected)
+        node = asyncio.run(ctx.refresh_node())
+        assert node.network_id == got and node.node_id == "n1", (reported, expected)
+        if not got:   # and with no network, no company key signs a block: the site every block passes through
+            with pytest.raises(XeError):
+                asyncio.run(chainops.signed(ctx, SimpleNamespace(hash=""), KeyPair.generate()))
+    # a node that was right and now says otherwise loses the identity it had
+    ctx = ctx_for("testnet-0005", "testnet-0005")
+    asyncio.run(ctx.refresh_node())
+    ctx.chain = SimpleNamespace(node=_const({"network_id": "mainnet", "id": "n1"}))
+    assert asyncio.run(ctx.refresh_node()).network_id == ""
+    from dao.settings import Settings
+    assert Settings.model_fields["xe_network_id"].default == "", "there is no network a deployment is for by default"
+
+
+# ---- XE-11401: a path that exists answers for the method it takes -------------------------------------------
+
+def test_the_two_session_opening_paths_read_with_get_say_which_method_they_take():
+    import asyncio
+
+    from dao.api import members
+    for path in ("registry", "anchor"):
+        with pytest.raises(HTTPException) as e:
+            asyncio.run(members.get_session(request=None, sid=path, ctx=None, db=None))
+        assert e.value.status_code == 405 and e.value.headers == {"Allow": "POST"}, path
+    posts = {r.path for r in members.router.routes if "POST" in r.methods}
+    assert {"/v1/members/sessions/registry", "/v1/members/sessions/anchor"} <= posts, "and those are the two there are"
+
+
+# ---- XE-4592 / XE-10109 / XE-10320: what the client keeps from the node is typed and bounded ---------------
+
+async def test_a_state_chain_value_a_long_identity_and_a_keyset_of_non_keys_are_refused():
+    import httpx
+
+    from xe import client as xc
+    answers = {}
+    c = _node(lambda request: httpx.Response(answers["now"][0], **answers["now"][1]))
+
+    async def refused(call):
+        with pytest.raises(xc.XeError) as e:
+            await call()
+        assert e.value.status == 0
+    # the node's {key, value} envelope is opened before the value is judged: a null inside it is a null
+    answers["now"] = (200, {"content": b'{"key":"dao.x","value":null}'})
+    await refused(lambda: c.statechain_key("dao.x"))
+    answers["now"] = (200, {"content": b'{"key":"dao.x","value":{"a":1}}'})
+    assert await c.statechain_key("dao.x") == {"a": 1}
+    answers["now"] = (200, {"content": b"null"})
+    await refused(lambda: c.statechain_key("dao.x"))
+    answers["now"] = (404, {"content": b'{"error":"not found"}'})
+    assert await c.statechain_key("dao.x") is None, "only a 404 is 'not set'"
+    # a body that cannot be encoded is never sent, and what leaves the client is an XeError
+    sent = []
+    c2 = _node(lambda request: sent.append(request) or httpx.Response(200, content=b"{}"))
+    await refused(lambda: c2.submit_statechain_block(SimpleNamespace(to_wire=lambda: '{"a":"\ud800"}')))
+    assert sent == []
+    await c2.aclose()
+    # the node's names are bounded; a keyset holds keys, and a bounded number of them
+    for name in ("network_id", "id", "version"):
+        answers["now"] = (200, {"content": json.dumps({name: "x" * (xc.MAX_IDENT_CHARS + 1)}).encode()})
+        await refused(c.node)
+    answers["now"] = (200, {"content": json.dumps({"network_id": "x" * xc.MAX_IDENT_CHARS}).encode()})
+    assert len((await c.node())["network_id"]) == xc.MAX_IDENT_CHARS
+    key = "ab" * 32
+    for keys in (["zz" * 32], [key, "ab"], [key + "00"], [key, 5], [f"{i:064x}" for i in range(xc.MAX_KEYSET_KEYS + 1)], ["<script>" + "a" * 56]):
+        answers["now"] = (200, {"content": json.dumps({"keys": keys, "threshold": 1}).encode()})
+        await refused(c.dao_keyset)
+    answers["now"] = (200, {"content": json.dumps({"keys": [key.upper()], "threshold": 1}).encode()})
+    assert await c.dao_keyset() == {"keys": [key], "threshold": 1}
+    await c.aclose()
+
+
+# ---- XE-8855: a read that failed is not "not written" ------------------------------------------------------
+
+async def test_a_registry_read_that_failed_says_so_and_is_not_reported_as_absent(monkeypatch):
+    from dao.services import records
+    from xe.client import XeError
+    answers = {}
+
+    async def statechain_key(key):
+        if isinstance(answers["now"], Exception):
+            raise answers["now"]
+        return answers["now"]
+    ctx = SimpleNamespace(chain=SimpleNamespace(statechain_key=statechain_key))
+    for answer, present in ((XeError(0, "ReadTimeout"), None), (XeError(503, "busy"), None), (None, False), ({"entity": "x"}, True)):
+        monkeypatch.setattr(records, "_public_reads", {})
+        answers["now"] = answer
+        read = await records.onchain_registry(ctx)
+        assert records.registry_present(read) is present, answer
+        assert ("error" in read) == isinstance(answer, Exception) and ("value" in read) != ("error" in read)
+    import inspect
+
+    from dao.api import legal
+    assert "registry_present" in inspect.getsource(legal), "the legal identifier asks the three-way question"
 
 
 # ---- the sibling sweep of 15 November: each rule at the sites the first fixes had not reached ---------------
@@ -1823,3 +2121,65 @@ def test_what_the_door_refuses_in_a_payload_the_cli_refuses_to_sign_and_the_star
     assert "lint_public_copy(ctx.config, public_template_prose())" in inspect.getsource(main.lifespan), "XE-5986"
 
 
+async def test_what_the_client_keeps_of_a_keyset_and_a_balance_is_bounded_field_by_field():
+    """XE-10109 / XE-10320. The keys were bounded and the fields beside them were not: a megabyte under any
+    other name in the keyset answer, or a balance of ten thousand assets, was stored with every snapshot."""
+    import httpx
+
+    from xe import client as xc
+    from xe.client import XeError
+    reply = {}
+    c = _node(lambda request: httpx.Response(200, content=reply["v"]))
+    k1, k2, a = "ab" * 32, "cd" * 32, "a" * 64
+    big = "x" * (xc.MAX_IDENT_CHARS + 1)
+    reply["v"] = json.dumps({"keys": [k1, k2], "threshold": 1, "address": "x", "note": big, "nested": {"a": [1] * 100},
+                             "list": [big], big: 1, "flag": True, "n": 3, "none": None}).encode()
+    assert await c.keyset_of(a) == {"keys": [k1, k2], "threshold": 1, "address": "x", "flag": True, "n": 3, "none": None}
+    reply["v"] = json.dumps({"address": "x", "note": big, "nested": {"deep": big}}).encode()
+    assert await c.keyset_of(a) == {"address": "x"}, "and for an account that is not multisig"
+    reply["v"] = json.dumps({"balances": {f"A{i}": 1 for i in range(xc.MAX_BALANCE_ASSETS)}}).encode()
+    assert len(await c.balances(a)) == xc.MAX_BALANCE_ASSETS
+    for bad in ({f"A{i}": 1 for i in range(xc.MAX_BALANCE_ASSETS + 1)}, {big: 1}):
+        reply["v"] = json.dumps({"balances": bad}).encode()
+        with pytest.raises(XeError) as e:
+            await c.balances(a)
+        assert e.value.status == 0
+    # the one read sized to a whole store has the time its size needs, and no other read does (XE-11882)
+    import inspect
+    assert "deadline_s=CHAT_STORE_DEADLINE_S" in inspect.getsource(xc.XeClient.chat_messages)
+    assert xc.CHAT_STORE_DEADLINE_S > xc.REQUEST_DEADLINE_S and inspect.getsource(xc.XeClient).count("deadline_s=CHAT_STORE_DEADLINE_S") == 1
+
+
+def test_small_rules_of_the_sweep_hold_where_they_are_stated():
+    import inspect
+
+    from dao import chainops, signer as signer_mod, ui
+    from dao.api import legal
+    from dao.services import fees, inbox, portal, sessions
+    from xe import encoding
+    # a proposal on which no fee was due names no fee block
+    base = dict(title="t", author_account="a", status="open", opened_at=10**18, closes_at=2 * 10**18, rules={}, ops=None,
+                result=None, decision=None, analysis=[], body="b")
+    assert portal.to_dict(SimpleNamespace(hash="h" * 64, fee_block_hash="h" * 64, **base))["fee_block_hash"] == ""
+    assert portal.to_dict(SimpleNamespace(hash="h" * 64, fee_block_hash="f" * 64, **base))["fee_block_hash"] == "f" * 64
+    # a block is waited on for as long as a node could take it, not for less (XE-4591)
+    assert fees.STANDING_NS > chainops.TIMESTAMP_WINDOW_NS
+    src = inspect.getsource(fees.settle_due)
+    assert src.count("_stands(f)") == 2, "and a row whose pass failed is asked too"
+    # every register can be read to its end (XE-4601), and every page has a total order (XE-3250)
+    for route in (legal.anchors, legal.pause_state):
+        assert {"offset", "limit"} <= set(inspect.signature(route).parameters), route.__name__
+    assert "Vote.timestamp.asc(), Vote.account.asc()" in inspect.getsource(portal.votes_for)
+    assert "SigningSession.updated_at.desc(), SigningSession.id.desc()" in inspect.getsource(sessions.ended_holding_a_block)
+    # the members' page lists every session a member can still act on, however many have come since (XE-1561)
+    assert "await sessions.open_sessions(db)" in inspect.getsource(ui.members_page)
+    members = (ROOT / "dao/templates/members.html").read_text(encoding="utf-8")
+    assert "closed_total > closed|length" in members and "keyset.error" in members
+    assert "t.error" in (ROOT / "dao/templates/records.html").read_text(encoding="utf-8")
+    # a classification fits its column (XE-2775), an open block's account is compared as the address is derived
+    assert 'max_len=32' in inspect.getsource(inbox.set_status)
+    assert "b.account.lower()" in inspect.getsource(encoding.verify_open_block_signature)
+    # the keyfile: whatever goes wrong looking for it or making room for it is a SignerError (XE-4282)
+    assert "path.exists()" not in inspect.getsource(signer_mod._read_keyfile) + inspect.getsource(signer_mod.Signer.init_keyfile)
+    src = inspect.getsource(signer_mod._write_keyfile)
+    assert src.index("try:") < src.index("path.parent.mkdir(")
