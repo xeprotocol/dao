@@ -14,7 +14,7 @@ from typing import Any
 
 import yaml
 
-from xe.keys import derive_address
+from xe.keys import derive_address, is_valid_public_key
 
 
 def _sha256_file(path: Path) -> str:
@@ -241,6 +241,7 @@ def load_config(config_dir: Path) -> Config:
             files[f"prompts/{p.name}"] = p
     cfg = _read_config(d, files, prompts)
     require_distinct_seats(cfg)
+    require_valid_schedules(cfg)
     return cfg
 
 
@@ -314,6 +315,163 @@ def seat_conflicts(cfg: Config) -> list[str]:
     return out
 
 
+# ---- the domain of each schedule value ---------------------------------------------------------------
+#
+# A schedule value the code turns into a time, an amount, a state or a set of people is in its domain when
+# the config is loaded, or the config is not loaded. The code reads these values where it uses them
+# (`int(c.get(...))`, `f"due_{action}"`, `kind == "member"`), and before this a value outside its domain
+# was used as written: a misspelt fee action left every fee in a state no worker reads, an hour of 24
+# stopped every scheduled job, `kind: Member` took a founder out of every consent set, and nothing said
+# so (XE-3160 and the value-by-value reports after it). The API, the worker and the CLI all come through
+# `load_config`, so one check here is the check for all three. A key that is absent takes the code's
+# default, which is in the domain; a key that is present is checked.
+
+U64_MAX = 2**64 - 1
+FEE_ACTIONS = ("refund", "burn")                       # `fees.DUE` is `due_` + each
+WEIGHT_ASSETS = ("XE",)                                # balances, the fee and the floor are all in µXE
+TIMELOCK_STATUSES = ("proposed", "active")
+SEAT_KINDS = ("member", "officer")
+SEAT_RIGHTS = ("reserved_matters", "pause", "sign_statechain", "sign_treasury", "sign_resolutions", "sign_operations",
+               "operational_review")
+AGENT_CLASSES = ("orchestrator", "specialist")
+AGENT_STATUSES = ("designed", "designated", "active", "retired")
+MODES = ("members-direct", "ensemble")
+_HEX64_ANY = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def _whole(lo: int, hi: int):
+    return (lambda v: type(v) is int and lo <= v <= hi), f"a whole number from {lo} to {hi}"
+
+
+def _one_of(names: tuple[str, ...]):
+    return (lambda v: type(v) is str and v in names), "one of " + ", ".join(names)
+
+
+def _flag():
+    return (lambda v: type(v) is bool), "true or false"
+
+
+def _strings(ok, words: str, *, empty: bool):
+    def check(v) -> bool:
+        return (isinstance(v, list) and (empty or bool(v)) and all(type(x) is str and ok(x) for x in v)
+                and len(set(v)) == len(v))
+    return check, words
+
+
+SCHEDULE_B_DOMAINS: dict[str, dict[str, tuple]] = {
+    "cadence": {
+        "health_check_minutes": _whole(1, 60),
+        "directory_reregister_minutes": _whole(1, 29),      # inside the node's 30-minute directory TTL
+        "daily_note_hour_utc": _whole(0, 23),
+        "weekly_review_weekday": _whole(1, 7),              # Monday = 1 ... Sunday = 7
+        "weekly_review_hour_utc": _whole(0, 23),
+        "anchor_weekday": _whole(1, 7),
+        "anchor_hour_utc": _whole(0, 23),
+        "monthly_report_day": _whole(1, 28),                # a day every month has
+    },
+    "windows": {
+        "open_vote_days": _whole(1, 365),
+        "protocol_parameter_days": _whole(1, 365),
+        "upgrade_timelock_hours": _whole(0, 8760),
+        "upgrade_timelock_status": _one_of(TIMELOCK_STATUSES),
+    },
+    "pause": {
+        "initial_hours": _whole(1, 8760),
+        "extension_days": _whole(1, 365),
+        "public_post_within_hours": _whole(1, 8760),
+        "grounds": _strings(lambda x: bool(x.strip()), "a list of distinct grounds, at least one", empty=False),
+    },
+    "open_vote": {
+        "fee_micro_xe": _whole(0, 2**63 - 1),   # kept in the fee ledger, whose column is a signed 64-bit integer
+        "fee_on_quorum": _one_of(FEE_ACTIONS),
+        "fee_below_quorum": _one_of(FEE_ACTIONS),
+        "quorum_wallets": _whole(1, 10**9),
+        "pass_mark_fraction": ((lambda v: type(v) in (int, float) and 0 <= v < 1), "a number from 0 up to, not including, 1"),
+        "weight_asset": _one_of(WEIGHT_ASSETS),
+        "excluded_accounts": _strings(lambda x: bool(_HEX64_ANY.fullmatch(x)), "a list of distinct 64-hex accounts", empty=True),
+    },
+    "open_vote.participating_wallet": {
+        "min_balance_micro_xe": _whole(0, U64_MAX),
+        "must_exist_before_open": _flag(),
+        "exclude_agent_accounts": _flag(),
+    },
+    "open_vote.agents": {
+        "stipend_micro_xe": _whole(0, U64_MAX),
+        "max_weight_share": ((lambda v: type(v) in (int, float) and 0 <= v <= 1), "a number from 0 to 1"),
+        "count_toward_quorum": _flag(),
+    },
+}
+
+
+def schedule_b_faults(cfg: Config) -> list[str]:
+    """Every Schedule B value that is outside its domain (`SCHEDULE_B_DOMAINS`), in the file's own words."""
+    out: list[str] = []
+    if not isinstance(cfg.schedule_b, dict):
+        return ["the file is not a mapping"]
+    for path, domain in SCHEDULE_B_DOMAINS.items():
+        section: Any = cfg.schedule_b
+        for name in path.split("."):
+            section = section.get(name, {}) if isinstance(section, dict) else None
+        if not isinstance(section, dict):
+            out.append(f"{path} must be a mapping")
+            continue
+        for key, (ok, words) in domain.items():
+            if key in section and not ok(section[key]):
+                out.append(f"{path}.{key} is {section[key]!r}; it must be {words}")
+    w = cfg.schedule_b.get("windows")
+    if isinstance(w, dict) and w.get("upgrade_timelock_status") == "active" and w.get("upgrade_timelock_hours", 0) == 0:
+        out.append("windows.upgrade_timelock_status is active with upgrade_timelock_hours of 0: an armed timelock runs for at least an hour")
+    return out
+
+
+def schedule_c_faults(cfg: Config) -> list[str]:
+    """Every seat attribute in Schedule C that is outside its vocabulary, read from the file as written
+    (the `human_seats` property turns `may: pause` into a tuple of letters, and a seat whose `kind` is
+    not exactly `member` into an officer). A seat's key, where given, is one a signature can verify
+    under: a seat that is counted and can never sign is the deadlock of XE-2073 by another spelling."""
+    out: list[str] = []
+    if "mode" in cfg.schedule_c and not _one_of(MODES)[0](cfg.schedule_c["mode"]):
+        out.append(f"mode is {cfg.schedule_c['mode']!r}; it must be one of {', '.join(MODES)}")
+    for i, s in enumerate(cfg.schedule_c.get("human_seats") or []):
+        seat = f"human seat {i + 1} ({s.get('id')})"
+        if "kind" in s and not _one_of(SEAT_KINDS)[0](s["kind"]):
+            out.append(f"{seat}: kind is {s['kind']!r}; it must be one of {', '.join(SEAT_KINDS)}")
+        if "may" in s and not _strings(lambda x: x in SEAT_RIGHTS, "", empty=True)[0](s["may"]):
+            out.append(f"{seat}: may is {s['may']!r}; it must be a list of distinct rights from {', '.join(SEAT_RIGHTS)}")
+        key = s.get("public_key") or ""
+        if isinstance(key, str) and _HEX64_ANY.fullmatch(key) and not is_valid_public_key(bytes.fromhex(key)):
+            out.append(f"{seat}: public_key is not a usable ed25519 key")
+    accounts = cfg.schedule_c.get("accounts")
+    if accounts is not None and not isinstance(accounts, dict):
+        out.append("accounts must be a mapping of names to accounts")
+    for name, account in (accounts.items() if isinstance(accounts, dict) else ()):
+        # every signed request is addressed to `dao`, fees are paid to `fee`, and the vote leaves these
+        # out of the weight: a value that is no account is one nothing on the chain can ever match
+        if account not in (None, "") and not (isinstance(account, str) and _HEX64_ANY.fullmatch(account)):
+            out.append(f"accounts.{name} is {account!r}; it must be a 64-hex account, or left empty")
+    scopes = cfg.schedule_c.get("tool_scopes")
+    if scopes is not None and not isinstance(scopes, dict):
+        out.append("tool_scopes must be a mapping of scope names to what each allows")
+    for i, s in enumerate(cfg.schedule_c.get("agent_seats") or []):
+        seat = f"agent seat {i + 1} ({s.get('id')})"
+        for key, names in (("class", AGENT_CLASSES), ("status", AGENT_STATUSES)):
+            if key in s and not _one_of(names)[0](s[key]):
+                out.append(f"{seat}: {key} is {s[key]!r}; it must be one of {', '.join(names)}")
+        if "optional" in s and type(s["optional"]) is not bool:
+            out.append(f"{seat}: optional is {s['optional']!r}; it must be true or false")
+        if "tool_scopes" in s and not _strings(lambda x: not isinstance(scopes, dict) or x in scopes, "", empty=True)[0](s["tool_scopes"]):
+            out.append(f"{seat}: tool_scopes is {s['tool_scopes']!r}; it must be a list of distinct scopes from the glossary")
+    return out
+
+
+def require_valid_schedules(cfg: Config) -> None:
+    """Refuse a config whose schedules carry a value outside its domain, naming every one. Called by
+    `load_config` after the seats are known to be well formed (`require_distinct_seats`)."""
+    faults = [f"schedule_b.yaml: {f}" for f in schedule_b_faults(cfg)] + [f"schedule_c.yaml: {f}" for f in schedule_c_faults(cfg)]
+    if faults:
+        raise ValueError("; ".join(faults))
+
+
 def _read_config(d: Path, files: dict[str, Path], prompts: dict[str, str]) -> Config:
     return Config(
         dir=d,
@@ -339,6 +497,27 @@ def _flatten_strings(value: Any) -> list[str]:
     if isinstance(value, list):
         return [s for v in value for s in _flatten_strings(v)]
     return []
+
+
+# Every template is in one register. The public ones are linted against the kill list by every gate there is
+# (`dao copy-lint`, the test suite), from this list and no other: the command once carried a shorter list of
+# its own and passed pages the tests would have failed (XE-5986).
+PUBLIC_TEMPLATES = ("base.html", "home.html", "proposals.html", "proposal.html", "proposal_new.html", "seats.html",
+                    "seat.html", "how.html", "decisions.html", "decision_record.html", "inbox.html", "log.html",
+                    "log_entry.html", "live.html", "charter.html", "error.html", "_keybox.html", "_rules.html")
+LEGAL_TEMPLATES = ("members.html", "records.html")   # the seat holders' console and the statutory records
+TEMPLATE_DIR = Path(__file__).parent / "templates"
+
+
+def template_prose(text: str) -> str:
+    """What a template says to a reader: Jinja, scripts and tags removed."""
+    text = re.sub(r"{[{%#].*?[}%#]}", " ", text, flags=re.S)
+    text = re.sub(r"<script.*?</script>", " ", text, flags=re.S)
+    return re.sub(r"<[^>]+>", " ", text)
+
+
+def public_template_prose() -> list[str]:
+    return [template_prose((TEMPLATE_DIR / name).read_text(encoding="utf-8")) for name in PUBLIC_TEMPLATES]
 
 
 def lint_public_copy(cfg: Config, extra_texts: list[str] | None = None) -> list[str]:

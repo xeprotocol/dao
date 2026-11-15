@@ -1703,6 +1703,132 @@ async def test_callers_that_arrive_during_a_replay_wait_for_it_and_share_its_ans
 
 
 
+# ---- XE-3160 and the value-by-value reports after it: a schedule value is in its domain at load -----------
+
+def test_a_schedule_value_outside_its_domain_is_refused_at_load(tmp_path):
+    import copy
+    import shutil
+
+    import yaml
+
+    from dao.config import (FEE_ACTIONS, SCHEDULE_B_DOMAINS, SEAT_RIGHTS, require_valid_schedules, schedule_b_faults,
+                            schedule_c_faults)
+    from dao.services import fees, resolutions, sessions
+    from dao.worker_schedule import job_table
+    from xe.keys import is_valid_public_key
+    cfg = load_config(ROOT / "config")
+    assert schedule_b_faults(cfg) == [] and schedule_c_faults(cfg) == [], "the committed schedules load"
+
+    def section_of(doc, path):
+        for name in path.split("."):
+            doc = doc[name]
+        return doc
+    # every value the committed Schedule B carries in a checked section has a domain; the one that does
+    # not is prose nothing reads
+    for path, domain in SCHEDULE_B_DOMAINS.items():
+        loose = {k for k, v in section_of(cfg.schedule_b, path).items() if not isinstance(v, dict)} - set(domain)
+        assert loose <= {"reserved_matter"}, (path, loose)
+    # the vocabularies are the ones the code acts on
+    assert tuple(f"due_{a}" for a in FEE_ACTIONS) == fees.DUE
+    assert {resolutions.SIGN_RIGHT, sessions.SIGN_RIGHT, "pause", "operational_review"} <= set(SEAT_RIGHTS)
+
+    def b_faults(path, key, value):
+        c = load_config(ROOT / "config")
+        c.schedule_b = copy.deepcopy(c.schedule_b)
+        section_of(c.schedule_b, path)[key] = value
+        return schedule_b_faults(c)
+    outside = {
+        "health_check_minutes": (0, 61, 1.5, True), "directory_reregister_minutes": (0, 30, True),
+        "daily_note_hour_utc": (-1, 24, 8.0), "weekly_review_weekday": (0, 8), "weekly_review_hour_utc": (-1, 24),
+        "anchor_weekday": (0, 8), "anchor_hour_utc": (-1, 24), "monthly_report_day": (0, 29, 31),
+        "open_vote_days": (0, -21, 366), "protocol_parameter_days": (0, 366), "upgrade_timelock_hours": (-1, 8761),
+        "upgrade_timelock_status": ("Active", "on", "active "),
+        "initial_hours": (0, -72), "extension_days": (0, -7), "public_post_within_hours": (0, -4),
+        "grounds": ([], [""], ["a", "a"], "exploit_or_irreversible_loss"),
+        "fee_micro_xe": (-1, 2**64, 1.0, True), "fee_on_quorum": ("Refund", "refnud", "", "due_refund"),
+        "fee_below_quorum": ("Burn", "keep"), "quorum_wallets": (0, -1, True),
+        "pass_mark_fraction": (1, 1.5, -0.1, float("nan"), True), "weight_asset": ("XUSD", "xe", ""),
+        "excluded_accounts": (["zz"], "f" * 64, ["f" * 64, "f" * 64]),
+        "min_balance_micro_xe": (-1, 2**64), "must_exist_before_open": ("yes", 1, 0), "exclude_agent_accounts": ("no", 1),
+        "stipend_micro_xe": (-1, 2**64), "max_weight_share": (1.01, -0.01, 5, float("nan"), True),
+        "count_toward_quorum": ("false", 0),
+    }
+    assert {k for d in SCHEDULE_B_DOMAINS.values() for k in d} == set(outside), "every checked value is walked"
+    for path, domain in SCHEDULE_B_DOMAINS.items():
+        for key in domain:
+            for value in (None, "8", [1], {"a": 1}) + outside[key]:
+                found = b_faults(path, key, value)
+                assert len(found) == 1 and found[0].startswith(f"{path}.{key} "), (path, key, value, found)
+            # absent is the code's default, which is in the domain
+            c = load_config(ROOT / "config")
+            c.schedule_b = copy.deepcopy(c.schedule_b)
+            del section_of(c.schedule_b, path)[key]
+            assert schedule_b_faults(c) == [], (path, key)
+    # a section that is not a mapping, and an armed timelock that runs for no time
+    for path in SCHEDULE_B_DOMAINS:
+        c = load_config(ROOT / "config")
+        c.schedule_b = copy.deepcopy(c.schedule_b)
+        head, _, leaf = path.rpartition(".")
+        (section_of(c.schedule_b, head) if head else c.schedule_b)[leaf] = None
+        assert any(f.startswith(f"{path} must be a mapping") for f in schedule_b_faults(c)), path
+    assert len(b_faults("windows", "upgrade_timelock_status", "active")) == 0
+    c = load_config(ROOT / "config")
+    c.schedule_b = copy.deepcopy(c.schedule_b)
+    c.schedule_b["windows"].update(upgrade_timelock_status="active", upgrade_timelock_hours=0)
+    assert len(schedule_b_faults(c)) == 1
+    # the edges of each cadence domain are values the scheduler can turn into a time
+    for hour, weekday, day, minutes in ((0, 1, 1, 1), (23, 7, 28, 60)):
+        cadence = {"daily_note_hour_utc": hour, "weekly_review_weekday": weekday, "weekly_review_hour_utc": hour,
+                   "anchor_weekday": weekday, "anchor_hour_utc": hour, "monthly_report_day": day,
+                   "health_check_minutes": minutes, "directory_reregister_minutes": min(minutes, 29)}
+        c = load_config(ROOT / "config")
+        c.schedule_b = {**c.schedule_b, "cadence": cadence}
+        assert schedule_b_faults(c) == []
+        assert job_table(SimpleNamespace(config=c))["health"]["every_s"] == minutes * 60
+
+    # Schedule C, read as written
+    def c_faults(edit):
+        c = load_config(ROOT / "config")
+        c.schedule_c = copy.deepcopy(c.schedule_c)
+        edit(c.schedule_c)
+        return schedule_c_faults(c)
+
+    def human(**over):
+        return lambda d: d["human_seats"][0].update(over)
+
+    def agent(**over):
+        return lambda d: d["agent_seats"][0].update(over)
+    cases = {
+        "kind by case": human(kind="Member"), "kind with a space": human(kind="member "), "kind unknown": human(kind="director"),
+        "kind that is not a word": human(kind=True),
+        "may as one word": human(may="pause"), "may with an unknown right": human(may=["pause", "sign_everything"]),
+        "may by case": human(may=["Pause"]), "may repeated": human(may=["pause", "pause"]),
+        "agent class by case": agent(**{"class": "Specialist"}), "agent status unknown": agent(status="live"),
+        "agent optional as a word": agent(optional="yes"), "agent scopes as one word": agent(tool_scopes="chain.read"),
+        "agent scope outside the glossary": agent(tool_scopes=["chain.read", "tx.sign"]),
+        "mode unknown": lambda d: d.update(mode="Ensemble"),
+    }
+    identity = "01" + "00" * 31    # a point, and one no signature verifies under
+    if not is_valid_public_key(bytes.fromhex(identity)):
+        cases["key no signature can verify under"] = human(public_key=identity)
+    for what, edit in cases.items():
+        assert len(c_faults(edit)) == 1, (what, c_faults(edit))
+    assert c_faults(human(public_key=KeyPair.generate().pub_key_hex.upper(), may=[], kind="officer")) == []
+    # and the load itself refuses, naming every fault in both files: the path the API, the worker and the CLI take
+    d = tmp_path / "config"
+    shutil.copytree(ROOT / "config", d)
+    b, sc = (yaml.safe_load((d / f).read_text()) for f in ("schedule_b.yaml", "schedule_c.yaml"))
+    b["open_vote"]["fee_on_quorum"], b["cadence"]["daily_note_hour_utc"] = "refnud", 24
+    sc["human_seats"][0]["kind"] = "Member"
+    (d / "schedule_b.yaml").write_text(yaml.safe_dump(b))
+    (d / "schedule_c.yaml").write_text(yaml.safe_dump(sc))
+    with pytest.raises(ValueError) as e:
+        load_config(d)
+    for words in ("schedule_b.yaml: cadence.daily_note_hour_utc", "schedule_b.yaml: open_vote.fee_on_quorum", "schedule_c.yaml: human seat 1"):
+        assert words in str(e.value), words
+    require_valid_schedules(cfg)
+
+
 # ---- XE-10452: a per-client allowance is counted against the client's network ------------------------------
 
 def test_a_client_allowance_is_keyed_by_network_not_by_one_address(monkeypatch):
@@ -2283,6 +2409,65 @@ async def test_what_the_client_keeps_of_a_keyset_and_a_balance_is_bounded_field_
     import inspect
     assert "deadline_s=CHAT_STORE_DEADLINE_S" in inspect.getsource(xc.XeClient.chat_messages)
     assert xc.CHAT_STORE_DEADLINE_S > xc.REQUEST_DEADLINE_S and inspect.getsource(xc.XeClient).count("deadline_s=CHAT_STORE_DEADLINE_S") == 1
+
+
+def test_schedule_c_names_accounts_or_leaves_them_empty_and_a_fee_fits_the_ledger():
+    """XE-2073's rule at the fields it had not reached: an `accounts` entry that is no account is one every
+    signed request is addressed to and nothing can match, and a fee past 2^63 - 1 is one the ledger's
+    column refuses on the first proposal. Refused at load, by name."""
+    import copy
+
+    from dao.config import require_valid_schedules, schedule_b_faults, schedule_c_faults
+
+    def c_faults(edit):
+        c = load_config(ROOT / "config")
+        c.schedule_c = copy.deepcopy(c.schedule_c)
+        edit(c.schedule_c)
+        return c, schedule_c_faults(c)
+    assert c_faults(lambda d: None)[1] == []
+    for value in ("d" * 64, "D" * 64, "", None):
+        assert c_faults(lambda d, v=value: d["accounts"].update(dao=v))[1] == [], value
+    for value in ("d" * 63, "xyz", 7, ["d" * 64], {"a": 1}, True):
+        c, faults = c_faults(lambda d, v=value: d["accounts"].update(dao=v))
+        assert len(faults) == 1 and faults[0].startswith("accounts.dao is "), value
+        with pytest.raises(ValueError, match="accounts.dao"):
+            require_valid_schedules(c)
+    assert c_faults(lambda d: d.update(accounts=["d" * 64]))[1] == ["accounts must be a mapping of names to accounts"]
+    assert any(f.startswith("tool_scopes must be a mapping") for f in c_faults(lambda d: d.update(tool_scopes=["chain.read"]))[1])
+    for fee, ok in ((0, True), (2**63 - 1, True), (2**63, False), (2**64 - 1, False)):
+        c = load_config(ROOT / "config")
+        c.schedule_b = copy.deepcopy(c.schedule_b)
+        c.schedule_b["open_vote"]["fee_micro_xe"] = fee
+        assert (schedule_b_faults(c) == []) is ok, fee
+
+
+def test_the_agent_vote_rule_says_the_share_and_the_quorum_rule_the_config_holds():
+    """XE-5988 / XE-3160. The one statement of the rule truncated the share (0.29 read "28%"), failed the
+    page when the share was left to its default, and said "never count toward quorum" whatever the two
+    flags said. It says what the tally does."""
+    import copy
+
+    from dao.ui import templates
+
+    def said(**agents):
+        c = load_config(ROOT / "config")
+        c.schedule_b = copy.deepcopy(c.schedule_b)
+        for k, v in agents.pop("wallet", {}).items():
+            c.schedule_b["open_vote"]["participating_wallet"][k] = v
+        for k, v in agents.items():
+            if v is None:
+                c.schedule_b["open_vote"]["agents"].pop(k, None)
+            else:
+                c.schedule_b["open_vote"]["agents"][k] = v
+        return str(templates.env.get_template("_rules.html").module.agent_vote(c))
+    for share, shown in ((0.29, "29%"), (0.07, "7%"), (0.125, "12.5%"), (1, "100%"), (0, "0%"), (None, "1%")):
+        assert f"at most {shown} of the weight" in said(max_weight_share=share), share
+    assert "never count toward quorum" in said()
+    assert "never count toward quorum" in said(count_toward_quorum=True), "excluded as agent accounts all the same"
+    assert "never count toward quorum" in said(wallet={"exclude_agent_accounts": False})
+    assert "count toward quorum as any wallet does" in said(count_toward_quorum=True, wallet={"exclude_agent_accounts": False})
+    page = (ROOT / "dao/templates/proposal.html").read_text(encoding="utf-8")
+    assert '"%g"|format(p.rules.pass_mark_fraction * 100)' in page and "* 100)|int" not in page
 
 
 async def test_an_anchor_number_belongs_to_the_block_the_chain_holds():

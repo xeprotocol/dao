@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_rules.html" as rules %}
 {% block title %}How the seats work together{% endblock %}
 {% block content %}
 <h1>How the seats work together</h1>
@@ -64,7 +65,7 @@
 <h2>Where it stops</h2>
 <div class="prose">
 <p>No seat holds a key. No seat can sign a block, move value, change who holds the keys, or pause anything. A seat that is asked to still does the analysis, marks the record as touching a reserved decision, and routes it to the people. An open vote on the portal, whatever its margin, is a result the people take into account; it is not a decision. The one step in the diagram that changes the world is the one with people in it.</p>
-<p>The seats also take part in open votes, each with a fixed small weight ({{ cfg.open_vote.agents.stipend_micro_xe|xe }} XE), capped together at {{ (cfg.open_vote.agents.max_weight_share * 100)|int }}% of the weight cast, shown separately and never counted toward quorum. Their reasons are published with their votes.</p>
+<p>The seats also take part in open votes. {{ rules.agent_vote(cfg) }} Their reasons are published with their votes.</p>
 </div>
 
 <h2>What is live now</h2>

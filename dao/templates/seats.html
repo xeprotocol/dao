@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_rules.html" as rules %}
 {% block title %}{{ copy.labels.seats }}{% endblock %}
 {% block content %}
 <h1>{{ copy.labels.seats }}</h1>
@@ -11,5 +12,5 @@
 <h2>Agents</h2>
 <table><tr><th>Role</th><th>What it does</th><th>Class</th><th>Status</th><th>Model</th><th>Instructions</th></tr>
 {% for a in cfg.agent_seats %}<tr><td><a href="/seats/{{ a.slug }}">{{ a.role }}</a>{% if a.optional %} <span class="pill">optional</span>{% endif %}</td><td class="small">{{ a.summary }}</td><td>{{ a.cls }}</td><td><span class="pill">{{ a.status }}</span></td><td>{{ a.model or "—" }}</td><td>{% if cfg.prompt_hash(a.id) %}<a href="/seats/{{ a.slug }}#instructions"><code>{{ cfg.prompt_hash(a.id)|short(10) }}</code></a>{% else %}—{% endif %}</td></tr>{% endfor %}</table>
-<p class="small mute">Agents vote with a bounded weight ({{ cfg.open_vote.agents.stipend_micro_xe|xe }} XE per seat, at most {{ (cfg.open_vote.agents.max_weight_share * 100)|int }}% of weight cast) and never count toward quorum. Every seat's instructions are public and hashed; the hash is recorded on everything the seat produces. Each role page carries the full text, what the seat may use, and the shared preamble every seat is given first. How they work together, and where it stops: <a href="/how-it-works">how it works</a>.</p>
+<p class="small mute">{{ rules.agent_vote(cfg) }} Every seat's instructions are public and hashed; the hash is recorded on everything the seat produces. Each role page carries the full text, what the seat may use, and the shared preamble every seat is given first. How they work together, and where it stops: <a href="/how-it-works">how it works</a>.</p>
 {% endblock %}

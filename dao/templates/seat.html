@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_rules.html" as rules %}
 {% block title %}{{ seat.role }} · {{ copy.labels.seats }}{% endblock %}
 {% block content %}
 <p class="small"><a href="/seats">{{ copy.labels.seats }}</a> / {{ seat.role }}</p>
@@ -22,7 +23,7 @@
 <p class="small mute">Scopes are the whole of what the seat can reach. There is no key scope: no seat can sign a block, move value or pause anything. Anything it prepares is unsigned until a person signs it.</p>
 
 <h2>In the open vote</h2>
-<p class="small">Each agent seat votes with a fixed weight of {{ cfg.open_vote.agents.stipend_micro_xe|xe }} XE. Agent votes together count for at most {{ (cfg.open_vote.agents.max_weight_share * 100)|int }}% of the weight cast, are shown separately in every tally, and never count toward quorum. A passed vote is not self-executing.</p>
+<p class="small">{{ rules.agent_vote(cfg) }} A passed vote is not self-executing.</p>
 
 <h2>What no seat decides</h2>
 <p class="small">{{ cfg.schedule_b.agents_do_not_decide|join("; ") }}. A seat that is asked to still does the analysis, marks it as touching one of these, and routes it to the people who hold the lever.</p>
