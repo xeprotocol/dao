@@ -228,6 +228,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Everything goes with these tables, the signed event log first among it, and no upgrade brings a row
+    # back. An empty schema may be taken down; one that holds a record may not (XE-4169).
+    if op.get_bind().execute(sa.text("SELECT 1 FROM events LIMIT 1")).first() is not None:
+        raise RuntimeError("refusing to downgrade past 0001: that drops the event log and every record with it, and "
+                           "nothing restores them. To start again, drop the database.")
     for t in ("schedule_runs", "treasury_snapshots", "health_checks", "anchors", "outbox_messages",
               "inbox_messages", "fee_ledger", "votes", "proposals", "signing_sessions", "pause_records",
               "resolutions", "log_head", "events"):

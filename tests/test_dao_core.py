@@ -2773,6 +2773,90 @@ async def test_a_receive_pass_is_bounded_in_number_and_time_and_dust_waits_behin
     assert chainops._offered[(acct, "fee")][0] == 1 and len(chainops._offered) == limit
 
 
+# ---- XE-4169: a downgrade does not discard what the upgrade cannot restore ---------------------------------
+
+def test_a_downgrade_refuses_while_it_would_discard_what_the_upgrade_cannot_restore():
+    import importlib.util
+    versions = Path(__file__).resolve().parent.parent / "alembic" / "versions"
+
+    def migration(name):
+        spec = importlib.util.spec_from_file_location(f"migration_{name[:4]}", versions / name)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    class Op:
+        """Alembic's `op` over a database that answers every question with `row`."""
+
+        def __init__(self, row):
+            self.row, self.asked, self.did = row, [], []
+
+        def get_bind(self):
+            return self
+
+        def execute(self, statement, params=None):
+            self.asked.append((str(statement), params))
+            return SimpleNamespace(first=lambda: self.row)
+
+        def __getattr__(self, name):
+            return lambda *a, **k: self.did.append(name)
+
+    # 0004: `events.v` says which envelope a row was hashed under, and the upgrade restores every row as v1
+    m = migration("0004_event_envelope_v2.py")
+    m.op = held = Op(row=(1,))
+    with pytest.raises(RuntimeError, match="v2 events"):
+        m.downgrade()
+    assert held.did == [] and "v >= 2" in held.asked[0][0]
+    m.op = empty = Op(row=None)
+    m.downgrade()
+    assert empty.did == ["drop_column"]
+    # 0002: the table of claimed signatures comes back empty, so it is not dropped while a claim still guards a request
+    m = migration("0002_seen_signatures.py")
+    from dao.auth import MAX_SKEW_NS
+    assert m.REPLAY_WINDOW_NS == MAX_SKEW_NS
+    m.op = held = Op(row=(1,))
+    before = time.time_ns()
+    with pytest.raises(RuntimeError, match="could\\s+still be replayed"):
+        m.downgrade()
+    cutoff = held.asked[0][1]["cutoff"]
+    assert held.did == [] and before - MAX_SKEW_NS <= cutoff <= time.time_ns() - MAX_SKEW_NS
+    m.op = empty = Op(row=None)
+    m.downgrade()
+    assert empty.did == ["drop_index", "drop_table"]
+    # 0003: the wider column holds nonces the narrower one cannot
+    m = migration("0003_pow_nonce_u64.py")
+    m.op = held = Op(row=(1,))
+    with pytest.raises(RuntimeError, match="2\\^63"):
+        m.downgrade()
+    assert held.did == [] and "pow_nonce > 9223372036854775807" in held.asked[0][0]
+    m.op = empty = Op(row=None)
+    m.downgrade()
+    assert empty.did == ["alter_column"]
+    # 0001: every table, the log first among them; an empty schema may go and one that holds a record may not
+    m = migration("0001_initial.py")
+    m.op = held = Op(row=(1,))
+    with pytest.raises(RuntimeError, match="event log"):
+        m.downgrade()
+    assert held.did == [] and "FROM events" in held.asked[0][0]
+    m.op = empty = Op(row=None)
+    m.downgrade()
+    assert empty.did == ["drop_table"] * 14
+    # the sites: a downgrade that drops a table or a column or narrows a type refuses first, and every
+    # other one takes away only what its upgrade rebuilds from what is still there
+    guarded = {"0001_initial.py", "0002_seen_signatures.py", "0003_pow_nonce_u64.py", "0004_event_envelope_v2.py"}
+    seen = set()
+    for path in sorted(versions.glob("0*.py")):
+        src = path.read_text()
+        down = src[src.index("def downgrade"):]
+        seen.add(path.name)
+        if path.name in guarded:
+            assert down.index("raise RuntimeError(") < min(down.index(w) for w in ("op.drop_", "op.alter_column") if w in down), path.name
+            continue
+        loses = "drop_table" in down or "drop_column" in down or "type_=" in down
+        assert not loses or path.name == "0006_inbox_published.py", f"{path.name} drops data: say why its upgrade restores it"
+    assert guarded < seen and len(seen) == 7
+
+
 # ---- XE-11273: nothing a client puts in a header raises out of a middleware --------------------------------
 
 async def test_a_declared_length_is_a_bounded_number_or_the_request_is_refused():
@@ -3007,6 +3091,54 @@ async def test_no_response_carries_the_text_of_a_failure_the_service_did_not_wri
         await c.statechain_tip()
     assert str(e.value) == "node unreachable: ConnectError" and e.value.transient
     await c.aclose()
+
+
+# ---- XE-10697, XE-8172: the schema the migrations build is the one the models declare ---------------------
+
+def test_the_migrations_build_the_timestamps_and_the_indexes_the_models_declare():
+    import importlib.util
+    from sqlalchemy import DateTime
+    from dao.models import Base
+    path = ROOT / "alembic/versions/0007_timestamps_and_indexes.py"
+    spec = importlib.util.spec_from_file_location("migration_0007", path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    tables = Base.metadata.sorted_tables
+    required = {(t.name, c.name) for t in tables for c in t.columns if isinstance(c.type, DateTime) and not c.nullable}
+    assert set(m.TIMESTAMPS) == required and len(m.TIMESTAMPS) == len(required) == 9
+    # 0001 is where each was created without NOT NULL, and no other migration creates a timestamp column
+    initial = (ROOT / "alembic/versions/0001_initial.py").read_text()
+    loose = [line for line in initial.splitlines() if "sa.DateTime(timezone=True), server_default" in line]
+    assert len(loose) == 9 and not any("nullable=False" in line for line in loose)
+    declared = {i.name: (t.name, tuple(c.name for c in i.columns)) for t in tables for i in t.indexes}
+    assert {name: (table, columns) for name, table, columns in m.INDEXES} == {n: declared[n] for n, _, _ in m.INDEXES}
+    # and every index, under the name its migration gave it: a database built from the models (the tests')
+    # is the one the migrations build (the deployment's)
+    import re
+    made = {name: (table, columns) for name, table, columns in m.INDEXES}
+    for version in sorted((ROOT / "alembic/versions").glob("0*.py")):
+        for name, table, cols in re.findall(r'op\.create_index\("(\w+)", "(\w+)", \[([^\]]*)\]', version.read_text()):
+            made[name] = (table, tuple(re.findall(r'"(\w+)"', cols)))
+    assert declared == made and len(made) == 17
+
+    class Op:
+        def __init__(self):
+            self.did = []
+
+        def __getattr__(self, name):
+            return lambda *a, **k: self.did.append((name, a, k))
+    m.op = up = Op()
+    m.upgrade()
+    steps = iter(up.did)
+    for table, column in m.TIMESTAMPS:
+        (fill, (statement,), _), (alter, target, how) = next(steps), next(steps)
+        assert fill == "execute" and str(statement) == f"UPDATE {table} SET {column} = now() WHERE {column} IS NULL"
+        assert (alter, target, how["nullable"]) == ("alter_column", (table, column), False)
+    assert [(n, a) for n, a, _ in steps] == [("create_index", (name, table, list(cols))) for name, table, cols in m.INDEXES]
+    m.op = down = Op()
+    m.downgrade()
+    assert [n for n, _, _ in down.did] == ["drop_index"] * 3 + ["alter_column"] * 9
+    assert all(k["nullable"] is True for n, _, k in down.did if n == "alter_column")
 
 
 # ---- sweep of XE-4318: the one unauthenticated read that asks the node on every request --------------------

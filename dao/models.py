@@ -125,7 +125,7 @@ class Proposal(Base):
     title: Mapped[str] = mapped_column(String(256), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     ops: Mapped[list | None] = mapped_column(JSONB, nullable=True)           # optional exact state-chain ops
-    author_account: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    author_account: Mapped[str] = mapped_column(String(64), nullable=False)
     author_pub_key: Mapped[str] = mapped_column(String(64), nullable=False)
     author_signature: Mapped[str] = mapped_column(String(128), nullable=False)
     author_timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -144,7 +144,7 @@ class Vote(Base):
     __tablename__ = "votes"
     __table_args__ = (UniqueConstraint("proposal_hash", "account", name="uq_vote_proposal_account"),)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    proposal_hash: Mapped[str] = mapped_column(String(64), ForeignKey("proposals.hash"), nullable=False, index=True)
+    proposal_hash: Mapped[str] = mapped_column(String(64), ForeignKey("proposals.hash"), nullable=False)
     account: Mapped[str] = mapped_column(String(64), nullable=False)
     pub_key: Mapped[str] = mapped_column(String(64), nullable=False)
     choice: Mapped[str] = mapped_column(String(8), nullable=False)           # for | against | abstain
@@ -161,7 +161,7 @@ class Vote(Base):
 class FeeLedger(Base):
     __tablename__ = "fee_ledger"
     fee_block_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
-    proposal_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    proposal_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     payer: Mapped[str] = mapped_column(String(64), nullable=False)
     amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
     state: Mapped[str] = mapped_column(String(16), nullable=False, default="seen")  # seen | due_refund | due_burn | settling | refunded | burned
@@ -182,7 +182,7 @@ class InboxMessage(Base):
     __tablename__ = "inbox_messages"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)             # envelope id
     channel: Mapped[str] = mapped_column(String(8), nullable=False)           # chat | http
-    from_account: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    from_account: Mapped[str] = mapped_column(String(64), nullable=False)
     to_account: Mapped[str] = mapped_column(String(64), nullable=False)
     pub_key: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     body: Mapped[str] = mapped_column(Text, nullable=False)
@@ -202,7 +202,7 @@ class InboxMessage(Base):
 class OutboxMessage(Base):
     __tablename__ = "outbox_messages"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)             # envelope id
-    in_reply_to: Mapped[str] = mapped_column(String(64), nullable=False, default="", index=True)
+    in_reply_to: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     from_seat: Mapped[str] = mapped_column(String(64), nullable=False)
     to_account: Mapped[str] = mapped_column(String(64), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
@@ -227,7 +227,7 @@ class Anchor(Base):
 class HealthCheck(Base):
     __tablename__ = "health_checks"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    ts: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
     ok: Mapped[bool] = mapped_column(Boolean, nullable=False)
     detail: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
@@ -235,7 +235,7 @@ class HealthCheck(Base):
 class TreasurySnapshot(Base):
     __tablename__ = "treasury_snapshots"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    ts: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
     balances: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
 
@@ -248,3 +248,16 @@ class ScheduleRun(Base):
 
 
 Index("ix_events_kind_index", Event.kind, Event.index)
+# An index is declared here under the name its migration gave it, so a database built from the models
+# (the tests') and one built by the migrations (the deployment's) are the same schema (XE-10697).
+Index("ix_proposals_author", Proposal.author_account)
+Index("ix_votes_proposal", Vote.proposal_hash)
+Index("ix_fee_ledger_proposal", FeeLedger.proposal_hash)
+Index("ix_inbox_from", InboxMessage.from_account)
+Index("ix_outbox_reply", OutboxMessage.in_reply_to)
+Index("ix_health_ts", HealthCheck.ts)
+Index("ix_treasury_ts", TreasurySnapshot.ts)
+# read in time order on every inbox page, and by status and age on every worker pass (XE-8172); migration 0007
+Index("ix_inbox_timestamp", InboxMessage.timestamp, InboxMessage.id)
+Index("ix_outbox_status", OutboxMessage.status, OutboxMessage.created_at)
+Index("ix_sessions_status", SigningSession.status, SigningSession.created_at)

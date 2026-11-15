@@ -19,4 +19,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Dropping `v` forgets which envelope each row was hashed under, and the upgrade above brings every row
+    # back as v1, under which a v2 row's stored hash no longer verifies. So there is no going back past this
+    # revision once a v2 row exists: a downgrade does not discard what the upgrade cannot restore (XE-4169).
+    if op.get_bind().execute(sa.text("SELECT 1 FROM events WHERE v >= 2 LIMIT 1")).first() is not None:
+        raise RuntimeError("refusing to downgrade past 0004: the log holds v2 events, and without events.v "
+                           "they cannot be verified. Restore from a backup taken before 0004 instead.")
     op.drop_column("events", "v")
