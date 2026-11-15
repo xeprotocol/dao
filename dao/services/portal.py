@@ -26,7 +26,7 @@ from ..canonical import DOMAIN_PROPOSAL, canonical_json, sha256_hex
 
 from ..chainops import SNAPSHOT_RULE, account_snapshot, empty_snapshot, snapshot_time
 from ..context import Context
-from ..db import serialize
+from ..db import locked, serialize
 from ..models import FeeLedger, Proposal, Resolution, Vote
 from ..text import clean_text, field_text
 from . import sessions
@@ -100,6 +100,12 @@ async def submit(ctx: Context, db: AsyncSession, v: Verified) -> Proposal:
     fee = int(rules["fee_micro_xe"])
     if fee and not fee_block_hash:
         raise HTTPException(400, f"a fee of {fee} µXE to {fee_account(ctx)} is required; include fee_block_hash")
+    if fee_block_hash and not fee:
+        # A fee block is recorded against a proposal, and published as its fee block, only once
+        # `_verify_fee` has read it. With no fee due nothing is read, so there is nothing to record: a hash
+        # taken on the caller's word would sit in the unique column and in `proposal.opened` for good, and
+        # refuse the block's real payer if a fee is set later (XE-4290).
+        raise HTTPException(400, "no fee is due on a proposal; leave fee_block_hash out")
     fee_block = await _verify_fee(ctx, db, fee_block_hash, v.account, fee)
     now = time.time_ns()
     h = proposal_hash(v.account, title, body, ops, fee_block_hash, v.timestamp)
@@ -123,7 +129,7 @@ async def get(db: AsyncSession, h: str, *, lock: bool = False) -> Proposal:
     writers queue instead of each saving its own copy of a list over the other's (XE-0672)."""
     q = select(Proposal).where(Proposal.hash == h.lower())
     if lock:   # and read the row as it is now, even if an unlocked copy is already in this session (XE-0960)
-        q = q.with_for_update().execution_options(populate_existing=True)
+        q = locked(q)
     pr = (await db.execute(q)).scalar_one_or_none()
     if pr is None:
         raise HTTPException(404, "proposal not found")
@@ -131,18 +137,30 @@ async def get(db: AsyncSession, h: str, *, lock: bool = False) -> Proposal:
 
 
 async def list_proposals(db: AsyncSession, status: str | None = None, offset: int = 0, limit: int = 50) -> list[Proposal]:
-    q = select(Proposal).order_by(Proposal.opened_at.desc()).offset(offset).limit(min(limit, 200))
+    # the hash last: a paged listing has a total order, or two reads of it can skip or repeat a row (XE-3250)
+    q = select(Proposal).order_by(Proposal.opened_at.desc(), Proposal.hash.desc()).offset(offset).limit(min(limit, 200))
     if status:
         q = q.where(Proposal.status == status)
     return list((await db.execute(q)).scalars().all())
 
 
-async def awaiting_decision(db: AsyncSession, limit: int = 50) -> list[Proposal]:
-    """Closed proposals with no decision, and decided ones whose decision was interim (deferred or referred)."""
-    q = (select(Proposal).where(or_(Proposal.status == "closed",
-                                    and_(Proposal.status == "decided", Proposal.decision["decision"].astext.notin_(FINAL))))
-         .order_by(Proposal.opened_at.desc()).limit(min(limit, 200)))
+_AWAITING = or_(Proposal.status == "closed",
+                and_(Proposal.status == "decided", Proposal.decision["decision"].astext.notin_(FINAL)))
+
+
+async def awaiting_decision(db: AsyncSession, limit: int = 50, offset: int = 0) -> list[Proposal]:
+    """Closed proposals with no decision, and decided ones whose decision was interim (deferred or
+    referred). Work that is waiting: oldest first, so the one that has waited longest is on the first page
+    however many close after it, and `count_awaiting_decision` says how many there are in all. Newest
+    first with no offset, the longest-waiting dropped off every list past the page size (XE-4601, the
+    rule `inbox.list_untriaged` keeps since XE-1565)."""
+    q = (select(Proposal).where(_AWAITING).order_by(Proposal.opened_at.asc(), Proposal.hash.asc())
+         .offset(offset).limit(min(limit, 200)))
     return list((await db.execute(q)).scalars().all())
+
+
+async def count_awaiting_decision(db: AsyncSession) -> int:
+    return int((await db.execute(select(func.count()).select_from(Proposal).where(_AWAITING))).scalar_one())
 
 
 # ---- votes ------------------------------------------------------------------------------------
@@ -195,26 +213,37 @@ def is_current(ctx: Context, pr: Proposal, row: Vote) -> bool:
             and bool(row.is_agent) == (row.account in ctx.config.agent_accounts))
 
 
+async def vote_of(db: AsyncSession, h: str, account: str) -> Vote | None:
+    return (await db.execute(select(Vote).where(Vote.proposal_hash == h, Vote.account == account))).scalar_one_or_none()
+
+
 async def rederive_stale(ctx: Context, db: AsyncSession, pr: Proposal) -> list[Vote]:
     """Rows written under an earlier snapshot time or rule carry a weight the proposal no longer means.
     Each is re-derived from the chain before the tally reads it; the vote itself (choice, signature,
     time) stands. A node error leaves the row as it is and raises, so the close waits for the next pass
-    rather than closing on stale weight (XE-1617)."""
-    stale = []
+    rather than closing on stale weight (XE-1617).
+
+    The rows are written before the first entry is appended. Appending takes the log head, and a vote
+    being cast holds its row and then waits for the head: rows written one at a time between entries
+    would take the two in the other order, and the node would be asked about each account with the log
+    held shut (XE-12010)."""
+    stale, changed = [], []
     for row in await votes_for(db, pr.hash):
         if is_current(ctx, pr, row):
             continue
         is_agent = row.account in ctx.config.agent_accounts
         snap, reasons, participating, weight = await eligibility(ctx, pr, row.account, is_agent)
-        changed = (row.weight, row.participating, row.is_agent) != (weight, participating, is_agent)
+        if (row.weight, row.participating, row.is_agent) != (weight, participating, is_agent):
+            changed.append(row)
         row.weight, row.participating, row.is_agent = weight, participating, is_agent
         row.eligibility = {"snapshot": snap, "not_participating_because": reasons}
-        if changed:
-            await ctx.events.append(db, "vote.rederived", "harness", {
-                "proposal": pr.hash, "account": row.account, "weight": weight, "participating": participating,
-                "is_agent": is_agent,
-            }, ref=f"proposal:{pr.hash}")
         stale.append(row)
+    await db.flush()
+    for row in changed:
+        await ctx.events.append(db, "vote.rederived", "harness", {
+            "proposal": pr.hash, "account": row.account, "weight": row.weight, "participating": row.participating,
+            "is_agent": row.is_agent,
+        }, ref=f"proposal:{pr.hash}")
     return stale
 
 
@@ -252,8 +281,7 @@ async def vote(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Vot
     reason = clean_text(v.payload.get("reason"), "reason", max_len=2000, required=False)
     pr = await get(db, pr.hash, lock=True)
     _open(pr)
-    existing = (await db.execute(select(Vote).where(Vote.proposal_hash == pr.hash, Vote.account == v.account)
-                                 .with_for_update())).scalar_one_or_none()
+    existing = (await db.execute(locked(select(Vote).where(Vote.proposal_hash == pr.hash, Vote.account == v.account)))).scalar_one_or_none()
     if existing:
         # Replacement is by signer time, not arrival: a vote signed earlier than the one on record is stale
         # and cannot overwrite it, whoever replays it and whenever (XE-0033).
@@ -276,7 +304,7 @@ async def vote(ctx: Context, db: AsyncSession, pr: Proposal, v: Verified) -> Vot
 
 
 async def votes_for(db: AsyncSession, h: str) -> list[Vote]:
-    return list((await db.execute(select(Vote).where(Vote.proposal_hash == h).order_by(Vote.timestamp.asc()))).scalars().all())
+    return list((await db.execute(select(Vote).where(Vote.proposal_hash == h).order_by(Vote.timestamp.asc(), Vote.account.asc()))).scalars().all())
 
 
 def _share(parts: dict[str, int], total: int) -> dict[str, int]:
@@ -325,7 +353,8 @@ def tally(pr: Proposal, votes: list[Vote], ctx: Context | None = None) -> dict:
     quorum = int(rules.get("quorum_wallets", 20))
     quorum_met = participating >= quorum
     pass_mark = float(rules.get("pass_mark_fraction", 0.5))
-    passed = quorum_met and decided > 0 and (counted["for"] / decided) > pass_mark
+    # compared exactly: weights are integers of µXE and the mark is the decimal the schedule wrote (XE-5578)
+    passed = quorum_met and decided > 0 and Fraction(counted["for"], decided) > Fraction(str(rules.get("pass_mark_fraction", 0.5)))
     return {
         "votes": len(votes), "stale_rows": stale, "participating_wallets": participating, "quorum_wallets": quorum, "quorum_met": quorum_met,
         "weight": counted, "weight_human": human, "weight_agent_raw": agent, "agent_scale": round(scale, 6),
@@ -334,11 +363,22 @@ def tally(pr: Proposal, votes: list[Vote], ctx: Context | None = None) -> dict:
     }
 
 
+def shown_tally(pr: Proposal, votes: list[Vote], ctx: Context | None = None) -> dict:
+    """The tally a reader is shown. An open proposal's is the live count. One that has closed shows the
+    count it closed on (`pr.result`, written once by `_close`), not a recount against the seats and the
+    snapshot rule as they are today: its vote rows are never re-derived after the close, so a later seat
+    change or rule bump would drop them from a recount and the page would show a different outcome from
+    the one recorded, acted on and settled (XE-4460)."""
+    if pr.status != "open" and pr.result:
+        return pr.result
+    return tally(pr, votes, ctx)
+
+
 async def close_due(ctx: Context, db: AsyncSession) -> list[Proposal]:
     """Worker: close proposals whose window has ended; record result; queue the fee action."""
     now = time.time_ns()
-    due = list((await db.execute(select(Proposal).where(Proposal.status == "open", Proposal.closes_at <= now)
-                                 .with_for_update(skip_locked=True))).scalars().all())
+    due = list((await db.execute(locked(select(Proposal).where(Proposal.status == "open", Proposal.closes_at <= now),
+                                        skip_locked=True))).scalars().all())
     closed = []
     for pr in due:
         h = pr.hash
@@ -360,11 +400,12 @@ async def _close(ctx: Context, db: AsyncSession, pr: Proposal) -> None:
     res = tally(pr, await votes_for(db, pr.hash))
     pr.result = res
     pr.status = "closed"
-    await ctx.events.append(db, "proposal.closed", "harness", {"proposal": pr.hash, "title": pr.title, "result": res}, ref=f"proposal:{pr.hash}")
     fee = (await db.execute(select(FeeLedger).where(FeeLedger.proposal_hash == pr.hash))).scalar_one_or_none()
     if fee and fee.state == "seen":
         action = pr.rules.get("fee_on_quorum", "refund") if res["quorum_met"] else pr.rules.get("fee_below_quorum", "burn")
         fee.state = f"due_{action}"
+    await db.flush()   # the rows, then the log head: the order every other writer takes them in (XE-12010)
+    await ctx.events.append(db, "proposal.closed", "harness", {"proposal": pr.hash, "title": pr.title, "result": res}, ref=f"proposal:{pr.hash}")
 
 
 async def _decision_resolution(db: AsyncSession, pr: Proposal, res_id: str, *, passed: bool = True) -> Resolution:
@@ -477,14 +518,16 @@ async def counts(db: AsyncSession) -> dict:
 def to_dict(pr: Proposal, votes: list[Vote] | None = None, include_body: bool = True, ctx: Context | None = None) -> dict:
     d = {
         "hash": pr.hash, "title": pr.title, "author": pr.author_account, "status": pr.status, "opened_at": pr.opened_at,
-        "snapshot_at": snapshot_time(pr.opened_at), "closes_at": pr.closes_at, "fee_block_hash": pr.fee_block_hash,
+        "snapshot_at": snapshot_time(pr.opened_at), "closes_at": pr.closes_at,
+        # a proposal on which no fee was due keeps its own hash in the column, which names no block
+        "fee_block_hash": "" if pr.fee_block_hash == pr.hash else pr.fee_block_hash,
         "rules": pr.rules, "ops": pr.ops,
         "result": pr.result, "decision": pr.decision, "analysis": pr.analysis,
     }
     if include_body:
         d["body"] = pr.body
     if votes is not None:
-        d["tally"] = tally(pr, votes, ctx)
+        d["tally"] = shown_tally(pr, votes, ctx)
         d["votes"] = [{"account": v.account, "choice": v.choice, "weight": v.weight, "participating": v.participating,
                        "is_agent": v.is_agent, "timestamp": v.timestamp, "reason": v.reason} for v in votes]
     return d

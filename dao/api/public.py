@@ -12,11 +12,11 @@ from fastapi.responses import RedirectResponse
 from sse_starlette.sse import EventSourceResponse
 
 from .. import __version__
-from ..auth import SignedRequest, claim_signature, require_pow, require_seat, verify_and_claim, verify_signed
+from ..auth import POW_RULE, SignedRequest, accept, addressee, member_action, require_pow, verify_signed
 from ..canonical import DOMAIN_INBOX_HTTP, DOMAIN_MEMBER_ACTION, DOMAIN_PROPOSAL, DOMAIN_VOTE
 from ..db import session
 from ..log import EventLog, event_to_dict
-from ..ratelimit import INBOX, NODE_READ, PROPOSAL, SNAPSHOT, STREAMS, VOTE, enforce_account, enforce_ip
+from ..ratelimit import INBOX, NODE_READ, PROPOSAL, SNAPSHOT, STREAMS, VOTE, enforce_ip
 from ..services import inbox as inbox_svc
 from ..services import pause as pause_svc
 from ..services import portal, records
@@ -56,14 +56,17 @@ async def manifest(ctx: Ctx, db: Db):
             "schedule": f"{base}/v1/schedule/next",
         },
         "signing": {
-            "method": "ed25519 over sha256(domain || canonical_json({payload, timestamp}))",
+            "method": "ed25519 over sha256(domain || canonical_json({dao, network, payload, timestamp}))",
+            "to": addressee(ctx),
             "domains": {
                 "proposal": DOMAIN_PROPOSAL.decode().rstrip("\x00"),
                 "vote": DOMAIN_VOTE.decode().rstrip("\x00"),
                 "inbox": DOMAIN_INBOX_HTTP.decode().rstrip("\x00"),
                 "member_action": DOMAIN_MEMBER_ACTION.decode().rstrip("\x00"),
             },
-            "note": "domain bytes are the string followed by a single 0x00 byte",
+            "note": "domain bytes are the string followed by a single 0x00 byte; dao and network are the values "
+                    "in `to`, so a signature is for this deployment and no other; a member-action payload "
+                    "names its `action`",
         },
         "rules": ctx.config.pinned_rules(),
     }
@@ -115,9 +118,8 @@ async def list_proposals(db: Db, status: str | None = None, offset: int = Query(
 @router.post("/proposals", status_code=201)
 async def submit_proposal(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
     enforce_ip(request, PROPOSAL)
-    v = verify_signed(req, DOMAIN_PROPOSAL)
-    enforce_account(PROPOSAL, v.account)
-    await claim_signature(db, v)
+    v = verify_signed(ctx, req, DOMAIN_PROPOSAL)
+    await accept(db, v, PROPOSAL)
     pr = await portal.submit(ctx, db, v)
     await db.commit()
     return portal.to_dict(pr)
@@ -133,7 +135,7 @@ async def get_proposal(h: str, db: Db, ctx: Ctx):
 async def proposal_votes(h: str, db: Db, ctx: Ctx):
     pr = await portal.get(db, h)
     votes = await portal.votes_for(db, pr.hash)
-    return {"proposal": pr.hash, "tally": portal.tally(pr, votes, ctx),
+    return {"proposal": pr.hash, "tally": portal.shown_tally(pr, votes, ctx),
             "votes": [{"account": v.account, "choice": v.choice, "weight": v.weight, "participating": v.participating,
                        "is_agent": v.is_agent, "timestamp": v.timestamp, "reason": v.reason, "signature": v.signature,
                        "pub_key": v.pub_key} for v in votes]}
@@ -142,9 +144,8 @@ async def proposal_votes(h: str, db: Db, ctx: Ctx):
 @router.post("/proposals/{h}/votes", status_code=201)
 async def cast_vote(request: Request, h: str, req: SignedRequest, ctx: Ctx, db: Db):
     enforce_ip(request, VOTE)
-    v = verify_signed(req, DOMAIN_VOTE)
-    enforce_account(VOTE, v.account)
-    await claim_signature(db, v)
+    v = verify_signed(ctx, req, DOMAIN_VOTE)
+    await accept(db, v, VOTE)
     pr = await portal.get(db, h)
     row = await portal.vote(ctx, db, pr, v)
     await db.commit()
@@ -156,9 +157,8 @@ async def cast_vote(request: Request, h: str, req: SignedRequest, ctx: Ctx, db: 
 async def cast_vote_flat(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
     """Same as POST /proposals/{hash}/votes; the proposal hash comes from the signed payload."""
     enforce_ip(request, VOTE)
-    v = verify_signed(req, DOMAIN_VOTE)
-    enforce_account(VOTE, v.account)
-    await claim_signature(db, v)
+    v = verify_signed(ctx, req, DOMAIN_VOTE)
+    await accept(db, v, VOTE)
     pr = await portal.get(db, field_text(v.payload, "proposal"))
     row = await portal.vote(ctx, db, pr, v)
     await db.commit()
@@ -167,11 +167,14 @@ async def cast_vote_flat(request: Request, req: SignedRequest, ctx: Ctx, db: Db)
 
 
 @router.get("/decisions")
-async def decisions(db: Db, limit: int = Query(50, ge=1, le=200)):
-    rows = await portal.list_proposals(db, "decided", 0, limit)
-    closed = await portal.awaiting_decision(db, limit)
+async def decisions(db: Db, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0, le=2**31 - 1)):
+    """Decided proposals newest first; those awaiting a decision oldest first, with how many there are in
+    all (`awaiting_total`). `offset` pages both lists."""
+    rows = await portal.list_proposals(db, "decided", offset, limit)
+    closed = await portal.awaiting_decision(db, limit, offset)
     return {"decided": [portal.to_dict(p, include_body=False) for p in rows],
-            "awaiting_decision": [portal.to_dict(p, include_body=False) for p in closed]}
+            "awaiting_decision": [portal.to_dict(p, include_body=False) for p in closed],
+            "awaiting_total": await portal.count_awaiting_decision(db), "offset": offset, "limit": limit}
 
 
 @router.get("/snapshot/{account}")
@@ -192,7 +195,16 @@ async def snapshot(request: Request, account: str, ctx: Ctx, db: Db, proposal: s
         snap, reasons, participating, weight = await portal.eligibility_at(
             ctx, ctx.config.pinned_rules(), portal.snapshot_time(time.time_ns()), account, is_agent)
     else:
-        snap, reasons, participating, weight = await portal.eligibility(ctx, await portal.get(db, proposal), account, is_agent)
+        pr = await portal.get(db, proposal)
+        # On a proposal that has closed, a wallet that voted is told what its vote was recorded with: that is
+        # what the result counted, and a second derivation from the chain as it reads today is not (XE-4460).
+        row = None if pr.status == "open" else await portal.vote_of(db, pr.hash, account)
+        if row is not None:
+            kept = row.eligibility or {}
+            snap, reasons = kept.get("snapshot") or {}, kept.get("not_participating_because") or []
+            participating, weight = row.participating, row.weight
+        else:
+            snap, reasons, participating, weight = await portal.eligibility(ctx, pr, account, is_agent)
     return {"account": account, **snap, "weight": weight, "participating": participating,
             "not_participating_because": reasons}
 
@@ -207,8 +219,8 @@ async def inbox_info(ctx: Ctx, db: Db, limit: int = Query(50, ge=1, le=200)):
         "how": "send an XE chat envelope to the account above, or POST a signed message here with a proof of work",
         "pow": {
             "difficulty": f"0x{ctx.node.chat_pow_difficulty:016x}",
-            "rule": "pow_nonce (u64) such that sha256(nonce_le8 || signing_digest)[0:8] read big-endian >= difficulty; "
-                    "signing_digest = sha256(domain || 0x00 || canonical_json({payload, timestamp}))",
+            "rule": POW_RULE + "; signing_digest = sha256(domain || 0x00 || canonical_json({dao, network, payload, timestamp})), "
+                    "dao and network as published at GET /v1 under signing.to",
             "domain": DOMAIN_INBOX_HTTP.rstrip(b"\x00").decode(),
         },
         "logging": "messages sent here are kept in the hash chain on receipt and appear here and on the public log once a member has read them",
@@ -220,10 +232,9 @@ async def inbox_info(ctx: Ctx, db: Db, limit: int = Query(50, ge=1, le=200)):
 async def inbox_post(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
     """Signed message plus a chat-level proof of work over the signing digest (see GET /v1/inbox for the rule)."""
     enforce_ip(request, INBOX)
-    v = verify_signed(req, DOMAIN_INBOX_HTTP)
-    enforce_account(INBOX, v.account)
+    v = verify_signed(ctx, req, DOMAIN_INBOX_HTTP)
     require_pow(v, ctx.node.chat_pow_difficulty)   # the work is paid before anything touches the database (XE-0699)
-    await claim_signature(db, v)
+    await accept(db, v, INBOX)
     m = await inbox_svc.http_submit(ctx, db, v)
     await db.commit()
     return inbox_svc.to_dict(m)
@@ -267,6 +278,7 @@ async def log_get(db: Db, index: int = Path(ge=0, le=2**63 - 1)):
     return event_to_dict(ev)
 
 
+STREAM_BATCH = 200   # log entries read per pass of the event stream
 RESUME_RE = re.compile(r"-?[0-9]{1,18}")   # ASCII digits only: `\d` would take any script's digits
 
 
@@ -307,7 +319,7 @@ async def events_stream(request: Request, ctx: Ctx, after: int | None = Query(No
         try:
             while not await request.is_disconnected():
                 async with session() as s:
-                    rows = await EventLog.since(s, last_index)
+                    rows = await EventLog.since(s, last_index, limit=STREAM_BATCH)
                 for ev in rows:
                     last_index = ev.index
                     idle_since = time.monotonic()
@@ -315,6 +327,11 @@ async def events_stream(request: Request, ctx: Ctx, after: int | None = Query(No
                 if time.monotonic() - idle_since >= 15:
                     idle_since = time.monotonic()
                     yield {"event": "ping", "data": json.dumps({"ts": time.time_ns(), "last": last_index})}
+                if len(rows) >= STREAM_BATCH:
+                    # A full batch means there is more behind it: read on. The wait below is for a stream
+                    # that has caught up; taken after every batch it held a resuming reader to one batch
+                    # every three seconds however far behind it was (XE-4267).
+                    continue
                 try:
                     await asyncio.wait_for(wake.get(), timeout=3)
                     while not wake.empty():
@@ -343,7 +360,7 @@ async def health(ctx: Ctx, db: Db):
     stale = records.health_is_stale(ctx, last)
     return {"ok": bool(last and last.get("ok")) and not stale, "stale": stale,
             "last_check_age_s": records.health_age_s(last), "cadence_s": records.cadence_s(ctx),
-            "last_check": last, "uptime_30d": await records.uptime_30d(ctx, db),
+            "last_check": last, "uptime_30d": await records.uptime_30d_shown(ctx, db),
             "paused": await pause_svc.is_paused(db)}
 
 
@@ -359,8 +376,8 @@ async def ready(ctx: Ctx, db: Db):
 # ---- signed member/officer actions on the public router (analysis, decision) -------------------
 
 @router.post("/proposals/{h}/analysis", status_code=201)
-async def proposal_analysis(h: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
+async def proposal_analysis(request: Request, h: str, req: SignedRequest, ctx: Ctx, db: Db):
+    v = await member_action(request, db, ctx, req, "add_analysis", proposal=h)
     pr = await portal.get(db, h, lock=True)
     await portal.add_analysis(ctx, db, pr, v)
     await db.commit()
@@ -368,8 +385,8 @@ async def proposal_analysis(h: str, req: SignedRequest, ctx: Ctx, db: Db):
 
 
 @router.post("/proposals/{h}/decision", status_code=201)
-async def proposal_decision(h: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
+async def proposal_decision(request: Request, h: str, req: SignedRequest, ctx: Ctx, db: Db):
+    v = await member_action(request, db, ctx, req, "decide_proposal", proposal=h)
     if not (v.seat.is_member or v.seat.can("operational_review")):
         raise HTTPException(403, "decisions are recorded by members or an officer with operational_review")
     pr = await portal.get(db, h, lock=True)

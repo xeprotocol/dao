@@ -21,6 +21,17 @@ write is made exactly once, whatever the worker does around it. One pass runs at
 A block the node keeps refusing is offered for as long as nothing else stands in its place, with the reason
 on the row. It is replaced when the fee account's chain next moves, which the next fee received does.
 
+One block of ours at a time stands on any one place. A row's block that was offered and is not on the
+chain yet may be on its way there, and the next row's block would be built on the same previous: two
+blocks signed by the fee key for one place, of which the chain can keep one, and a proof of work spent
+on the other. So a pass takes the rows already holding a block first, and once a row holds a block
+a node could still take, no other row's block is built that pass (XE-4591). "Could still take" has an end:
+a node accepts a block dated within an hour of its clock, so a block older than that (and a margin for
+the clock) is not waited on, and the rows behind it build as before, which is also what moves the chain
+past it. Receives are not held back by a standing block. A receive that loses the place to it is refused,
+its send stays pending on the node, and the next pass offers it again; and a receive is what moves the
+chain past a settlement block no node will take.
+
 A receive is offered for every send pending to the fee account, and recorded for a fee the ledger knows
 when the fee account's chain holds a final receive whose source is that fee's send. A fee whose receive is
 not on the chain is not settled: there is nothing of the payer's to pay out.
@@ -29,6 +40,7 @@ not on the chain is not settled: there is nothing of the payer's to pay out.
 from __future__ import annotations
 
 import logging
+import time
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,6 +55,9 @@ from . import pause
 log = logging.getLogger("dao.fees")
 
 DUE = ("due_refund", "due_burn")
+# the hour a node allows a block's timestamp either way, and a margin for its clock: waited out in full,
+# since a block a node could still take is exactly the one another must not be built beside
+STANDING_NS = chainops.TIMESTAMP_WINDOW_NS + 5 * 60 * 1_000_000_000
 UNRECEIVED_ERROR = "fee send was never received into the fee account; nothing to settle"
 ARRIVING_NOTE = "the fee's receive is not final on the fee account's chain yet; settlement waits for it"
 
@@ -120,24 +135,44 @@ async def settle_due(ctx: Context, db: AsyncSession) -> int:
     rows reached `refunded` or `burned` this pass."""
     if not ctx.signer.has("fee"):
         return 0
-    keys = list((await db.execute(select(FeeLedger.fee_block_hash).where(FeeLedger.state.in_(DUE + ("settling",)))
-                                  .order_by(FeeLedger.updated_at.asc(), FeeLedger.fee_block_hash.asc()))).scalars().all())
+    rows = (await db.execute(select(FeeLedger.fee_block_hash, FeeLedger.tx_hashes).where(FeeLedger.state.in_(DUE + ("settling",)))
+                             .order_by(FeeLedger.updated_at.asc(), FeeLedger.fee_block_hash.asc()))).all()
+    # rows that hold a block first, each group oldest first: theirs are the blocks that may be standing,
+    # and whether one is has to be known before anything is built for a row that has none (XE-4591)
+    keys = [key for key, tx in sorted(rows, key=lambda r: 0 if (r[1] or {}).get("settle_block") else 1)]
     chain = _FeeChain(ctx)
     n = 0
+    standing = False
     for key in keys:
         f = await db.get(FeeLedger, key)
         try:
             if f.state in DUE and not (f.tx_hashes or {}).get("receive") and not await _received(ctx, db, f, chain):
                 continue
-            if await _settle(ctx, db, f):
+            # with a block of ours standing, a row that has none is marked and not built: its block would
+            # go where that one may yet land. The next pass takes it.
+            if await _settle(ctx, db, f, build=not standing):
                 n += 1
+            elif _stands(f):
+                standing = True
         except Exception as e:  # keep going; the row is as it was last committed, and is taken again next tick
             await db.rollback()
             f = await db.get(FeeLedger, key)
             f.error = str(e)[:500]
             await db.commit()
             log.warning("fee settle failed for %s: %s", f.proposal_hash, e)
+            # a row whose pass failed (the node could not be read) may hold a block all the same, and
+            # that block stands whether or not this pass could look at it
+            standing = standing or _stands(f)
     return n
+
+
+def _stands(f: FeeLedger) -> bool:
+    """Whether the row holds a settlement block that is not settled and that a node could still take."""
+    block = (f.tx_hashes or {}).get("settle_block")
+    if f.state != "settling" or not isinstance(block, dict):
+        return False
+    ts = block.get("timestamp")
+    return isinstance(ts, int) and time.time_ns() - ts < STANDING_NS
 
 
 async def _received(ctx: Context, db: AsyncSession, f: FeeLedger, chain: _FeeChain) -> bool:
@@ -193,9 +228,10 @@ async def _note(db: AsyncSession, f: FeeLedger, why: str) -> None:
         await db.commit()
 
 
-async def _settle(ctx: Context, db: AsyncSession, f: FeeLedger) -> bool:
+async def _settle(ctx: Context, db: AsyncSession, f: FeeLedger, *, build: bool = True) -> bool:
     """Take a row as far as the chain allows this pass; True once it is `refunded` or `burned`. A burn that
-    leaves an excess to return is two phases, one block each."""
+    leaves an excess to return is two phases, one block each. With `build` false the row's own block is
+    followed if it has one and no new block is built for it (`settle_due` says when)."""
     if "settle_nonce" in (f.tx_hashes or {}):
         # Marked by the release before this one, which named its block by a nonce in the memo and kept no
         # hash. Whether that block went out cannot be told from the row, so no block is built for it here.
@@ -208,7 +244,7 @@ async def _settle(ctx: Context, db: AsyncSession, f: FeeLedger) -> bool:
     while f.state == "settling":
         block = f.tx_hashes.get("settle_block")
         if block is None:
-            block = await _build(ctx, db, f, fee)
+            block = await _build(ctx, db, f, fee) if build else None
             if block is None:
                 return False
             # The block is on the row before it is offered: whatever happens next, this is the block the

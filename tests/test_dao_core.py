@@ -2470,6 +2470,20 @@ def test_the_agent_vote_rule_says_the_share_and_the_quorum_rule_the_config_holds
     assert '"%g"|format(p.rules.pass_mark_fraction * 100)' in page and "* 100)|int" not in page
 
 
+def test_rows_are_written_before_the_log_head_is_taken():
+    """XE-12010. A writer that appends between two row writes holds the head and then waits for a row, and
+    a writer that holds that row waits for the head. Re-deriving votes did this once per vote, with a node
+    read in between; closing a proposal did it with the fee row."""
+    import inspect
+
+    from dao.services import portal
+    src = inspect.getsource(portal.rederive_stale)
+    assert src.count("ctx.events.append(") == 1 and src.index("await db.flush()") < src.index("ctx.events.append(")
+    assert src.index("await eligibility(") < src.index("await db.flush()"), "and the node is asked before either is held"
+    src = inspect.getsource(portal._close)
+    assert src.index("fee.state = ") < src.index("await db.flush()") < src.index("ctx.events.append(")
+
+
 async def test_an_anchor_number_belongs_to_the_block_the_chain_holds():
     """XE-6256 / XE-4148. An ended session's block lands after a later session has taken its number: the
     register row goes to the block that is on the chain. A row that already names a block there stands."""
@@ -2508,6 +2522,41 @@ async def test_an_anchor_number_belongs_to_the_block_the_chain_holds():
     db = Db(own)
     await sessions._anchor_written(db, s)
     assert (own.statechain_index, own.statechain_hash, own.event_index) == (12, "bh", 60), "its own row is filled as it is"
+
+
+async def test_a_closed_proposal_tells_a_voter_what_the_vote_was_recorded_with(monkeypatch):
+    """XE-4460. The preview derived a weight from the chain as it reads now for any proposal; on one that
+    has closed, the wallet's vote is on record with the weight the result counted, and that is the answer."""
+    from dao.api import public
+    from dao.services import portal
+    h, voter, other = "ab" * 32, "a" * 64, "b" * 64
+    pr = SimpleNamespace(hash=h, status="closed", rules={}, opened_at=1)
+    kept = SimpleNamespace(weight=5, participating=False,
+                           eligibility={"snapshot": {"snapshot_at": 9, "balance": 5}, "not_participating_because": ["too new"]})
+    derived = []
+
+    async def get(db, proposal):
+        return pr
+
+    async def vote_of(db, proposal, account):
+        return kept if account == voter else None
+
+    async def eligibility(ctx, proposal, account, is_agent):
+        derived.append(account)
+        return {"snapshot_at": 9, "balance": 1}, [], True, 1
+    monkeypatch.setattr(portal, "get", get)
+    monkeypatch.setattr(portal, "vote_of", vote_of)
+    monkeypatch.setattr(portal, "eligibility", eligibility)
+    ctx = SimpleNamespace(config=SimpleNamespace(agent_accounts=set()))
+
+    def request(n):
+        return SimpleNamespace(client=SimpleNamespace(host=f"10.77.0.{n}"))
+    assert await public.snapshot(request(1), voter, ctx, None, proposal=h) == {
+        "account": voter, "snapshot_at": 9, "balance": 5, "weight": 5, "participating": False, "not_participating_because": ["too new"]}
+    assert derived == []
+    assert (await public.snapshot(request(2), other, ctx, None, proposal=h))["weight"] == 1 and derived == [other]
+    pr.status = "open"
+    assert (await public.snapshot(request(3), voter, ctx, None, proposal=h))["weight"] == 1, "an open proposal is derived, as a vote would be"
 
 
 def test_small_rules_of_the_sweep_hold_where_they_are_stated():

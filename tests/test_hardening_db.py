@@ -1516,6 +1516,7 @@ async def test_no_worker_job_writes_to_the_node_while_paused_except_directory_re
     ctx.settings = SimpleNamespace(public_base_url="http://dao")
     ctx.config.members = [_member("founder-a")]
     ctx.config.pause = {}
+    ctx.config.cadence = {}
     sm = async_sessionmaker(db.bind, expire_on_commit=False)
 
     @asynccontextmanager
@@ -2247,6 +2248,11 @@ async def test_a_set_aside_signature_is_replaced_by_the_seats_next_one_and_a_liv
          lambda: p.lifted_by, lambda: p.status == "lifted"),
     ]
     for name, sign, payload, sigs, done in sites:
+        if name == "pause.lift":
+            # the extension the site before applied began a new term, and nothing toward lifting the old one
+            # carried into it (XE-5577, below); this is a lift signature given since, by a key since rotated
+            assert p.lifted_by == []
+            p.lifted_by = [stale]
         assert [s["public_key"] for s in sigs()] == [old], name
         await sign(_signed_by("founder-a", new, payload))
         assert [(s["seat"], s["public_key"]) for s in sigs()] == [("founder-a", new)], f"{name}: replaced, not added beside"
@@ -2298,6 +2304,88 @@ async def test_a_set_aside_signature_is_replaced_by_the_seats_next_one_and_a_liv
     assert r4.status == "passed" and [s["seat"] for s in r4.signatures] == ["founder-b"], \
         "the one member who can sign has signed; the signature from the seat that lost the right is not what passed it, and is not shown as if it had"
     assert [s["seat"] for s in resolutions.to_dict(r4, ctx.config)["signatures"]] == ["founder-b"]
+
+
+# ---- XE-5577 / XE-7207: consent on a pause is to one outcome, for the term it was given in ----------------------
+
+async def test_a_members_latest_pause_signature_is_their_position_and_an_extension_starts_a_new_term(db):
+    from dao.models import PauseRecord
+    from dao.services import pause
+    ctx = _ctx()
+    ka, kb, kc = "a" * 64, "b" * 64, "c" * 64
+    ctx.config.pause = {}
+    now = time.time_ns()
+
+    async def paused(pid, members):
+        for old in (await db.execute(select(PauseRecord).where(PauseRecord.status == "active"))).scalars():
+            old.status = "lifted"
+        await db.flush()
+        ctx.config.members = members
+        r = PauseRecord(id=pid, determined_by="founder-a", ground="g", determination="d" * 20, started_at=now,
+                        expires_at=now + 10**12, indefinite=False, status="active", lifted_by=[], extensions=[])
+        db.add(r)
+        await db.flush()
+        return r
+
+    def by(seat, key, **payload):
+        return _signed_by(seat, key, {"pause_id": "p", **payload})
+
+    two = [_member("founder-a", key=ka), _member("founder-b", key=kb)]
+    # the reported sequence: A signs to lift, both then extend, and B alone signs to lift
+    r = await paused("p1", two)
+    await pause.lift(ctx, db, r, by("founder-a", ka))
+    assert [s["seat"] for s in r.lifted_by] == ["founder-a"]
+    await pause.extend(ctx, db, r, by("founder-a", ka, reason="the audit is not back"))
+    assert r.lifted_by == [], "signing to extend withdrew A's signature to lift"
+    await pause.extend(ctx, db, r, by("founder-b", kb, reason="agreed, and counsel asked for a week"))
+    term = r.expires_at
+    assert r.extensions[-1]["applied"] and term > now + 10**12
+    await pause.lift(ctx, db, r, by("founder-b", kb))
+    assert r.status == "active" and r.expires_at == term and pause.to_dict(ctx, r)["lift_signatures"] == 1
+    # each member is shown as having said what that member signed, whoever signed last (XE-7207)
+    assert pause.to_dict(ctx, r)["extensions"][-1]["reasons"] == [
+        {"seat": "founder-a", "reason": "the audit is not back"},
+        {"seat": "founder-b", "reason": "agreed, and counsel asked for a week"}]
+    assert "reason" not in r.extensions[-1]
+    # A may sign to lift again in the new term, and then it is lifted: by both, after both extended
+    await pause.lift(ctx, db, r, by("founder-a", ka))
+    assert r.status == "lifted"
+
+    # the mirror: A signs to extend, then to lift; B's signature to extend does not apply it on A's old one
+    r = await paused("p2", two)
+    await pause.extend(ctx, db, r, by("founder-a", ka))
+    await pause.lift(ctx, db, r, by("founder-a", ka))
+    assert r.extensions[-1]["signatures"] == [], "signing to lift withdrew A's signature on the pending extension"
+    before = r.expires_at
+    await pause.extend(ctx, db, r, by("founder-b", kb, reason="b only"))
+    assert not r.extensions[-1]["applied"] and r.expires_at == before
+    assert [s["seat"] for s in r.lifted_by] == ["founder-a"], "B extending does not touch A's signature to lift"
+    assert pause.to_dict(ctx, r)["extensions"][-1]["reasons"] == [{"seat": "founder-b", "reason": "b only"}]
+    # a second signature with no reason leaves the first signer's reason on the first signer's signature
+    await pause.extend(ctx, db, r, by("founder-a", ka))
+    assert r.extensions[-1]["applied"] and r.lifted_by == []
+    assert pause.to_dict(ctx, r)["extensions"][-1]["reasons"] == [{"seat": "founder-b", "reason": "b only"}]
+
+    # Every member signs an extension, so each one's earlier signature to lift is withdrawn by their own
+    # hand. The term rule covers the signature nobody withdrew: C signed to lift, was not a signer when A
+    # and B extended, and is one again afterwards. C's signature was for the term before.
+    three = [*two, _member("founder-c", key=kc)]
+    r = await paused("p3", three)
+    await pause.lift(ctx, db, r, by("founder-c", kc))
+    ctx.config.members = [*two, _member("founder-c", rights=(), key=kc)]
+    await pause.extend(ctx, db, r, by("founder-a", ka))
+    await pause.extend(ctx, db, r, by("founder-b", kb))
+    assert r.extensions[-1]["applied"] and r.lifted_by == []
+    ctx.config.members = three
+    await pause.lift(ctx, db, r, by("founder-a", ka))
+    await pause.lift(ctx, db, r, by("founder-b", kb))
+    assert r.status == "active" and pause.to_dict(ctx, r)["lift_signatures"] == 2
+    # an applied extension is a record: a later signature to lift takes nothing off it
+    assert sorted(s["seat"] for s in r.extensions[-1]["signatures"]) == ["founder-a", "founder-b"]
+    # the log says what happened to the earlier signature
+    kinds = {e.kind: e.payload for e in (await db.execute(select(Event).where(Event.ref == "pause:p1"))).scalars()}
+    assert kinds["pause.extension_signed"]["withdrew_lift_signature"] is True
+    assert [x["seat"] for x in kinds["pause.extended"]["reasons"]] == ["founder-a", "founder-b"]
 
 
 # ---- XE-1967: a passed resolution is passed; a step that fails is one step ------------------------------------
@@ -2905,6 +2993,29 @@ async def test_a_keyset_session_the_seats_no_longer_meet_is_not_built_signed_or_
     assert len(sent) == 1
 
 
+# ---- XE-4290: a fee block is recorded only once it has been read ------------------------------------------
+
+async def test_no_fee_block_is_recorded_when_no_fee_is_due(db):
+    ctx = _ctx()
+    rules = ctx.config.pinned_rules()
+    ctx.config.pinned_rules = lambda: {**rules, "fee_micro_xe": 0}
+
+    async def never(h):
+        raise AssertionError("no fee is due: the chain is not asked")
+    ctx.chain.block = never
+    with pytest.raises(HTTPException) as e:
+        await portal.submit(ctx, db, _v(payload={"title": "t", "body": "b", "fee_block_hash": "c" * 64}))
+    assert e.value.status_code == 400 and "no fee is due" in e.value.detail
+    assert (await db.execute(select(Proposal))).scalars().all() == []
+    for blank in ({}, {"fee_block_hash": ""}, {"fee_block_hash": None}):
+        pr = await portal.submit(ctx, db, _v(payload={"title": "t", "body": "b", **blank}))
+        assert pr.fee_block_hash == pr.hash, "the column holds the proposal's own hash, which no fee block can be"
+    await db.flush()
+    assert (await db.execute(select(FeeLedger))).scalars().all() == []
+    opened = (await db.execute(select(Event).where(Event.kind == "proposal.opened"))).scalars().all()
+    assert len(opened) == 3 and all(ev.payload["fee_block_hash"] == "" for ev in opened)
+
+
 # ---- XE-6048: a condition that lasts is logged when it begins and when it ends -----------------------------
 
 async def test_a_degraded_spell_is_one_log_entry_at_each_edge_however_many_checks_it_lasts(db):
@@ -3010,6 +3121,48 @@ async def test_a_failed_directory_registration_is_retried_soon_and_logged_once_a
     assert await events() == ["directory.register_failed", "directory.registered"]
     db.expire_all()
     assert time.time_ns() - (await ws.last_runs(db))["directory"] < 60 * ws.NS, "a good run is marked as run now"
+
+
+# ---- XE-4460 / XE-5578: a closed proposal shows the tally it closed on ------------------------------------
+
+async def test_a_closed_proposal_shows_the_tally_it_closed_on_whatever_the_seats_are_now(db):
+    from dao.chainops import SNAPSHOT_RULE, snapshot_time
+    ctx = _ctx()
+    rules = {**ctx.config.pinned_rules(), "quorum_wallets": 1, "pass_mark_fraction": 0.5}
+    now = time.time_ns()
+    pr = Proposal(hash="4" * 64, title="t", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64, author_signature="s",
+                  author_timestamp=now, fee_block_hash="4" * 64, status="open", opened_at=now - D, closes_at=now + D,
+                  rules=rules, analysis=[])
+    db.add(pr)
+    current = {"at": snapshot_time(pr.opened_at), "rule": SNAPSHOT_RULE}
+    for acct, choice, weight in (("v1", "for", 3_000_000), ("v2", "against", 1_000_000)):
+        db.add(Vote(proposal_hash=pr.hash, account=acct, pub_key="p" * 64, choice=choice, reason="", timestamp=now,
+                    signature=os.urandom(8).hex(), weight=weight, participating=True, is_agent=False,
+                    eligibility={"snapshot": current, "not_participating_because": []}))
+    await db.flush()
+    votes = await portal.votes_for(db, pr.hash)
+    live = portal.shown_tally(pr, votes, ctx)
+    assert live == portal.tally(pr, votes, ctx) and live["outcome"] == "passed", "an open proposal shows the live count"
+    pr.result, pr.status = portal.tally(pr, votes), "closed"
+    closed_on = dict(pr.result)
+    # the larger voter is made an agent seat after the close: a recount would drop the row and fail the vote
+    ctx.config.agent_accounts = {"v1"}
+    assert portal.tally(pr, votes, ctx)["outcome"] != "passed", "the recount the pages used to show"
+    for status in ("closed", "decided"):
+        pr.status = status
+        assert portal.shown_tally(pr, votes, ctx) == closed_on
+        assert portal.to_dict(pr, votes, ctx=ctx)["tally"] == closed_on
+    import inspect
+
+    from dao import ui
+    from dao.api import public
+    for mod in (ui, public):
+        assert "portal.tally(" not in inspect.getsource(mod), "every published tally goes through shown_tally"
+    # the pass test is exact at any weight (XE-5578): one unit over half of 2^60 passes, exactly half does not
+    def outcome(for_, against):
+        rows = [SimpleNamespace(is_agent=False, choice=c, weight=w, participating=True) for c, w in (("for", for_), ("against", against))]
+        return portal.tally(SimpleNamespace(rules=rules), rows)["outcome"]
+    assert outcome(2**59 + 1, 2**59 - 1) == "passed" and outcome(2**59, 2**59) == "failed"
 
 
 # ---- XE-4601 / XE-3250: waiting work is listed oldest first with a count, and every page has a total order ----
@@ -3258,6 +3411,49 @@ async def test_time_under_a_pause_does_not_count_toward_giving_a_reply_up(db):
     db.add(rec("p3", now - D // 4, expires=now + D, status="active"))
     await db.commit()
     assert abs(await pause.paused_ns(db, now - D) - D // 4) < 60 * inbox.NS
+
+
+# ---- XE-4591: one settlement block of ours stands on a place at a time ---------------------------------------
+
+async def test_no_second_settlement_block_is_built_where_one_of_ours_may_still_land(db, monkeypatch):
+    from collections import Counter
+    ctx, chain, fee = _fee_ctx(funded=3000)
+    for n in "123":
+        await _fee_row(db, "due_refund", n=n)
+
+    async def refuse(block):
+        raise XeError(503, "service unavailable")
+    chain.on_submit = refuse
+    assert await fees.settle_due(ctx, db) == 0
+    assert len(chain.submits) == 1, "three rows due and one block signed: the others would stand where it stands"
+    rows = [await _fee(db, n) for n in "123"]
+    assert [bool(r.tx_hashes.get("settle_block")) for r in rows] == [True, False, False]
+    assert all(r.state == "settling" for r in rows), "the rows behind are marked and wait; nothing is built for them"
+    assert fees._stands(rows[0]) and not fees._stands(rows[1])
+    first = chain.submits[0]
+    assert await fees.settle_due(ctx, db) == 0
+    assert [b["hash"] for b in chain.submits] == [first["hash"]] * 2, "the same block again, and still only that one"
+    # a block older than a node would take is not waited on: the row behind builds, as it did before, and
+    # that is also what moves the chain past it. One more block, not one per row.
+    monkeypatch.setattr(fees, "STANDING_NS", 0)
+    assert not fees._stands(await _fee(db, "1"))
+    monkeypatch.undo()
+    old = dict(first, timestamp=first["timestamp"] - fees.STANDING_NS - 1)
+    row = await _fee(db, "1")
+    row.tx_hashes = {**row.tx_hashes, "settle_block": {**row.tx_hashes["settle_block"], "timestamp": old["timestamp"]}}
+    await db.commit()
+    assert await fees.settle_due(ctx, db) == 0
+    built = {b["hash"]: b for b in chain.submits}
+    assert len(built) == 2 and Counter(b["previous"] for b in built.values()) == {first["previous"]: 2}
+    assert [bool((await _fee(db, n)).tx_hashes.get("settle_block")) for n in "123"] == [True, True, False]
+    # the node comes back: the first lands, the second can no longer and is dropped, the third is built on
+    # the new tip; the second follows on the next pass. Every fee is paid once.
+    chain.on_submit = None
+    assert await fees.settle_due(ctx, db) == 2
+    assert await fees.settle_due(ctx, db) == 1
+    assert [(await _fee(db, n)).state for n in "123"] == ["refunded"] * 3
+    sends = chain.of(fee, "send")
+    assert len(sends) == 3 and len({b["previous"] for b in sends}) == 3 and (await chain.balances(fee))["XE"] == 0
 
 
 # ---- XE-2775: a value the database cannot hold is the caller's error, as the real driver reports it ---------

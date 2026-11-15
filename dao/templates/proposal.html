@@ -14,7 +14,7 @@
     {% if tally.weight_agent_raw['for'] or tally.weight_agent_raw.against %}<br>Agent weight scaled by {{ tally.agent_scale }}{% endif %}</p>
   </div>
   <div class="card"><h3>Rules pinned at open</h3>
-    <p class="small" style="margin:0">Weight: {{ p.rules.weight_asset or "XE" }} balance at the snapshot ({{ snapshot_at|ns }}, an hour before open) · quorum {{ p.rules.quorum_wallets }} wallets with ≥ {{ p.rules.participating_wallet.min_balance_micro_xe|xe }} {{ p.rules.weight_asset or "XE" }} · pass mark {{ (p.rules.pass_mark_fraction * 100)|int }}% of for+against · fee {{ p.rules.fee_micro_xe|xe }} XE ({{ p.rules.fee_on_quorum }} on quorum, {{ p.rules.fee_below_quorum }} below)</p>
+    <p class="small" style="margin:0">Weight: {{ p.rules.weight_asset or "XE" }} balance at the snapshot ({{ snapshot_at|ns }}, an hour before open) · quorum {{ p.rules.quorum_wallets }} wallets with ≥ {{ p.rules.participating_wallet.min_balance_micro_xe|xe }} {{ p.rules.weight_asset or "XE" }} · pass mark {{ "%g"|format(p.rules.pass_mark_fraction * 100) }}% of for+against · fee {{ p.rules.fee_micro_xe|xe }} XE ({{ p.rules.fee_on_quorum }} on quorum, {{ p.rules.fee_below_quorum }} below)</p>
   </div>
   {% if p.result %}<div class="card"><h3>{{ copy.labels.result_published }}</h3><p style="margin:0"><span class="pill {{ p.result.outcome }}">{{ p.result.outcome.replace('_',' ') }}</span> · {{ copy.labels.not_self_executing }}</p></div>{% endif %}
   {% if p.decision %}<div class="card"><h3>{{ copy.labels.decision_taken }}</h3><p style="margin:0"><b>{{ p.decision.decision }}</b> — {{ p.decision.reasons }}</p></div>
