@@ -37,6 +37,7 @@ Edit `.env`:
 
 - `POSTGRES_PASSWORD`: long random, no `%` characters.
 - `XE_NODE_URL`: `https://ldn.core.test.network` on testnet.
+- `XE_NETWORK_ID`: the network that node is on, exactly as it reports it (`curl -s $XE_NODE_URL/node | jq -r .network_id`; `testnet-0005` at the time of writing). Required: the harness signs nothing and verifies no signed request unless the node reports this id, and it changes when testnet is reset.
 - `PUBLIC_BASE_URL`: `https://dao.test.network`.
 - `DAO_SIGNER_PASSPHRASE`: long random; it encrypts the company keyfile.
 - `GIT_COMMIT=$(git rev-parse --short HEAD)` (or let the deploy script below set it).
@@ -58,7 +59,7 @@ docker compose run --rm --no-deps -v $PWD/tests:/app/tests app \
   sh -c "pip install -q pytest pytest-asyncio && pytest -q tests/test_xe_wire.py tests/test_dao_core.py tests/test_templates.py"
 ```
 
-All of these must pass before the next step. If `test_block_hash_matches_testnet` or `test_statechain_genesis_and_oracle_hash` fail, stop: the protocol encoding has drifted and nothing the harness signs would be accepted.
+All of these must pass before the next step. If `test_block_hash_matches_testnet`, `test_statechain_oracle_block_hash` or `test_statechain_genesis_hash_is_over_document_bytes` fail, stop: the protocol encoding has drifted and nothing the harness signs would be accepted.
 
 Database-backed tests: the log chain, and the inbox / vote / fee hardening (uses a scratch database it wipes):
 

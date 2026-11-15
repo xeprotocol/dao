@@ -4,7 +4,7 @@ Grounded in what the code calls (`xe/client.py`, `dao/chainops.py`, `dao/service
 the brief hopes for. Short version: mainnet needs to be testnet-0005's API and wire format, with the DAO keyset in
 genesis and a node URL we trust. Everything else is config.
 
-Written 27 October 2026 against `dao` commit `c60cf81`.
+Written 27 October 2026 against `dao` commit `c60cf81`; the endpoint tables were checked again against `xe/client.py` on 15 November 2026 (after `2efbfee`), and `tests/test_dao_core.py` holds them to it.
 
 ## 1. A node API endpoint the harness can reach
 
@@ -16,14 +16,14 @@ cross-check against a second. For mainnet this should be a node we run or Adam r
 
 | Endpoint | Used for |
 |---|---|
-| `GET /`, `GET /node` | `network_id`, `pow_difficulty`, `chat_pow_difficulty`, node peer id. The mainnet badge shows only when `network_id` is `mainnet` or `mainnet-<n>`; anything else shows testnet. |
-| `GET /health`, `GET /network/readiness` | worker health, `/v1/ready` |
+| `GET /node` | `network_id` (compared with `XE_NETWORK_ID`; nothing is signed unless they match), `pow_difficulty`, `chat_pow_difficulty`, node peer id. The mainnet badge shows only when `network_id` is `mainnet` or `mainnet-<n>`; anything else shows testnet. |
+| `GET /ready` | worker health check, `/v1/ready` |
 | `GET /accounts/{a}/balance`, `GET /accounts/{a}/chain` | voting weight at snapshot, treasury read, fee account frontier, agent account checks |
 | `GET /accounts/{a}/keyset` | treasury multisig read |
 | `GET /pending/{a}` | pending sends into the fee account (receive step) |
 | `GET /blocks/{hash}` | fee verification. Must carry `finalized`; see [xeprotocol/xe#55](https://github.com/xeprotocol/xe/issues/55). |
-| `GET /statechain/tip`, `GET /statechain/blocks`, `GET /statechain/blocks/{i}` | signing sessions build at the live tip; anchor verification |
-| `GET /statechain/kv`, `GET /statechain/kv/{key}` | reading `dao.registry`, `dao.anchor.<n>`, `sys.*` |
+| `GET /statechain/tip`, `GET /statechain/blocks/{i}` | signing sessions build at the live tip; anchor verification |
+| `GET /statechain/kv/{key}` | reading `dao.registry`, `dao.anchor.<n>`, `sys.*` |
 | `GET /statechain/keyset` | the DAO keyset and threshold shown on `/records` and `/members`, and used to decide when a signing session has enough signatures |
 | `GET /directory/{account}` | whether the DAO account is registered |
 | `GET /chat/auth/challenge`, `GET /chat/messages`, `GET /chat/events` | inbox |
@@ -42,7 +42,7 @@ These are what the byte-exact fixtures in `tests/test_xe_wire.py` pin to testnet
 them, the harness produces invalid hashes or signatures:
 
 - Account address = `sha256("xe/account/v1" || pubkey)`; ed25519 throughout.
-- Block canonical encoding, hash, and PoW scheme (SHA-256 + BLAKE2b, leading-zero difficulty).
+- Block canonical encoding, hash, and PoW scheme. The block hash is SHA-256 (`sha256(network_id || canonical || aux)`). The proof of work is BLAKE2b over that hash, and a threshold, not leading zeros: `blake2b(nonce_le8 || hash)` with an eight-byte digest, read big-endian, must be at least the difficulty.
 - State-chain block hashing: values hashed as the exact bytes received, not canonicalised (BRIEF §16.19).
   `normalise_ops` depends on this.
 - Chat envelope format and PoW; directory registration format.
