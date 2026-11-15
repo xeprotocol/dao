@@ -4324,6 +4324,59 @@ async def test_a_fees_receive_is_sought_from_the_end_of_the_chain_a_bounded_numb
     assert e.value.status == 0 and "malformed" in str(e.value)
     # nothing in a fee pass reads the fee account's chain whole
     assert not hasattr(chainops, "chain_index") and "full_chain" not in inspect.getsource(fees)
+
+
+# ---- XE-14692: what draws nothing is refused, whatever its category ---------------------------------------
+
+def test_what_draws_nothing_is_refused_whatever_its_category():
+    """XE-1099 refused category Cf. The combining grapheme joiner, the Hangul fillers, the Mongolian and the
+    other variation selectors and the braille blank draw nothing either and are filed elsewhere. One table
+    (`_INVISIBLE`, Unicode's Default_Ignorable_Code_Point outside Cf) and every user of `_bad` reads it."""
+    import unicodedata
+
+    from dao import text
+    from dao.text import clean_text, field_text, scrub
+    named = ["\u034f", "\u115f", "\u1160", "\u3164", "\uffa0", "\u17b4", "\u180b", "\u180f", "\u2800", "\ufe00", "\ufe0d",
+             "\U000e0100", "\U000e01ef", "\U00016fe4", "\U0001d159"]
+    assert all(ord(c) in text._INVISIBLE for c in named)
+    refused = [chr(o) for o in sorted(text._INVISIBLE) if chr(o) not in text._ALLOWED_FORMAT]
+    refused += [chr(o) for o in range(0xAD, 0x110000) if unicodedata.category(chr(o)) == "Cf" and chr(o) not in text._ALLOWED_FORMAT]
+    assert len(refused) > 4000
+    for c in refused:
+        assert text.has_bad_control(f"a{c}b"), hex(ord(c))
+    for c in named:
+        with pytest.raises(HTTPException):
+            clean_text(f"a{c}b", "title", max_len=100)
+        with pytest.raises(HTTPException):
+            field_text({"proposal": f"a{c}b"}, "proposal")
+        assert scrub(f"a{c}b") == "a\ufffdb"
+    # two titles that draw the same are the same title, or one of them is refused
+    with pytest.raises(HTTPException):
+        clean_text("Raise the fee\u3164", "title", max_len=100)
+    # what carries meaning passes: the joiners and the selectors where they have something to act on; spaces
+    # that are spaces; and ordinary text in the scripts the table touches, written the way they are written
+    # (Persian after a Latin word and before a full stop, a Malayalam word ending in a joiner, a Mongolian
+    # letter and a Japanese name with their variant chosen, braille with its own space)
+    for ok in ("\u0646\u200c\u0627", "\U0001f468\u200d\U0001f469", "\u2764\ufe0f", "\u2194\ufe0e", "a\u00a0b", "a\u3000b",
+               "e\u0301", "\ud55c\uad6d\uc5b4", "\u1820\u1821\u1822", "\u1781\u17d2\u1798\u17c2\u179a",
+               "\u2764\ufe0f\u200d\U0001f525", "1\ufe0f\u20e3 and #\ufe0f\u20e3", "\u2139\ufe0f", "\u0915\u094d\u200d\u0937",
+               "\U0001f3f3\ufe0f\u200d\U0001f308 done \u2714\ufe0f",
+               "API\u200c\u0647\u0627", "\u0647\u200d.\u0642", "\u0d05\u0d35\u0d28\u0d4d\u200d", "\u0d05\u0d35\u0d28\u0d4d\u200d ok",
+               "\u1820\u180b", "\u1820\u180f\u1821", "\u845b\U000e0100\u57ce", "\u2813\u2800\u283a", "\u2813\u2800\u2800\u283a"):
+        assert clean_text(ok, "title", max_len=100) == ok and scrub(ok) == ok and not text.has_bad_control(ok), ok
+    # and the same ones where they act on nothing draw nothing, and are refused like the rest: at the end of
+    # a Latin title, beside a space or one another, between Latin letters, after a letter with no such form
+    for bad, at in (("Raise the fee\u200d", 13), ("\u200d", 0), ("\u200craise", 0), ("Rai\u200dse", 3), ("fee \u200d now", 4),
+                    ("\U0001f468\u200d\u200d\U0001f469", 2), ("\u2764\ufe0f\u200d", 2), ("Raise the fee\ufe0f", 13),
+                    ("caf\u00e9\ufe0f", 4), ("\u2764\ufe0f\ufe0f", 2), ("1\ufe0f", 1), ("\ufe0f", 0), ("a \ufe0e", 2),
+                    ("Raise the fee\u180b", 13), ("\u1820\u180b\u180b", 2), ("fee\U000e0100", 3),
+                    ("\u845b\U000e0100\U000e0100", 2), ("fee\u2800now", 3), ("\u2813\u2800\u2800\u2800\u283a", 2)):
+        with pytest.raises(HTTPException):
+            clean_text(bad, "title", max_len=100)
+        with pytest.raises(HTTPException):
+            field_text({"proposal": bad}, "proposal")
+        assert text.has_bad_control(bad) and scrub(bad)[at] == "\ufffd" and len(scrub(bad)) == len(bad), bad
+        assert [i for i in range(len(bad)) if text._refused(bad, i)] == [at], bad
 # ---- XE-3894: nothing offers a sender what the log cannot do ----------------------------------------------
 
 def test_nothing_offers_a_sender_a_redaction_the_log_cannot_make():
