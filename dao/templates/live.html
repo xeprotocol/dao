@@ -15,14 +15,20 @@
   var when = function (ns) { var d = new Date(Number(BigInt(ns) / 1000000n)); return d.toISOString().slice(0, 16).replace('T', ' ') + ' UTC'; };
   var cell = function (html, cls) { var td = document.createElement('td'); if (cls) td.className = cls; td.innerHTML = html; return td; };
   var esc = function (s) { return String(s).replace(/[&<>"']/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); };
-  var src = new EventSource('/v1/events');
+  // The stream is opened from the newest entry the page was rendered with, not from the head as it is when
+  // the stream connects: an entry written between the two was in neither and never appeared (XE-9465).
+  // What the two halves both hold is shown once. On a reconnect the browser's Last-Event-ID takes over.
+  // With no public entry to show yet, that point is the head the page was rendered at.
+  var newest = {{ events[0].index if events else head_index|default(-1) }};
+  var src = new EventSource('/v1/events' + (newest >= 0 ? '?after=' + newest : ''));
   var beat = function (text) { status.textContent = text + ' · ' + new Date().toISOString().slice(11, 19) + ' UTC'; };
   src.onopen = function () { beat('connected'); };
   src.onerror = function () { beat('reconnecting'); };
   src.addEventListener('ping', function () { beat('connected, no new entries'); });
   src.addEventListener('entry', function (ev) {
     var e; try { e = JSON.parse(ev.data); } catch (err) { return; }
-    if (e.index === undefined) return;
+    if (e.index === undefined || e.index <= newest) return;
+    newest = e.index;
     var empty = document.getElementById('empty'); if (empty) empty.remove();
     var tr = document.createElement('tr');
     tr.appendChild(cell('<a href="/log/' + e.index + '">' + e.index + '</a>', 'num'));

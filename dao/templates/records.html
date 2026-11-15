@@ -13,7 +13,7 @@
   <tr><th>Network</th><td>{{ network_id }} ({{ badge }})</td></tr>
   <tr><th>Governance surface</th><td><code>{{ base_url }}/v1/legal/identifier</code></td></tr>
   <tr><th>State-chain update authority</th><td><code>sys.dao_keyset</code> — <a href="{{ node_url }}/statechain/keyset">{{ node_url }}/statechain/keyset</a></td></tr>
-  <tr><th>{{ legal.registry_label }}</th><td><code>dao.registry</code> — <a href="{{ node_url }}/statechain/kv/dao.registry">{{ node_url }}/statechain/kv/dao.registry</a> · {% if registry_onchain %}present{% else %}<b>not yet written</b>{% endif %}</td></tr>
+  <tr><th>{{ legal.registry_label }}</th><td><code>dao.registry</code> — <a href="{{ node_url }}/statechain/kv/dao.registry">{{ node_url }}/statechain/kv/dao.registry</a> · {% if registry_onchain.error is defined %}<b>could not be read from the node just now</b>{% elif registry_onchain.value is not none %}present{% else %}<b>not yet written</b>{% endif %}</td></tr>
   <tr><th>Software</th><td>v{{ version }} · commit <code>{{ git_commit }}</code> · <a href="{{ cfg.registry.repository }}">{{ cfg.registry.repository }}</a> · {{ cfg.registry.licence }}</td></tr>
   <tr><th>Charter</th><td>sha256 <code>{{ cfg.charter_hash }}</code> · <a href="/charter">text</a> · <a href="/v1/charter">JSON</a></td></tr>
   <tr><th>Configuration hashes</th><td class="small">{% for k, v in cfg.hashes.items() %}{{ k }} <code>{{ v|short(16) }}</code><br>{% endfor %}</td></tr>
@@ -46,7 +46,7 @@
 
 <h2>{{ legal.treasury_label }}</h2>
 <table><tr><th>Account</th><th>Address</th><th>Balances</th><th>Keyset</th></tr>
-{% for name, t in treasury.items() %}<tr><td>{{ name }}</td><td><code>{{ t.address or "not configured" }}</code></td><td class="small">{% for a, v in t.balances.items() %}{{ v|xe }} {{ a }}<br>{% endfor %}</td><td class="small">{% if t.keyset %}{{ t.keyset.threshold }} of {{ t.keyset['keys']|length }}{% endif %}</td></tr>{% endfor %}</table>
+{% for name, t in treasury.items() %}<tr><td>{{ name }}</td><td><code>{{ t.address or "not configured" }}</code></td><td class="small">{% if t.error %}<span class="mute">could not be read from the node: {{ t.error }}</span>{% endif %}{% for a, v in t.balances.items() %}{{ v|xe }} {{ a }}<br>{% endfor %}</td><td class="small">{% if t.keyset %}{{ t.keyset.threshold }} of {{ t.keyset['keys']|length }}{% endif %}</td></tr>{% endfor %}</table>
 <p class="small mute">The harness holds no treasury key. Movements are member actions, recorded here after the fact.</p>
 
 <h2>Anchors</h2>
@@ -56,7 +56,7 @@
 
 <h2>{{ legal.registry_label }} (dao.registry)</h2>
 <details><summary>Intended value</summary><pre>{{ registry_intended|tojson(indent=1) }}</pre></details>
-<details><summary>On chain</summary><pre>{{ registry_onchain|tojson(indent=1) if registry_onchain else "not written" }}</pre></details>
+<details><summary>On chain</summary><pre>{% if registry_onchain.error is defined %}could not be read from the node: {{ registry_onchain.error }}{% elif registry_onchain.value is not none %}{{ registry_onchain.value|tojson(indent=1) }}{% else %}not written{% endif %}</pre></details>
 
 <p class="small mute" style="margin-top:32px">Seat holders: <a href="/members">members console</a> (signed actions only).</p>
 {% endblock %}

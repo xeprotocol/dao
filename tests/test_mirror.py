@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from dao.config import lint_public_copy, load_config
-from dao.mirror import build_llms_txt, html_to_markdown, md_path, md_target, wants_markdown
+from dao.mirror import MarkdownMirror, build_llms_txt, html_to_markdown, md_path, md_target, site_path, wants_markdown
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -89,3 +89,59 @@ def test_llms_txt_is_public_register_and_points_at_markdown():
         assert f"https://dao.test.network/seats/{a.slug}.md" in text, a.id
     assert "https://dao.test.network/v1/events" in text
     assert "https://dao.test.network//" not in text
+
+
+# ---- XE-7815 / XE-7861: the request path is the requester's text wherever it is written back ------------
+
+HOSTILE = ["//evil.example/x", "///evil.example/x", "/\\evil.example/x", "/a\n# Heading\n[x](https://evil.example)",
+           "/a>[x](https://evil.example)<b", "/a b", '/a"onmouseover="x', "/proposals/abc123/"]
+
+
+def test_a_link_to_this_site_is_a_path_on_this_site():
+    for path in HOSTILE:
+        for href in (site_path(path), md_path(path)):
+            assert href.startswith("/") and not href.startswith("//"), (path, href)
+            assert not set(href) & set('\\<>"\n\r\t '), (path, href)
+    assert md_path("//evil.example/x") == "/evil.example/x.md"
+    assert site_path("/seats/legal-and-compliance") == "/seats/legal-and-compliance"   # an ordinary path is untouched
+
+
+async def _twin(path, base_url, accept=b"text/markdown"):
+    """The markdown the mirror serves for a request, over a page that links to its own twin as base.html does."""
+    async def app(scope, receive, send):
+        html = (f'<html><head><title>t</title></head><body><main><p>hi</p>'
+                f'<a href="{md_path(scope["path"])}">this page as markdown</a></main></body></html>')
+        await send({"type": "http.response.start", "status": 404, "headers": [(b"content-type", b"text/html; charset=utf-8")]})
+        await send({"type": "http.response.body", "body": html.encode()})
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        return {"type": "http.request", "body": b""}
+
+    scope = {"type": "http", "method": "GET", "scheme": "https", "path": path,
+             "headers": [(b"accept", accept), (b"host", b"evil.example")]}
+    await MarkdownMirror(app, base_url)(scope, receive, send)
+    return sent[1]["body"].decode()
+
+
+async def test_the_twin_names_this_site_and_its_head_is_one_line_with_one_link():
+    for path in HOSTILE:
+        for via in (path, path + ".md"):
+            md = await _twin(via, "https://dao.test.network", b"text/markdown" if via == path else b"*/*")
+            comment, head, blank = md.split("\n")[:3]
+            assert comment == "<!-- t -->" and blank == "", (via, md)
+            assert head.startswith("*Markdown view of <https://dao.test.network/") and head.endswith("for reading.*"), (via, head)
+            assert head.count("<") == 1 and head.count(">") == 1 and "](" not in head and " # " not in head, (via, head)
+            assert not head.startswith("*Markdown view of <https://dao.test.network//"), (via, head)
+            # every link in the twin is on this site
+            import re
+            for url in re.findall(r"\]\(([^)]*)\)", md):
+                assert url.startswith("https://dao.test.network/") and not url.startswith("https://dao.test.network//"), (via, url)
+    # the Host header is the requester's too: with no configured address the twin gives the path, not a host
+    md = await _twin("/seats", "")
+    assert "evil.example" not in md and "*Markdown view of </seats>." in md
+

@@ -62,7 +62,8 @@ def render(request: Request, name: str, ctx: dict, status_code: int = 200) -> HT
     c = get_context()
     base = {
         "request": request, "copy": c.config.copy_public, "legal": c.config.copy_legal, "badge": c.node.badge,
-        "network_id": c.node.network_id, "version": __version__, "base_url": c.settings.public_base_url,
+        "network_id": c.node.network_id, "dao_account": c.config.accounts.get("dao", ""),
+        "version": __version__, "base_url": c.settings.public_base_url,
         "node_url": c.settings.xe_node_url, "mode": c.config.mode,
     }
     return templates.TemplateResponse(request, name, {**base, **ctx}, status_code=status_code)
@@ -119,7 +120,7 @@ async def proposal_page(request: Request, h: str):
         pr = await portal.get(db, h)
         votes = await portal.votes_for(db, pr.hash)
         events = await EventLog.page(db, 0, 50, ref=f"proposal:{pr.hash}")
-    return render(request, "proposal.html", {**common, "p": pr, "votes": votes, "tally": portal.tally(pr, votes, get_context()), "events": events,
+    return render(request, "proposal.html", {**common, "p": pr, "votes": votes, "tally": portal.shown_tally(pr, votes, get_context()), "events": events,
                                              "snapshot_at": snapshot_time(pr.opened_at)})
 
 
@@ -182,7 +183,8 @@ async def decisions_page(request: Request):
         common = await _common(db)
         decided = await portal.list_proposals(db, "decided", 0, 100)
         closed = await portal.awaiting_decision(db, 100)
-    return render(request, "decisions.html", {**common, "decided": decided, "closed": closed})
+        closed_total = await portal.count_awaiting_decision(db)
+    return render(request, "decisions.html", {**common, "decided": decided, "closed": closed, "closed_total": closed_total})
 
 
 @router.get("/decisions/example", response_class=HTMLResponse)
@@ -208,8 +210,9 @@ async def log_page(request: Request, offset: int = Query(0, ge=0), kind: str | N
 async def live_page(request: Request):
     async with session() as db:
         common = await _common(db)
+        head = await EventLog.head(db)   # read before the page, so the stream starts no later than the page ends
         rows = await EventLog.page(db, 0, 25)
-    return render(request, "live.html", {**common, "events": rows})
+    return render(request, "live.html", {**common, "events": rows, "head_index": head.index})
 
 
 @router.get("/log/{index}", response_class=HTMLResponse)
@@ -257,13 +260,20 @@ async def members_page(request: Request):
     c = get_context()
     async with session() as db:
         common = await _common(db)
-        res = await resolutions.list_resolutions(db)
-        sess = await sessions.list_sessions(db)
+        # what is waiting on a member first and whole (open resolutions, oldest first), then the recent rest
+        res = [*await resolutions.open_resolutions(db),
+               *[r for r in await resolutions.list_resolutions(db) if r.status != "open"]]
+        # the same for sessions: every one a member can still act on, then the recent rest. A page of the
+        # newest hundred hid an open session behind the weekly anchors that had come and gone since.
+        sess = [*await sessions.open_sessions(db),
+                *[s for s in await sessions.list_sessions(db) if s.status not in sessions.OPEN]]
         msgs = await inbox_svc.list_public(db, 100)
         closed = await portal.awaiting_decision(db, 50)
+        closed_total = await portal.count_awaiting_decision(db)
     ks = await records.public_keyset(c)
     return render(request, "members.html", {
         **common, "cfg": c.config, "resolutions": res, "sessions": sess, "messages": msgs,
-        "closed": closed, "keyset": ks, "reserved": sorted(resolutions.RESERVED_MATTERS), "ordinary": sorted(resolutions.ORDINARY_MATTERS),
+        "closed": closed, "closed_total": closed_total, "keyset": ks, "reserved": sorted(resolutions.RESERVED_MATTERS),
+        "ordinary": sorted(resolutions.ORDINARY_MATTERS),
         "res_dict": lambda r: resolutions.to_dict(r, c.config), "sess_dict": sessions.to_dict,
     })

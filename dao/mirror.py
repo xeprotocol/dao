@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter
@@ -31,9 +32,20 @@ def md_target(path: str) -> str | None:
     return "/" if page in ("", "/index") else page
 
 
+def site_path(path: str) -> str:
+    """A request path as a link to this site: percent-encoded, and beginning with exactly one `/`.
+
+    The path a request arrives on is the requester's text, decoded. Written back into a page as it came,
+    `//host/x` is a link to another site (and so is `/\\host/x`, which browsers read the same way), and a
+    `>` or a newline ends whatever it was written inside. Everything that puts the request path into a page
+    or a twin takes it from here (XE-7815, XE-7861)."""
+    return "/" + quote(path, safe="/").lstrip("/")
+
+
 def md_path(page: str) -> str:
-    """The `.md` twin of a page path."""
-    return "/index.md" if page in ("", "/") else page.rstrip("/") + ".md"
+    """The `.md` twin of a page path: always a path on this site."""
+    p = site_path(page)
+    return "/index.md" if p == "/" else p.rstrip("/") + ".md"
 
 
 def wants_markdown(accept: str) -> bool:
@@ -100,7 +112,9 @@ def html_to_markdown(html: str, canonical: str) -> str:
     body = _converter.convert_soup(main)
     body = re.sub(r"[ \t]+\n", "\n", body)
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
-    head = f"*Markdown view of <{canonical}>. The page is the record; this is the same page for reading.*"
+    # the address is partly the requester's text; inside the autolink it is one URL and nothing else
+    link = re.sub(r"[^!#-;=?-~]", lambda m: quote(m.group()), canonical)
+    head = f"*Markdown view of <{link}>. The page is the record; this is the same page for reading.*"
     if title:
         # the title is page-controlled text; it must not be able to close the comment it sits in
         head = f"<!-- {title.replace('--', '- -').replace('>', '›')} -->\n{head}"
@@ -156,18 +170,14 @@ class MarkdownMirror:
             await send({"type": "http.response.body", "body": bytes(body)})
             return
 
-        base = self.base_url or _origin_from_scope(scope)
-        out = html_to_markdown(body.decode("utf-8", "replace"), base + target).encode("utf-8")
+        # The address is the configured one. The Host header is the requester's and is not consulted: without
+        # a configured base the twin says the path and leaves the page's links relative.
+        out = html_to_markdown(body.decode("utf-8", "replace"), self.base_url + site_path(target)).encode("utf-8")
         keep = [(k, v) for k, v in headers if k not in (b"content-type", b"content-length", b"vary")]
         keep += [(b"content-type", b"text/markdown; charset=utf-8"), (b"content-length", str(len(out)).encode()),
                  (b"vary", b"Accept")]
         await send({"type": "http.response.start", "status": status, "headers": keep})
         await send({"type": "http.response.body", "body": out if scope["method"] == "GET" else b""})
-
-
-def _origin_from_scope(scope) -> str:
-    host = next((v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"host"), "localhost")
-    return f"{scope.get('scheme', 'http')}://{host}"
 
 
 # ---- llms.txt ---------------------------------------------------------------------------------------
