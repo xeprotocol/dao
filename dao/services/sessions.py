@@ -24,7 +24,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.client import XeError
-from xe.keys import KeyError_, is_valid_public_key, verify_hex_signature
+from xe.keys import KeyError_, exact_hex, is_valid_public_key, verify_hex_signature
 from xe.statechain import StateBlock, StateChainError, StateOp, build_block, check_ops_fit, validate_keyset
 
 from ..auth import Verified
@@ -105,7 +105,7 @@ def _check_keyset(value, seat_keys: set[str] | None = None) -> None:
     except StateChainError as e:
         raise HTTPException(400, f"keyset: {e}") from e
     for k in keys:
-        if not is_valid_public_key(bytes.fromhex(k)):
+        if not is_valid_public_key(exact_hex(k, 32, "keyset key")):
             raise HTTPException(400, f"{k[:12]}… is not a usable ed25519 public key")
     if seat_keys is not None:
         held = sum(1 for k in keys if k in seat_keys)
@@ -133,7 +133,7 @@ def normalise_ops(ops) -> list[dict]:
         try:
             op = StateOp.from_json(o)
             op.validate()
-        except (StateChainError, TypeError, ValueError) as e:
+        except StateChainError as e:
             raise HTTPException(400, f"ops are malformed: {e}") from e
         d = {"action": op.action, "key": op.key}
         if op.action == "set":
@@ -366,7 +366,7 @@ async def sign(ctx: Context, db: AsyncSession, s: SigningSession, pub_key: str, 
     if pub_key not in ks["keys"]:
         raise HTTPException(403, "this key is not in the live sys.dao_keyset")
     try:
-        verify_hex_signature(pub_key, signature, bytes.fromhex(s.block_hash))
+        verify_hex_signature(pub_key, signature, exact_hex(s.block_hash, 32, "block hash"))
     except KeyError_ as e:
         raise HTTPException(401, f"signature does not verify over block hash: {e}") from e
     if any(x["public_key"] == pub_key for x in s.block_signatures):

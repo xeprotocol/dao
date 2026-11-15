@@ -24,12 +24,26 @@ class KeyError_(ValueError):
     pass
 
 
-def _hex(value: str, n: int, what: str) -> bytes:
-    """Exactly 2n hex digits. `bytes.fromhex` alone also accepts whitespace, which the node's
-    `hex.DecodeString` does not, and which would make two spellings of one signature (XE-0699)."""
-    if not isinstance(value, str) or len(value) != 2 * n or not _HEX_RE.fullmatch(value):
-        raise KeyError_(f"invalid {what}: want {2 * n} hex digits")
+def is_hex(value: object, n: int | None = None) -> bool:
+    """Hex digits and nothing else: exactly 2n of them when `n` is given, any whole number of bytes when it
+    is not."""
+    return (isinstance(value, str) and len(value) % 2 == 0 and bool(_HEX_RE.fullmatch(value))
+            and (n is None or len(value) == 2 * n))
+
+
+def exact_hex(value: object, n: int | None, what: str, err: type[Exception] = KeyError_) -> bytes:
+    """The bytes of a hex string, and the one place this package and the harness decode one: nothing else
+    calls `bytes.fromhex`. That function also accepts whitespace, which the node's `hex.DecodeString` does
+    not, so a spaced spelling would pass here and be refused there, and one signature or hash would have
+    two spellings (XE-0699, XE-3845, XE-3534). `err` is the calling module's own error."""
+    if not is_hex(value, n):
+        want = f"{2 * n} hex digits" if n is not None else "hex digits, a whole number of bytes"
+        raise err(f"invalid {what}: want {want}")
     return bytes.fromhex(value)
+
+
+def _hex(value: str, n: int, what: str) -> bytes:
+    return exact_hex(value, n, what)
 
 
 def _hex32(value: str, what: str) -> bytes:

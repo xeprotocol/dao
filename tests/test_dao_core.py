@@ -1108,7 +1108,9 @@ async def test_node_fields_the_harness_computes_with_are_integers_or_the_respons
     body["v"] = {"keys": [k1.upper(), k2], "threshold": 2}
     assert await c.dao_keyset() == {"keys": [k1, k2], "threshold": 2}
     for bad in ({"keys": [k1, 5], "threshold": 1}, {"keys": k1, "threshold": 1}, {"keys": [k1]}, {"keys": [k1], "threshold": "x"},
-                {"keys": ["ab", "cd"], "threshold": 2}, {"keys": [k1, "zz" * 32], "threshold": 1}):
+                {"keys": ["ab", "cd"], "threshold": 2}, {"keys": [k1, "zz" * 32], "threshold": 1},
+                # one key spelt twice is one key: a threshold of two over it could never be met (XE-3845)
+                {"keys": [k1, k1.upper()], "threshold": 2}, {"keys": [k1, k2, k1], "threshold": 2}):
         body["v"] = bad
         await refused(c.dao_keyset)
     await c.aclose()
@@ -1661,6 +1663,7 @@ async def test_a_block_signature_from_a_key_no_longer_in_the_keyset_is_counted_n
         submitted.append(len(s_.block_signatures))
     ctx = SimpleNamespace(chain=SimpleNamespace(dao_keyset=keyset, statechain_tip=tip), events=SimpleNamespace(append=nothing))
     monkeypatch.setattr(sessions, "require_unpaused", nothing)
+    monkeypatch.setattr(sessions, "require_executable", lambda ctx_, s_: None)   # what the session writes is XE-4131's rule
     monkeypatch.setattr(sessions, "submit", submit)
     # two signatures on the block, one of them from a key rotated out: two of two is not met, at any site
     await sessions.sign(ctx, None, s, k1.pub_key_hex, sig(k1), "member:a")
@@ -2592,3 +2595,47 @@ def test_small_rules_of_the_sweep_hold_where_they_are_stated():
     assert "path.exists()" not in inspect.getsource(signer_mod._read_keyfile) + inspect.getsource(signer_mod.Signer.init_keyfile)
     src = inspect.getsource(signer_mod._write_keyfile)
     assert src.index("try:") < src.index("path.parent.mkdir(")
+# ---- XE-11273: nothing a client puts in a header raises out of a middleware --------------------------------
+
+async def test_a_declared_length_is_a_bounded_number_or_the_request_is_refused():
+    from dao.main import MAX_BODY_BYTES, BodyLimit
+
+    async def answer(value):
+        sent, reached = [], []
+
+        async def send(message):
+            sent.append(message)
+
+        async def receive():
+            return {"type": "http.request", "body": b"{}", "more_body": False}
+
+        async def app(scope, receive, send):
+            reached.append(scope)
+        await BodyLimit(app)({"type": "http", "method": "POST", "headers": [(b"content-length", value)]}, receive, send)
+        return (sent[0]["status"] if sent else None), bool(reached)
+    for not_a_length in (b"9" * 5000, b"1" * 19, b"", b"-1", b"+1", b"1 ", b" 1", b"0x10", b"1e3", b"1.0", "١٢".encode()):
+        assert await answer(not_a_length) == (400, False), not_a_length[:24]
+    for over in (str(MAX_BODY_BYTES + 1).encode(), b"9" * 18):
+        assert await answer(over) == (413, False), over
+    for fits in (b"0", b"2", str(MAX_BODY_BYTES).encode(), b"000002"):
+        assert await answer(fits) == (None, True), fits
+
+
+# ---- sweep of XE-3845: the command line takes a difficulty as the inbox publishes it, and nothing looser ---
+
+def test_the_cli_takes_a_difficulty_as_published_and_refuses_what_is_not_one():
+    from typer.testing import CliRunner
+
+    from dao import cli
+    runner, env = CliRunner(), {"XE_SEED": KeyPair.generate().seed.hex()}
+    base = ["sign-request", "xe-dao/inbox/v1", "{}", "--dao", "xe_dao", "--network", "testnet-x", "--pow"]
+    for spelling in ("0x0000000000000001", "0X01", "1", "0000000000000001"):
+        r = runner.invoke(cli.app, [*base, spelling], env=env)
+        assert r.exit_code == 0 and "pow_nonce" in json.loads(r.output), (spelling, r.output)
+    # a prefix alone, a sign, a space, a separator, a digit that is not ASCII, and a number past 64 bits,
+    # which no nonce meets and the search for which would not end
+    for bad in ("0x", "zz", "+1", " 1", "1_0", "0x0x1", "١", "1" + "0" * 16, "0x1" + "0" * 16):
+        r = runner.invoke(cli.app, [*base, bad], env=env)
+        assert r.exit_code != 0 and "pow_nonce" not in r.output, bad
+
+

@@ -32,6 +32,7 @@ from urllib.parse import quote
 import httpx
 
 from .encoding import Block
+from .keys import is_hex
 from .statechain import StateBlock
 
 PAGE = 1000
@@ -140,6 +141,8 @@ def _keyset(v: Any, what: str, *, need: bool) -> dict:
         # A keyset is stored with every health check and shown on the public pages. What is kept is keys:
         # 64 hex characters each, and a bounded number of them (XE-10109, XE-10320).
         raise malformed(f"{what}.keys holds a key that is not 64 hex characters")
+    if len({k.lower() for k in keys}) != len(keys):
+        raise malformed(f"{what}.keys names a key twice")   # so the bound below counts keys that exist
     if not 1 <= ks.get("threshold", 0) <= len(keys):
         raise malformed(f"{what}.threshold is not between 1 and the number of keys")
     return {**_plain(ks), "keys": [k.lower() for k in keys]}
@@ -508,10 +511,8 @@ class XeClient:
         ch = _typed(await self._get("/chat/auth/challenge"), "chat challenge", strs=("challenge",), need=("challenge",))
         if len(ch["challenge"]) > MAX_CHALLENGE_CHARS:
             raise malformed("chat challenge is longer than any the node issues")
-        try:
-            bytes.fromhex(ch["challenge"])
-        except ValueError as e:
-            raise malformed("chat challenge is not hex") from e
+        if not is_hex(ch["challenge"]):
+            raise malformed("chat challenge is not hex")
         return ch
 
     async def chat_messages(self, proof: dict[str, str], since_ns: int = 0) -> list[dict]:

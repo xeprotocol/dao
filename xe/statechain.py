@@ -26,7 +26,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Any
 
-from .keys import KeyPair, verify_hex_signature
+from .keys import KeyPair, exact_hex, is_hex, verify_hex_signature
 
 ACTION_SET = "set"
 ACTION_DELETE = "delete"
@@ -202,13 +202,7 @@ class StateBlock:
 def marshal_state_canonical(b: StateBlock) -> bytes:
     buf = bytearray()
     buf += struct.pack(">Q", b.index)
-    try:
-        prev = bytes.fromhex(b.prev_hash)
-    except ValueError as e:
-        raise StateChainError("invalid prev_hash hex") from e
-    if len(prev) != 32:
-        raise StateChainError("prev_hash must be 32 bytes")
-    buf += prev
+    buf += exact_hex(b.prev_hash, 32, "prev_hash", StateChainError)
     buf += struct.pack(">I", len(b.ops))
     for op in b.ops:
         if op.action not in ACTION_BYTES:
@@ -230,24 +224,25 @@ def hash_state_block(b: StateBlock) -> str:
 
 
 def sign_state_block_hash(block_hash: str, kp: KeyPair) -> dict:
-    return {"public_key": kp.pub_key_hex, "signature": kp.sign_hex(bytes.fromhex(block_hash))}
+    return {"public_key": kp.pub_key_hex, "signature": kp.sign_hex(exact_hex(block_hash, 32, "block hash", StateChainError))}
 
 
 def verify_state_signature(block_hash: str, sig: dict) -> None:
-    verify_hex_signature(sig["public_key"], sig["signature"], bytes.fromhex(block_hash))
+    verify_hex_signature(sig["public_key"], sig["signature"], exact_hex(block_hash, 32, "block hash", StateChainError))
 
 
 def validate_keyset(value: dict) -> None:
-    keys = value.get("keys") or []
-    thr = int(value.get("threshold", 0))
-    if not keys:
+    keys, thr = value.get("keys"), value.get("threshold", 0)
+    if not isinstance(keys, list) or not keys:
         raise StateChainError("keyset needs at least one key")
-    if len(set(keys)) != len(keys):
-        raise StateChainError("duplicate keys in keyset")
     for k in keys:
-        if len(k) != 64:
+        if not is_hex(k, 32):
             raise StateChainError("keyset key must be 64 hex chars")
-        bytes.fromhex(k)
+    if len({k.lower() for k in keys}) != len(keys):   # one key in two spellings is one key
+        raise StateChainError("duplicate keys in keyset")
+    # The node reads the threshold into an integer field, where 2.0, 2.9 and "2" are not one.
+    if isinstance(thr, bool) or not isinstance(thr, int):
+        raise StateChainError("threshold must be an integer")
     if thr < MIN_DAO_THRESHOLD:
         raise StateChainError(f"threshold must be >= {MIN_DAO_THRESHOLD}")
     if thr > len(keys):

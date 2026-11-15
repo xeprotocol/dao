@@ -17,7 +17,7 @@ import struct
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
-from .keys import KeyPair, derive_address, verify_hex_signature
+from .keys import KeyPair, derive_address, exact_hex, verify_hex_signature
 
 VERSION_BYTE = 0x02
 
@@ -55,13 +55,7 @@ def _u32(v: int) -> bytes:
 
 
 def _hex(value: str, what: str, size: int = 32) -> bytes:
-    try:
-        raw = bytes.fromhex(value)
-    except ValueError as e:
-        raise EncodingError(f"invalid {what} hex") from e
-    if len(raw) != size:
-        raise EncodingError(f"{what} must be {size} bytes, got {len(raw)}")
-    return raw
+    return exact_hex(value, size, what, EncodingError)
 
 
 def _len_prefixed(data: bytes) -> bytes:
@@ -253,7 +247,7 @@ def sign_block(b: Block, kp: KeyPair, network_id: str) -> Block:
     if b.type not in ("multisig_open", "multisig_update") and derive_address(kp.pub_key_hex) != b.account:
         raise EncodingError("signing key does not derive block account")
     b.hash = hash_block(b, network_id)
-    b.signature = kp.sign_hex(bytes.fromhex(b.hash))
+    b.signature = kp.sign_hex(_hex(b.hash, "block hash"))
     return b
 
 
@@ -270,4 +264,4 @@ def verify_open_block_signature(b: Block, network_id: str) -> None:
         raise EncodingError("open block must declare pub_key")
     if derive_address(b.pub_key) != b.account.lower():
         raise EncodingError("pub_key does not derive account address")
-    verify_hex_signature(b.pub_key, b.signature, bytes.fromhex(b.hash))
+    verify_hex_signature(b.pub_key, b.signature, _hex(b.hash, "block hash"))

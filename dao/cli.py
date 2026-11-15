@@ -10,7 +10,7 @@ from pathlib import Path
 
 import typer
 
-from xe.keys import KeyPair, derive_address
+from xe.keys import KeyError_, KeyPair, derive_address, exact_hex, is_hex
 
 # A command that fails prints its error, not its local variables: several of these hold a seed or a
 # passphrase while they run, and typer's default traceback writes every local to the terminal (XE-2213).
@@ -92,8 +92,12 @@ def new_seat_key():
 def sign(digest: str = typer.Option(..., help="32-byte hex digest shown by the web form")):
     """Sign a digest offline with a personal key (for browsers without Ed25519 WebCrypto).
     The seed is read from XE_SEED, or asked for."""
+    try:
+        target = exact_hex(digest, 32, "digest")
+    except KeyError_ as e:
+        raise typer.BadParameter(str(e)) from e
     kp = _seat_key()
-    typer.echo(json.dumps({"pub_key": kp.pub_key_hex, "signature": kp.sign_hex(bytes.fromhex(digest))}))
+    typer.echo(json.dumps({"pub_key": kp.pub_key_hex, "signature": kp.sign_hex(target)}))
 
 
 @app.command("sign-request")
@@ -117,7 +121,12 @@ def sign_request(domain: str = typer.Argument(..., help="e.g. xe-dao/vote/v1"),
     d = signing_target(domain.encode() + b"\x00", {"dao": dao.lower(), "network": network}, p, ts)
     out = {"payload": p, "timestamp": ts, "pub_key": kp.pub_key_hex, "signature": kp.sign_hex(d)}
     if pow_difficulty:
-        out["pow_nonce"] = compute_http_pow(pow_target(d, kp.pub_key_hex), int(pow_difficulty, 16))
+        # as `GET /v1/inbox` publishes it: a u64 in hex, with its 0x or without. Anything else is refused
+        # here; a number past 64 bits is one no nonce meets, and the search for it would not end.
+        digits = pow_difficulty[2:] if pow_difficulty[:2] in ("0x", "0X") else pow_difficulty
+        if not digits or not is_hex(digits.rjust(16, "0"), 8):
+            raise typer.BadParameter("--pow is the difficulty the inbox publishes: up to 16 hex digits")
+        out["pow_nonce"] = compute_http_pow(pow_target(d, kp.pub_key_hex), int(digits, 16))
     typer.echo(json.dumps(out))
 
 

@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable
 
 from xe.client import UNREACHABLE, XeClient, XeError
 from xe.encoding import Block, sign_block
-from xe.keys import KeyPair
+from xe.keys import KeyPair, exact_hex
 from xe.pow import WORKER_POW_DEADLINE_S, compute_pow
 
 from .context import Context
@@ -24,7 +24,7 @@ log = logging.getLogger("dao.chainops")
 
 async def _pow(hash_hex: str, difficulty: int) -> int:
     # PoW is CPU work; keep it off the event loop, and never let it run unbounded (XE-1188).
-    return await asyncio.to_thread(compute_pow, bytes.fromhex(hash_hex), difficulty, WORKER_POW_DEADLINE_S)
+    return await asyncio.to_thread(compute_pow, exact_hex(hash_hex, 32, "block hash"), difficulty, WORKER_POW_DEADLINE_S)
 
 
 async def _tip(chain: XeClient, account: str) -> tuple[str, dict[str, int]]:

@@ -36,7 +36,7 @@ from pathlib import Path
 
 from nacl import pwhash, secret, utils
 
-from xe.keys import KeyPair
+from xe.keys import KeyPair, exact_hex
 
 SCOPES = {
     "harness": {"event.sign"},
@@ -79,8 +79,8 @@ def decrypt_keyfile(blob: dict, passphrase: str) -> dict:
     """Every way the file can fail to open is a SignerError, which the startup path turns into a clean
     abort: a missing field, bad hex, a wrong passphrase, or plaintext that is not JSON (XE-1779)."""
     try:
-        box = secret.SecretBox(_kdf(passphrase, bytes.fromhex(blob["salt"])))
-        pt = box.decrypt(bytes.fromhex(blob["ciphertext"]))
+        box = secret.SecretBox(_kdf(passphrase, exact_hex(blob["salt"], None, "keyfile salt")))
+        pt = box.decrypt(exact_hex(blob["ciphertext"], None, "keyfile ciphertext"))
         return json.loads(pt.decode("utf-8"))
     except SignerError:
         raise

@@ -187,3 +187,106 @@ def test_an_opening_block_hashes_the_same_however_its_pub_key_and_hash_are_spell
         loud = {k: (v.upper() if k in ("account", "previous", "destination", "source", "representative") and isinstance(v, str) and len(v) == 64 else v)
                 for k, v in b.items()}
         assert hash_block(Block.from_json(loud), NETWORK_ID) == b["hash"], name
+
+
+# ---- hex is decoded in one place, exactly (XE-3845, XE-3534) ----------------------------------------
+
+SPACED = "ab " * 21 + "a"          # 64 characters; `bytes.fromhex` reads it as 21 bytes and one stray digit
+SHORT = "ab" * 30 + "ab  "         # 64 characters that `bytes.fromhex` decodes to 31 bytes
+PADDED = " " + "ab" * 32           # 32 bytes to `bytes.fromhex`, which skips the space; the node refuses it
+
+
+def test_nothing_in_the_package_or_the_harness_decodes_hex_but_the_exact_decoder():
+    """`bytes.fromhex` skips whitespace and the node's decoder does not, so a decoder that calls it takes a
+    spelling the node refuses. The rule is kept by there being one caller."""
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parent.parent
+    calls = []
+    for path in sorted(list((root / "xe").rglob("*.py")) + list((root / "dao").rglob("*.py"))):
+        for n, line in enumerate(path.read_text().splitlines(), 1):
+            code = line.split("#", 1)[0]
+            if re.search(r"\bfromhex\(", code) and "`bytes.fromhex`" not in code:
+                calls.append(f"{path.relative_to(root)}:{n}")
+    assert len(calls) == 1 and calls[0].startswith("xe/keys.py:"), calls
+    from xe import keys
+    import inspect
+    assert "bytes.fromhex(value)" in inspect.getsource(keys.exact_hex)
+
+
+def test_the_exact_decoder_takes_hex_digits_and_nothing_else():
+    from xe.keys import KeyError_, exact_hex, is_hex
+    assert is_hex("abCD") and is_hex("ab" * 32, 32) and exact_hex("00ff", 2, "x") == b"\x00\xff"
+    for bad in ("", "abc", "ab cd", " abcd", "abcd\n", "0xab", "zz", b"abcd", None, 12, ["ab"]):
+        assert not is_hex(bad), bad
+        with pytest.raises(KeyError_):
+            exact_hex(bad, None, "x")
+    assert not is_hex("abcd", 3) and not is_hex(PADDED, 32) and not is_hex(SHORT, 32) and not is_hex(SPACED, 32)
+    with pytest.raises(KeyError_, match="want 64 hex digits"):
+        exact_hex("ab" * 31, 32, "x")
+
+    class Mine(Exception):
+        pass
+    with pytest.raises(Mine):
+        exact_hex("ab cd", 2, "x", Mine)
+
+
+@pytest.mark.parametrize("bad", [SPACED, SHORT, PADDED, "ab" * 31, "zz" * 32])
+def test_every_decoder_refuses_a_spelling_the_node_refuses_with_its_own_error(bad):
+    from xe.chat import ChatError
+    from xe.chat_auth import chat_sign_target
+    from xe.encoding import EncodingError
+    from xe.keys import KeyError_, is_hex
+    from xe.statechain import StateChainError, sign_state_block_hash, validate_keyset
+    import dataclasses
+    kp = KeyPair.generate()
+    good = "ab" * 32
+
+    def block(**over):
+        return Block(**{**dict(type="send", account=kp.address, previous="0" * 64, balance=5, timestamp=1, asset="XE",
+                               destination=good, amount=5), **over})
+    hash_block(block(), NETWORK_ID)   # the control: the same block with nothing misspelled hashes
+    for over in (dict(account=bad), dict(previous=bad), dict(destination=bad), dict(representative=bad),
+                 dict(type="receive", source=bad),
+                 dict(type="multisig_open", keyset={"keys": [bad, good], "threshold": 2})):
+        with pytest.raises(EncodingError):
+            hash_block(block(**over), NETWORK_ID)
+
+    with pytest.raises(StateChainError):
+        hash_state_block(StateBlock(index=1, prev_hash=bad, ops=[], timestamp=1))
+    with pytest.raises(StateChainError):
+        sign_state_block_hash(bad, kp)
+    with pytest.raises(StateChainError):
+        verify_state_signature(bad, sign_state_block_hash(good, kp))
+    with pytest.raises(StateChainError, match="64 hex chars"):
+        validate_keyset({"keys": [good, bad], "threshold": 2})
+
+    if not is_hex(bad):   # a challenge has no fixed length, so 31 well-spelled bytes are a challenge
+        with pytest.raises(KeyError_):
+            chat_sign_target(bad)
+    with pytest.raises(KeyError_):
+        verify_hex_signature(bad, "cd" * 64, b"\x00" * 32)
+    env = new_envelope(kp, good, "hello", difficulty=0)
+    forged = dataclasses.replace(env, id=bad)
+    with pytest.raises(ChatError):
+        verify_envelope(forged, difficulty=0)
+
+    from dao.auth import pow_target
+    with pytest.raises(KeyError_):
+        pow_target(b"\x00" * 32, bad)
+
+
+def test_a_keyset_is_distinct_keys_and_an_integer_threshold():
+    """The mirror of the node's rule refuses what the node's own types refuse: a threshold that is not an
+    integer, and one key spelled twice."""
+    from xe.statechain import StateChainError, validate_keyset
+    a, b = "ab" * 32, "cd" * 32
+    validate_keyset({"keys": [a, b], "threshold": 2})
+    for thr in (2.0, 2.9, "2", True, None, [2]):
+        with pytest.raises(StateChainError, match="integer"):
+            validate_keyset({"keys": [a, b], "threshold": thr})
+    with pytest.raises(StateChainError, match="duplicate"):
+        validate_keyset({"keys": [a, a.upper(), b], "threshold": 2})
+    for keys in (None, "abab", {a: 1}, [], [a, 7], [a, None], [a, [b]]):
+        with pytest.raises(StateChainError):
+            validate_keyset({"keys": keys, "threshold": 2})

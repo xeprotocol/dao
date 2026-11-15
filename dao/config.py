@@ -14,7 +14,7 @@ from typing import Any
 
 import yaml
 
-from xe.keys import derive_address, is_valid_public_key
+from xe.keys import derive_address, exact_hex, is_valid_public_key
 
 
 def _sha256_file(path: Path) -> str:
@@ -439,7 +439,7 @@ def schedule_c_faults(cfg: Config) -> list[str]:
         if "may" in s and not _strings(lambda x: x in SEAT_RIGHTS, "", empty=True)[0](s["may"]):
             out.append(f"{seat}: may is {s['may']!r}; it must be a list of distinct rights from {', '.join(SEAT_RIGHTS)}")
         key = s.get("public_key") or ""
-        if isinstance(key, str) and _HEX64_ANY.fullmatch(key) and not is_valid_public_key(bytes.fromhex(key)):
+        if isinstance(key, str) and _HEX64_ANY.fullmatch(key) and not is_valid_public_key(exact_hex(key, 32, "public key")):
             out.append(f"{seat}: public_key is not a usable ed25519 key")
     accounts = cfg.schedule_c.get("accounts")
     if accounts is not None and not isinstance(accounts, dict):

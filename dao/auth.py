@@ -37,7 +37,7 @@ from sqlalchemy import delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from xe.keys import KeyError_, derive_address, verify_hex_signature
+from xe.keys import KeyError_, derive_address, exact_hex, verify_hex_signature
 
 from .canonical import DOMAIN_MEMBER_ACTION, digest
 from .config import Config, HumanSeat
@@ -173,7 +173,7 @@ POW_RULE = ("pow_nonce (u64) such that sha256(nonce_le8 || signing_digest || pub
 
 def pow_target(digest: bytes, pub_key: str) -> bytes:
     """What an HTTP proof of work is computed over: the request and the key that signed it."""
-    return digest + bytes.fromhex(pub_key)
+    return digest + exact_hex(pub_key, 32, "public key")
 
 
 def http_pow_hash(nonce: int, target: bytes) -> int:

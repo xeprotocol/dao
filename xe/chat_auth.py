@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import hashlib
 
-from .keys import KeyPair
+from .keys import KeyPair, exact_hex
 
 CHAT_AUTH_DOMAIN = b"xe/chat-read-auth/v1\x00"
 
 
 def chat_sign_target(challenge_hex: str) -> bytes:
-    return hashlib.sha256(CHAT_AUTH_DOMAIN + bytes.fromhex(challenge_hex)).digest()
+    return hashlib.sha256(CHAT_AUTH_DOMAIN + exact_hex(challenge_hex, None, "chat challenge")).digest()
 
 
 def chat_read_proof(kp: KeyPair, challenge_hex: str) -> dict[str, str]:

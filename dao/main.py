@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -78,6 +80,9 @@ app.add_middleware(MarkdownMirror, base_url=lambda: get_context().settings.publi
 # The largest legitimate write is a resolution (50k chars of body plus ops of up to 64 KiB each); anything
 # past a megabyte is not a request we have a route for, and is refused before it is parsed.
 MAX_BODY_BYTES = 1 << 20
+# A declared length is a number of few enough digits to be one. `int()` of a long enough run of digits
+# raises, and nothing a client puts in a header is allowed to raise out of a middleware (XE-11273).
+_LENGTH = re.compile(rb"[0-9]{1,18}")
 
 
 class BodyLimit:
@@ -88,7 +93,9 @@ class BodyLimit:
         if scope["type"] != "http" or scope.get("method") not in ("POST", "PUT", "PATCH"):
             return await self.app(scope, receive, send)
         declared = next((v for k, v in scope.get("headers", []) if k == b"content-length"), None)
-        if declared is not None and declared.isdigit() and int(declared) > self.limit:
+        if declared is not None and not _LENGTH.fullmatch(declared):
+            return await self._refuse(send, 400, "content-length is not a length")
+        if declared is not None and int(declared) > self.limit:
             return await self._refuse(send)
         seen = 0
         tripped = False
@@ -122,9 +129,9 @@ class BodyLimit:
             await self._refuse(send)
 
     @staticmethod
-    async def _refuse(send):
-        body = b'{"error":"request body too large","status":413}'
-        await send({"type": "http.response.start", "status": 413, "headers": [
+    async def _refuse(send, status: int = 413, error: str = "request body too large"):
+        body = json.dumps({"error": error, "status": status}, separators=(",", ":")).encode()
+        await send({"type": "http.response.start", "status": status, "headers": [
             (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
         await send({"type": "http.response.body", "body": body})
 

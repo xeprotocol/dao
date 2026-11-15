@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, asdict
 from typing import Any
 
-from .keys import KeyPair, verify_hex_signature, verify_payload_key
+from .keys import KeyPair, exact_hex, verify_hex_signature, verify_payload_key
 from .pow import CHAT_POW_DIFFICULTY, compute_pow, validate_pow
 
 MAX_MESSAGE_BYTES = 8192
@@ -105,7 +105,7 @@ def new_envelope(kp: KeyPair, to: str, message: str, difficulty: int = CHAT_POW_
     from_ = kp.address
     pub = kp.pub_key_hex
     eid = compute_envelope_id(from_, pub, to, message, ts)
-    id_bytes = bytes.fromhex(eid)
+    id_bytes = exact_hex(eid, 32, "envelope id", ChatError)
     sig = kp.sign_hex(id_bytes)
     nonce = compute_pow(id_bytes, difficulty, deadline_s) if difficulty > 0 else 0
     return Envelope(id=eid, from_=from_, pub_key=pub, to=to, message=message,
@@ -125,7 +125,7 @@ def verify_envelope(env: Envelope, difficulty: int = CHAT_POW_DIFFICULTY, check_
     expected = compute_envelope_id(env.from_, env.pub_key, env.to, env.message, env.timestamp)
     if env.id != expected:
         raise ChatError("envelope ID mismatch")
-    id_bytes = bytes.fromhex(env.id)
+    id_bytes = exact_hex(env.id, 32, "envelope id", ChatError)
     if difficulty > 0 and not validate_pow(id_bytes, env.pow_nonce, difficulty):
         raise ChatError("insufficient proof of work")
     try:

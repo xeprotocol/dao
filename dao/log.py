@@ -22,7 +22,7 @@ from typing import Any, AsyncIterator
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from xe.keys import verify_hex_signature
+from xe.keys import exact_hex, verify_hex_signature
 
 from .canonical import DOMAIN_EVENT, DOMAIN_EVENT_V2, digest
 from .db import locked
@@ -79,7 +79,7 @@ class EventLog:
         if self.signer.has("harness"):
             try:
                 signer_pk = self.signer.public_key("harness")
-                sig = self.signer.sign("harness", "event.sign", bytes.fromhex(h))
+                sig = self.signer.sign("harness", "event.sign", exact_hex(h, 32, "event hash"))
             except SignerError as e:
                 # a configured key that will not sign is an outage, not a reason to write an unsigned row
                 raise LogError(f"harness key will not sign: {e}") from e
