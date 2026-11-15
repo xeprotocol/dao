@@ -222,7 +222,7 @@ class Signer:
         """Return the key pair for a scoped operation that needs it (building blocks, envelopes).
         The policy check happens here, and so does the record of a refusal: every caller gets its key
         through this, so a use that was refused is counted whoever asked and however they handled being
-        told (`drain_denials`). A use that is allowed is logged by the caller, as the event of what the
+        told (`denials`). A use that is allowed is logged by the caller, as the event of what the
         key was used to write."""
         kp = self._keys.get(name)
         if kp is None or scope not in self._scopes.get(name, set()):
@@ -232,12 +232,23 @@ class Signer:
                               else f"key {name!r} is not permitted scope {scope!r}")
         return kp
 
-    def drain_denials(self) -> list[dict]:
-        """The refusals since this was last asked, one entry per key and scope with how many times, and
-        the count starts again. Key and scope only: what was to be signed is not kept."""
-        out = [{"key": k, "scope": s, "count": n} for (k, s), n in sorted(self._denied.items())]
-        self._denied.clear()
-        return out
+    def denials(self) -> list[dict]:
+        """The refusals not yet recorded, one entry per key and scope with how many times. Key and scope
+        only: what was to be signed is not kept. Reading them does not start the count again: a refusal
+        is counted here until whoever records it says it is recorded (`forget`), so a record that did
+        not commit loses none (XE-14106)."""
+        return [{"key": k, "scope": s, "count": n} for (k, s), n in sorted(self._denied.items())]
+
+    def forget(self, recorded: list[dict]) -> None:
+        """Stop counting the refusals in `recorded`, a reading of `denials` that is now on the log. Only
+        what was read is taken off: a refusal since the reading is still counted."""
+        for x in recorded:
+            key = (x["key"], x["scope"])
+            left = self._denied.get(key, 0) - x["count"]
+            if left > 0:
+                self._denied[key] = left
+            else:
+                self._denied.pop(key, None)
 
     def sign(self, name: str, scope: str, message: bytes) -> str:
         return self.keypair(name, scope).sign_hex(message)

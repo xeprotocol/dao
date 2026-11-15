@@ -49,9 +49,10 @@ class Worker:
         await self._seal_legacy_log()
         async with session() as db:
             d = await records.health_pass(self.ctx, db)
-            await self._log_signer_denials(db)
+            denials = await self._log_signer_denials(db)
             await mark_run(db, "health", {"ok": d["ok"]}, every_s=records.cadence_s(self.ctx))
             await db.commit()
+        self._signer_denials_logged(denials)
 
     async def _seal_legacy_log(self) -> None:
         """The seal over the log's v1 rows, written once (XE-4017). In a transaction of its own, so the log
@@ -64,14 +65,20 @@ class Worker:
         except Exception as e:
             log.warning("sealing the log's v1 rows failed: %s: %s", type(e).__name__, e)
 
-    async def _log_signer_denials(self, db) -> None:
+    async def _log_signer_denials(self, db) -> tuple[list[dict], list, dict]:
         """Uses of a company key the signer refused since the last check, onto the log (XE-3974). Like a
         degraded spell (XE-6048), a refusal that goes on is one entry when it starts, one when what is
         being refused changes and one when it stops, not one per check. No refusal goes uncounted for
-        that: the checks in between are carried, and each entry counts every use since the one before it."""
-        denied = self.ctx.signer.drain_denials()
+        that: the checks in between are carried, and each entry counts every use since the one before it.
+
+        Nothing is counted off here. This reads the signer's count and returns what the check's
+        transaction, once it has committed, lets the worker stop counting (`_signer_denials_logged`). A
+        check that fails after this (the schedule row, the commit, the append itself) has recorded
+        nothing, and before, the count had already been emptied for it: those refusals were on no log
+        and in no count (XE-14106)."""
+        denied = self.ctx.signer.denials()
         pairs = [(x["key"], x["scope"]) for x in denied]
-        carried = getattr(self, "_denied_carried", {})
+        carried = dict(getattr(self, "_denied_carried", {}))
         for x in denied:
             carried[(x["key"], x["scope"])] = carried.get((x["key"], x["scope"]), 0) + x["count"]
         if (denied and pairs != getattr(self, "_denied_before", [])) or (not denied and carried):
@@ -79,6 +86,13 @@ class Worker:
             await self.ctx.events.append(db, "signer.denied", "harness",
                                          {"denied": entry, **({} if denied else {"ended": True})}, public=True)
             carried = {}
+        return denied, pairs, carried
+
+    def _signer_denials_logged(self, read: tuple[list[dict], list, dict]) -> None:
+        """The check that read these refusals has committed: the signer stops counting them, and the
+        worker keeps what the next check compares against and carries."""
+        denied, pairs, carried = read
+        self.ctx.signer.forget(denied)
         self._denied_before, self._denied_carried = pairs, carried
 
     async def job_directory(self):

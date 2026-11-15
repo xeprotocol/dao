@@ -2136,7 +2136,7 @@ def test_a_refused_use_of_a_key_is_counted_by_the_signer_and_logged_once_per_spe
     from dao import worker as worker_mod
     s = Signer({"fee": KeyPair.generate()}, {"fee": {"block.receive"}})
     s.keypair("fee", "block.receive")
-    assert s.drain_denials() == [], "an allowed use is not a refusal"
+    assert s.denials() == [], "an allowed use is not a refusal"
     for name, scope in (("fee", "block.burn"), ("fee", "block.burn"), ("dao", "chat.send")):
         with pytest.raises(SignerError):
             s.keypair(name, scope)
@@ -2151,34 +2151,65 @@ def test_a_refused_use_of_a_key_is_counted_by_the_signer_and_logged_once_per_spe
             logged.append((kind, actor, payload, kw))
     w = worker_mod.Worker.__new__(worker_mod.Worker)
     w.ctx = SimpleNamespace(signer=s, events=Events())
-    asyncio.run(w._log_signer_denials(None))
+
+    def check():
+        w._signer_denials_logged(asyncio.run(w._log_signer_denials(None)))
+    check()
     assert logged == [("signer.denied", "harness", {"denied": want}, {"public": True})]
-    assert s.drain_denials() == [], "the count starts again"
+    assert s.denials() == [], "the count starts again"
     # the same refusals going on are not an entry per check; a change in what is refused is
     for _ in range(3):
         for name, scope in (("fee", "block.burn"), ("dao", "chat.send"), ("fee", "event.sign")):
             with pytest.raises(SignerError):
                 s.keypair(name, scope)
-        asyncio.run(w._log_signer_denials(None))
+        check()
     assert len(logged) == 1
     with pytest.raises(SignerError):
         s.keypair("fee", "block.send.refund")
-    asyncio.run(w._log_signer_denials(None))
+    check()
     # the entry for the change counts every refusal since the last entry, the three checks in between included
     assert len(logged) == 2 and logged[1][2] == {"denied": [
         {"key": "dao", "scope": "chat.send", "count": 3}, {"key": "fee", "scope": "block.burn", "count": 3},
         {"key": "fee", "scope": "block.send.refund", "count": 1}, {"key": "fee", "scope": "event.sign", "count": 3}]}
-    asyncio.run(w._log_signer_denials(None))   # nothing refused and nothing uncounted: nothing logged, and the spell is over
+    check()   # nothing refused and nothing uncounted: nothing logged, and the spell is over
     assert len(logged) == 2
     for _ in range(2):
         with pytest.raises(SignerError):
             s.keypair("fee", "block.send.refund")
-        asyncio.run(w._log_signer_denials(None))
+        check()
     assert len(logged) == 3 and logged[2][2] == {"denied": [{"key": "fee", "scope": "block.send.refund", "count": 1}]}
-    asyncio.run(w._log_signer_denials(None))   # the spell stops with a refusal no entry has counted: a closing entry counts it
+    check()   # the spell stops with a refusal no entry has counted: a closing entry counts it
     assert len(logged) == 4 and logged[3][2] == {"denied": [{"key": "fee", "scope": "block.send.refund", "count": 1}], "ended": True}
-    asyncio.run(w._log_signer_denials(None))
+    check()
     assert len(logged) == 4
+    # XE-14106: a check that did not commit has recorded nothing, so it has counted nothing off. The
+    # refusals it read are still the signer's, the spell is where it was, and the next check that does
+    # commit writes the entry the failed one would have: none lost, none twice.
+    for name, scope in (("fee", "block.burn"), ("fee", "block.burn")):
+        with pytest.raises(SignerError):
+            s.keypair(name, scope)
+    before = (s.denials(), w._denied_before, dict(w._denied_carried))
+    read = asyncio.run(w._log_signer_denials(None))          # appended inside a transaction that then rolls back
+    assert len(logged) == 5 and (s.denials(), w._denied_before, w._denied_carried) == before
+    assert read[2] is not w._denied_carried
+    logged.pop()                                             # the rollback takes the entry with it
+    with pytest.raises(SignerError):
+        s.keypair("fee", "block.burn")                       # refused between the failed check and the next
+    check()
+    assert len(logged) == 5 and logged[4][2] == {"denied": [{"key": "fee", "scope": "block.burn", "count": 3}]}
+    assert s.denials() == []
+    # a refusal after the reading and before the commit is not counted off with it
+    with pytest.raises(SignerError):
+        s.keypair("fee", "block.burn")
+    read = asyncio.run(w._log_signer_denials(None))
+    with pytest.raises(SignerError):
+        s.keypair("fee", "block.burn")
+    w._signer_denials_logged(read)
+    assert s.denials() == [{"key": "fee", "scope": "block.burn", "count": 1}]
+    # and the health job is the one caller: it counts off only after its commit
+    src = Path(worker_mod.__file__).read_text()
+    job = src[src.index("async def job_health"):src.index("async def _seal_legacy_log")]
+    assert job.index("await db.commit()") < job.index("self._signer_denials_logged(") and src.count("signer.forget(") == 1
 
 
 # ---- XE-6656 / XE-4124 / XE-5982: what a signed request may carry is settled before anything hashes it -----
