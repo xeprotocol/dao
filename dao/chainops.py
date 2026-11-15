@@ -28,9 +28,26 @@ async def _pow(hash_hex: str, difficulty: int) -> int:
     return await asyncio.to_thread(compute_pow, exact_hex(hash_hex, 32, "block hash"), difficulty, WORKER_POW_DEADLINE_S)
 
 
+def _moved(account: str) -> XeError:
+    """The account's chain grew between two reads of it. Nothing is built from the pair: the caller's next
+    pass reads again."""
+    return XeError(UNREACHABLE, f"the chain of {account[:12]} moved while it was being read; nothing is built on it")
+
+
 async def _tip(chain: XeClient, account: str) -> tuple[str, dict[str, int]]:
-    """(previous_hash, balances) for an account; previous == "0" for a fresh account."""
-    return await chain.tip(account), await chain.balances(account)
+    """(previous_hash, balances) for an account, as of one moment; previous == "0" for a fresh account.
+
+    The two are two requests, and a block of ours names both: its `previous` and the balance it leaves.
+    A block landing between them gave a tip from before it and a balance from after, and the block built
+    on that pair is one the node refuses for its balance while nothing stands on its parent, so it was
+    offered again, unchanged, for as long as the chain stayed where it was (XE-14160). The tip is read
+    again after the balance: a chain only grows, so a tip that is the same on both sides of the balance
+    is the tip the balance was read at. One that is not raises (`_moved`)."""
+    prev = await chain.tip(account)
+    bals = await chain.balances(account)
+    if await chain.tip(account) != prev:
+        raise _moved(account)
+    return prev, bals
 
 
 # Every block the harness writes to an account chain is built by `signed()`, and nothing is recorded from
@@ -120,7 +137,10 @@ RECEIVE_PASS_S = 30.0
 RECEIVE_RETRY_S = 60.0
 RECEIVE_RETRY_MAX_S = 3600.0
 # (account, send hash) -> (passes that offered it a receive, when the last one did). A pass the node or
-# the database stopped before the submit offered nothing and counts against no send. In this process
+# the database stopped before the submit offered nothing and counts against no send, and neither does a
+# receive whose proof of work ran out of time or whose submit found no node to connect to. A send whose
+# block cannot be made at all is counted as if offered: it will not be made on the next pass either, and
+# the count is what moves it out of the way of the sends behind it. In this process
 # only: after a restart every pending send is new again, which costs one pass. Entries leave with the send.
 _offered: dict[tuple[str, str], tuple[int, float]] = {}
 
@@ -151,9 +171,9 @@ async def receive_pending(ctx: Context, key_name: str, paused: Callable[[], Awai
     `paused()` is asked right before each submit, after the block's proof of work, so a pause that begins
     during a run stops the receives still to come (XE-2483). A send that cannot be received is logged and
     skipped whatever went wrong, since the ones behind it are independent (XE-0488). What is not about the
-    send ends the pass instead, and is held against none of them: the node failing the read of our own tip
-    or not naming its network (the sends behind would be told the same), and the pause check itself
-    failing, which is the caller's database and is raised to it. A receive is not kept for a retry: one
+    send ends the pass instead, and is held against none of them: the node failing the read of our own tip,
+    not naming its network or not being there to connect to for the submit (the sends behind would be
+    told the same), and the pause check itself failing, which is the caller's database and is raised to it. A receive is not kept for a retry: one
     that did not land leaves its send pending on the node, where the next pass finds it, and the node
     takes one receive per send."""
     kp = ctx.signer.keypair(key_name, scope)
@@ -175,7 +195,14 @@ async def receive_pending(ctx: Context, key_name: str, paused: Callable[[], Awai
             log.warning("receive into %s stopped at %s: %s", key_name, p["send_hash"][:12], e)
             todo = todo[:i]
             break
-        except Exception as e:  # a bad entry, proof of work that ran out of time: this send only
+        except TimeoutError:
+            # The proof of work ran out of time, which is this machine and the luck of the search and not
+            # the send: no receive was offered, and the send is not held to have been offered one. Counted,
+            # two slow searches put a fee that the node had never been shown into the wait a send gets
+            # for being refused twice, up to an hour (XE-14286).
+            log.warning("receive of %s into %s: proof of work ran out of time; tried again next pass", p["send_hash"][:12], key_name)
+            continue
+        except Exception as e:  # a bad entry: this send only
             log.warning("receive of %s into %s failed: %s: %s", p["send_hash"][:12], key_name, type(e).__name__, e)
         if b is not None:
             if await paused():
@@ -183,7 +210,16 @@ async def receive_pending(ctx: Context, key_name: str, paused: Callable[[], Awai
             try:
                 await ctx.chain.submit_block(b)
                 taken += 1
-            except Exception as e:  # a refusal, or no answer: this send only
+            except Exception as e:
+                if isinstance(e, XeError) and e.unsent:
+                    # No connection: the node was shown nothing, and the sends behind would be shown
+                    # nothing either. The pass ends, held against none of them, as it does when the
+                    # node fails the read of our tip. Counted, a node that could not be reached for two
+                    # passes put every send of those passes into the doubling wait (XE-14286).
+                    log.warning("receive into %s stopped at %s: %s", key_name, p["send_hash"][:12], e)
+                    todo = todo[:i]
+                    break
+                # a refusal, or a connection that gave no answer: this send only
                 log.warning("receive of %s into %s failed: %s: %s", p["send_hash"][:12], key_name, type(e).__name__, e)
         key = (kp.address, p["send_hash"])
         _offered[key] = (_offered.get(key, (0, 0.0))[0] + 1, time.monotonic())
@@ -224,6 +260,10 @@ async def _build_out(ctx: Context, key_name: str, scope: str, type_: str, amount
     if last is not None and last.get("finalized") is not True:
         return None
     have = (await ctx.chain.balances(kp.address)).get(asset, 0)
+    # the balance is the balance at this tip only if the tip is still the tip (`_tip`, XE-14160)
+    at_after, last_after = await ctx.chain.chain_end(kp.address)
+    if (at_after, last_after and last_after.get("hash")) != (at, last and last.get("hash")):
+        raise _moved(kp.address)
     if have < amount:
         raise XeError(409, f"insufficient {asset} in {key_name}: have {have}, need {amount}")
     b = Block(type=type_, account=kp.address, previous=last["hash"] if last else "0", balance=have - amount,
@@ -285,6 +325,7 @@ SNAPSHOT_LEAD_NS = TIMESTAMP_WINDOW_NS + SNAPSHOT_MARGIN_NS
 SNAPSHOT_LEAD_TEXT = "an hour and five minutes"
 CAUSAL_CHECK_NS = 2 * TIMESTAMP_WINDOW_NS
 MAX_CAUSAL_LOOKUPS = 32
+MAX_EXCLUDED_SHOWN = 32   # of the receives a snapshot left out, the ones it names; `excluded_count` is all of them
 CAUSAL_LOOKUP_CONCURRENCY = 8
 # Bumped whenever the figure this function derives for the same chain and `at` can change. A vote row
 # stores the result it was derived from; at close, rows derived under another `at` or rule are re-derived
@@ -303,7 +344,7 @@ def empty_snapshot(at_ns: int, unreadable: str = "") -> dict:
     """The snapshot of an account the chain has nothing for: not there, or (with `unreadable` set) one whose
     chain the harness cannot read on purpose, such as one past the page bound (XE-1706)."""
     d = {"exists": False, "balance": 0, "first_block_ts": None, "snapshot_block": "", "excluded_receives": [],
-         "lookups_capped": False, "unsettled": False, "at": at_ns, "rule": SNAPSHOT_RULE}
+         "excluded_count": 0, "lookups_capped": False, "unsettled": False, "at": at_ns, "rule": SNAPSHOT_RULE}
     if unreadable:
         d["unreadable"] = unreadable
     return d
@@ -375,8 +416,12 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
             tainted = max(tainted - (bal - new_bal), 0)
         bal = new_bal
         snap = b.get("hash", "")
+    # The first of the excluded receives and how many there are. The whole list went into the vote's row
+    # and out of the snapshot route, and its length is whoever sends to the account's to choose: a few
+    # thousand dust receives in the window were a few thousand hashes on every row derived from it (XE-14105).
     return {"exists": first_ts <= at_ns and counted > 0, "balance": max(bal - tainted, 0),
-            "first_block_ts": first_ts, "snapshot_block": snap, "excluded_receives": excluded, "lookups_capped": capped,
+            "first_block_ts": first_ts, "snapshot_block": snap, "excluded_receives": excluded[:MAX_EXCLUDED_SHOWN],
+            "excluded_count": len(excluded), "lookups_capped": capped,
             "unsettled": unsettled, "at": at_ns, "rule": SNAPSHOT_RULE}
 
 
@@ -401,15 +446,3 @@ async def _sends_at_or_before(chain: XeClient, send_hashes: list[str], at_ns: in
 
     found = await asyncio.gather(*(one(h) for h in send_hashes))
     return dict(zip(send_hashes, found))
-
-
-async def account_pub_key(chain: XeClient, account: str) -> str:
-    """The key declared on the account's open block, or '' if unknown."""
-    try:
-        page = await chain.chain(account, offset=0, limit=1)
-    except XeError as e:
-        if e.status == 404:
-            return ""
-        raise
-    blocks = page.get("blocks", [])
-    return (blocks[0].get("pub_key") or "") if blocks else ""

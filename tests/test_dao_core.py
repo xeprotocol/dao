@@ -665,7 +665,10 @@ async def test_snapshot_node_reads_are_bounded_and_the_bound_only_lowers_the_wei
     chain.block = counted
     d = await account_snapshot(chain, "D", T)
     assert chain.lookups == MAX_CAUSAL_LOOKUPS and in_flight["max"] <= CAUSAL_LOOKUP_CONCURRENCY
-    assert d["lookups_capped"] and len(d["excluded_receives"]) == 2 * n - 2 * MAX_CAUSAL_LOOKUPS
+    # every receive left out is counted; the snapshot names the first of them and no more (XE-14105)
+    from dao.chainops import MAX_EXCLUDED_SHOWN
+    assert d["lookups_capped"] and d["excluded_count"] == 2 * n - 2 * MAX_CAUSAL_LOOKUPS > MAX_EXCLUDED_SHOWN
+    assert len(d["excluded_receives"]) == MAX_EXCLUDED_SHOWN
     # the true balance is 2n; what is counted is at most that, and exactly the receives whose sends were checked
     assert d["balance"] == 2 * MAX_CAUSAL_LOOKUPS <= 2 * n
     # a sparse account is unaffected: every send looked up once, nothing capped
@@ -2877,6 +2880,46 @@ async def test_a_receive_pass_is_bounded_in_number_and_time_and_dust_waits_behin
     assert await chainops.receive_pending(ctx, "fee", not_paused) == limit - 1
     assert chainops._offered[(acct, "fee")][0] == 1 and len(chainops._offered) == limit
 
+    # a search for proof of work that ran out of time offered the send nothing, so the send is held to
+    # nothing: it is first in the next pass and the next, and the sends behind it are offered theirs (XE-14286)
+    chainops._offered.clear()
+
+    async def slow_for_the_fee(ctx_, block, kp_):
+        if block.source == "fee":
+            raise TimeoutError("no proof of work found in 120s")
+        return block
+    monkeypatch.setattr(chainops, "signed", slow_for_the_fee)
+    for _ in range(3):
+        assert await chainops.receive_pending(ctx, "fee", not_paused) == limit - 1
+        assert (acct, "fee") not in chainops._offered
+        assert chainops.receive_order(acct, pending, time.monotonic())[0]["send_hash"] == "fee"
+
+    # nor did a submit that found no node to connect to: the node was shown nothing, the sends behind
+    # would be shown nothing, and the pass ends held against none of them
+    import httpx
+    chainops._offered.clear()
+    monkeypatch.setattr(chainops, "signed", signed)
+    asked = []
+
+    async def no_node(block):
+        asked.append(block.source)
+        try:
+            raise httpx.ConnectError("connection refused")
+        except httpx.ConnectError as e:
+            raise XeError(0, "ConnectError") from e
+    ctx.chain.submit_block = no_node
+    assert await chainops.receive_pending(ctx, "fee", not_paused) == 0
+    assert asked == ["fee"] and chainops._offered == {}
+    # a connection that gave no answer may have carried a receive the node took: that send's, and the pass goes on
+    assert not XeError(0, "ReadTimeout").unsent and not XeError(503, "x").unsent
+
+    async def no_answer(block):
+        raise XeError(0, "ReadTimeout")
+    ctx.chain.submit_block = no_answer
+    assert await chainops.receive_pending(ctx, "fee", not_paused) == 0
+    assert len(chainops._offered) == limit and chainops._offered[(acct, "fee")][0] == 1
+    chainops._offered.clear()
+
 
 # ---- XE-4169: a downgrade does not discard what the upgrade cannot restore ---------------------------------
 
@@ -3777,6 +3820,79 @@ async def test_a_node_answer_is_kept_as_its_named_fields_at_a_bounded_size():
         await c.chat_messages(proof)
     assert "longer than any envelope" in e.value.message
     await c.aclose()
+
+
+# ---- XE-14160: a block of ours names a tip and a balance that were true at one moment ------------------------
+
+async def test_a_block_is_built_on_a_tip_and_a_balance_read_at_one_moment(monkeypatch):
+    """The rule: every block the harness builds on an account chain takes its `previous` and the balance
+    it leaves from one moment of that chain, and where the chain grew between the two reads nothing is
+    built. The sites are the two that build one: `_tip` (a receive) and `_build_out` (a send, a burn)."""
+    from dao import chainops
+    from xe.client import XeError
+    monkeypatch.setattr(chainops, "_offered", {})
+    kp = KeyPair.generate()
+    send_hash = "5" * 64
+
+    class Node:
+        """An account whose chain grows by one block as its balance is read, `moves` times."""
+
+        def __init__(self, moves):
+            self.moves, self.height, self.submitted = moves, 3, []
+
+        def _hash(self):
+            return f"{self.height:064x}"
+
+        async def tip(self, address):
+            return self._hash()
+
+        async def chain_end(self, address):
+            return self.height, {"hash": self._hash(), "finalized": True}
+
+        async def balances(self, address):
+            if self.moves:
+                self.moves, self.height = self.moves - 1, self.height + 1
+            return {"XE": 1000 * self.height}
+
+        async def pending_for(self, address):
+            return [{"send_hash": send_hash, "source": "s", "destination": address, "amount": 7, "asset": "XE", "timestamp": 0}]
+
+        async def submit_block(self, block):
+            self.submitted.append(block)
+
+    def ctx_for(node):
+        return SimpleNamespace(chain=node, signer=SimpleNamespace(keypair=lambda name, scope: kp),
+                               node=SimpleNamespace(network_id="xe-test", pow_difficulty=0))
+
+    async def not_paused():
+        return False
+    still = f"{3:064x}"
+    # a chain that stays where it is: the pair is the pair, and the block names it
+    assert await chainops._tip(Node(0), kp.address) == (still, {"XE": 3000})
+    builders = {"send": lambda ctx: chainops.build_send(ctx, "fee", "block.send", "d" * 64, 500),
+                "burn": lambda ctx: chainops.build_burn(ctx, "fee", "block.burn", 500)}
+    for type_, build in builders.items():
+        out = await build(ctx_for(Node(0)))
+        assert (out["type"], out["previous"], out["balance"], out["at"]) == (type_, still, 2500, 3)
+    node = Node(0)
+    assert await chainops.receive_pending(ctx_for(node), "fee", not_paused) == 1
+    assert (node.submitted[0].previous, node.submitted[0].balance, node.submitted[0].source) == (still, 3007, send_hash)
+    # a chain that grew between the reads: a tip from before the block and a balance from after it are
+    # not a pair, and nothing is built or offered on them
+    with pytest.raises(XeError) as e:
+        await chainops._tip(Node(1), kp.address)
+    assert e.value.transient and "moved" in e.value.message
+    for type_, build in builders.items():
+        with pytest.raises(XeError) as e:
+            await build(ctx_for(Node(1)))
+        assert e.value.transient and "moved" in e.value.message, type_
+    chainops._offered.clear()
+    node = Node(1)
+    assert await chainops.receive_pending(ctx_for(node), "fee", not_paused) == 0
+    assert node.submitted == [] and chainops._offered == {}, "and the send is held to nothing: it was offered nothing"
+    # the pass after it reads a chain that has stopped moving, and builds
+    assert await chainops.receive_pending(ctx_for(node), "fee", not_paused) == 1
+    assert (node.submitted[0].previous, node.submitted[0].balance) == (f"{4:064x}", 4007)
 
 
 # ---- sibling sweep of the seventh pass: the rules above, at the sites the reports did not name -------------
