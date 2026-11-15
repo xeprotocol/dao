@@ -17,6 +17,7 @@ import logging
 import re
 import secrets
 import time
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 from sqlalchemy import delete, func, select
@@ -29,6 +30,7 @@ from xe.statechain import StateBlock, StateChainError, StateOp, build_block, che
 from ..auth import Verified
 from ..canonical import canonical_json, sha256_hex
 from ..context import Context
+from ..db import locked
 from ..log import EventLog
 from ..models import Anchor, SigningSession
 from . import pause
@@ -155,6 +157,19 @@ def _block_from_session(s: SigningSession) -> StateBlock:
     return blk
 
 
+def require_executable(ctx: Context, s: SigningSession) -> None:
+    """What a session writes is checked against the seats as they are now each time it moves toward the
+    chain: when its block is built, when a signature is added, when it is submitted. `create` checks it
+    once, and a session lives for days: a seat that has changed its key or lost the right to sign since
+    then can leave a keyset session carrying a keyset the seats no longer meet, which would land and end
+    every later session, the one to repair it included (XE-4131, the deadlock of XE-1705 reached after
+    creation). The check is `check_ops`, the same one, so the two cannot differ."""
+    try:
+        check_ops(s.kind, s.ops, seat_keys_of(ctx.config))
+    except HTTPException as e:
+        raise HTTPException(409, f"this session can no longer be executed as approved: {e.detail}") from e
+
+
 async def require_unpaused(db: AsyncSession) -> None:
     """Approving a session is record-keeping and stays open during a pause; building, signing and
     submitting a block are the company acting on the chain and stop. Lifted pauses release them."""
@@ -193,7 +208,7 @@ async def get(db: AsyncSession, session_id: str, *, lock: bool = False) -> Signi
     """`lock=True` takes the row FOR UPDATE: every path that changes a session loads it this way, so two
     writers queue instead of each saving its own copy of a list over the other's (XE-0672)."""
     q = select(SigningSession).where(SigningSession.id == session_id)
-    s = (await db.execute(q.with_for_update() if lock else q)).scalar_one_or_none()
+    s = (await db.execute(locked(q) if lock else q)).scalar_one_or_none()
     if s is None:
         raise HTTPException(404, "session not found")
     return s
@@ -205,7 +220,8 @@ OPEN = ("approving", "signing")
 async def list_sessions(db: AsyncSession, status: str | None = None, limit: int = 100, offset: int = 0) -> list[SigningSession]:
     """A page of sessions, newest first, for listings. Not for deciding whether something is pending: a
     page cannot see past its own end, and sessions are never deleted (XE-1561). Ask `open_sessions`."""
-    q = select(SigningSession).order_by(SigningSession.created_at.desc()).offset(offset).limit(limit)
+    # the id last: rows made in one transaction share one `created_at`, and a page needs a total order (XE-3250)
+    q = select(SigningSession).order_by(SigningSession.created_at.desc(), SigningSession.id.desc()).offset(offset).limit(limit)
     if status:
         q = q.where(SigningSession.status == status)
     return list((await db.execute(q)).scalars().all())
@@ -220,7 +236,7 @@ async def count_sessions(db: AsyncSession, status: str | None = None) -> int:
 
 async def open_sessions(db: AsyncSession, kind: str | None = None) -> list[SigningSession]:
     """Every session still approving or signing, unpaged, oldest first; optionally of one kind."""
-    q = select(SigningSession).where(SigningSession.status.in_(OPEN)).order_by(SigningSession.created_at.asc())
+    q = select(SigningSession).where(SigningSession.status.in_(OPEN)).order_by(SigningSession.created_at.asc(), SigningSession.id.asc())
     if kind:
         q = q.where(SigningSession.kind == kind)
     return list((await db.execute(q)).scalars().all())
@@ -295,6 +311,7 @@ async def rebuild(ctx: Context, db: AsyncSession, s: SigningSession, actor: str 
         return await _submitted(ctx, db, s)
     require_timelock_run(s)
     await require_unpaused(db)
+    require_executable(ctx, s)
     ks = await live_keyset(ctx)
     if not approvals_met(s, ks):
         if s.status == "signing":
@@ -343,6 +360,7 @@ async def sign(ctx: Context, db: AsyncSession, s: SigningSession, pub_key: str, 
         raise HTTPException(409, f"session is {s.status}, not signing")
     require_timelock_run(s)
     await require_unpaused(db)
+    require_executable(ctx, s)
     pub_key = pub_key.lower()
     ks = await live_keyset(ctx)
     if pub_key not in ks["keys"]:
@@ -392,13 +410,70 @@ async def landed(ctx: Context, s: SigningSession) -> bool:
 
 
 async def _submitted(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSession:
+    """The chain holds the session's block at its index, and the record says so: the session, and for an
+    anchor the register row, in this one transaction. The row was once filled by the worker's next pass,
+    and until then the register and the health check called a written anchor unwritten (XE-6256)."""
+    was = s.status
     s.status = "submitted"
     s.submitted_index = int(s.block["index"])
     s.submitted_hash = s.block_hash
+    if s.kind == "anchor":
+        await _anchor_written(db, s)
     await ctx.events.append(db, "session.submitted", "harness", {
         "session_id": s.id, "kind": s.kind, "index": s.submitted_index, "hash": s.submitted_hash, "ops": s.ops,
+        **({"was": was} if was not in OPEN else {}),
     }, ref=f"session:{s.id}")
     return s
+
+
+async def _anchor_written(db: AsyncSession, s: SigningSession) -> None:
+    """The register row for an anchor session whose block is on the chain. A session that ended first took
+    its row with it (`_ended`); if its block landed after all, the row is written again from the op, which
+    is the anchor (XE-4148). Should a later session have taken the number in between, the row goes to
+    whichever block the chain holds: a row that names a block on the chain stands and the log carries this
+    one, and a row still waiting on its session is this block's now, since the number is written and what
+    the register says of it is what was written (XE-6256)."""
+    a = (await db.execute(select(Anchor).where(Anchor.session_id == s.id))).scalar_one_or_none()
+    if a is None:
+        try:
+            value = json.loads(s.ops[0]["value"])
+            n, event_index, head_hash = int(value["n"]), int(value["event_index"]), str(value["head_hash"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return
+        a = (await db.execute(select(Anchor).where(Anchor.n == n))).scalar_one_or_none()
+        if a is not None and a.statechain_index is not None:
+            return
+        if a is None:
+            a = Anchor(n=n, event_index=event_index, head_hash=head_hash, session_id=s.id)
+            db.add(a)
+        else:
+            a.event_index, a.head_hash, a.session_id = event_index, head_hash, s.id
+    a.statechain_index = s.submitted_index
+    a.statechain_hash = s.submitted_hash
+
+
+ENDED_WATCH_DAYS = 7
+ENDED_WATCH_MAX = 50
+
+
+async def ended_holding_a_block(db: AsyncSession) -> list[str]:
+    """Sessions that ended `failed` or `cancelled` with a block built, recently enough that the block could
+    still land: the newest `ENDED_WATCH_MAX` of the last `ENDED_WATCH_DAYS` days."""
+    since = datetime.now(timezone.utc) - timedelta(days=ENDED_WATCH_DAYS)
+    q = (select(SigningSession.id).where(SigningSession.status.in_(("failed", "cancelled")),
+                                         SigningSession.block_hash != "", SigningSession.updated_at >= since)
+         .order_by(SigningSession.updated_at.desc(), SigningSession.id.desc()).limit(ENDED_WATCH_MAX))
+    return list((await db.execute(q)).scalars().all())
+
+
+async def reconcile_ended(ctx: Context, db: AsyncSession, s: SigningSession) -> bool:
+    """A session's recorded outcome follows the chain, whatever state it was left in. One that ended
+    without its block on the chain, and whose block is there now (the node applied it after refusing it,
+    or the signed block was sent by another route), is recorded submitted (XE-4148). True if it was."""
+    if s.status not in ("failed", "cancelled") or not await landed(ctx, s):
+        return False
+    await _submitted(ctx, db, s)
+    return True
 
 
 def ready_to_submit(s: SigningSession, ks: dict) -> bool:
@@ -416,6 +491,7 @@ async def submit(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSe
     submits it again (XE-1677, XE-1689, XE-1817)."""
     require_timelock_run(s)
     await require_unpaused(db)
+    require_executable(ctx, s)
     blk = _block_from_session(s)
     try:
         await ctx.chain.submit_statechain_block(blk)
@@ -488,9 +564,11 @@ async def cancel(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified,
     landed is recorded as submitted, not cancelled, whatever the node said at the time (XE-1843, as for
     rebuild and submit). If the chain cannot be read the cancel waits (502). The answer carries the
     session as it now stands."""
-    if s.status in ("submitted", "cancelled"):
+    if s.status not in OPEN:
+        # Ended is ended: a session that was submitted, failed or cancelled is not ended a second time, and
+        # the reason on its row (the node's refusal, for a failed one) is not written over (XE-6873).
         raise HTTPException(409, f"session is {s.status}")
-    if s.status == "signing" and await landed(ctx, s):
+    if s.block and await landed(ctx, s):
         return await _submitted(ctx, db, s)
     s.status = "cancelled"
     s.error = reason

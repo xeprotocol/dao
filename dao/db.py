@@ -38,6 +38,15 @@ async def session() -> AsyncIterator[AsyncSession]:
         yield s
 
 
+def locked(q, *, skip_locked: bool = False):
+    """`q` as a locked read: FOR UPDATE, and the rows as the database holds them now. A session keeps the
+    copy of a row it has already loaded (`expire_on_commit=False` keeps it across commits too), and a
+    locked select that finds the row in the session hands that copy back unless told otherwise: the lock
+    is held and the values under it are old (XE-0960 for proposals, the log head after it, XE-6258 for the
+    rest). Every FOR UPDATE in the tree is taken through here, so none can leave the option off."""
+    return q.with_for_update(skip_locked=skip_locked).execution_options(populate_existing=True)
+
+
 async def serialize(db: AsyncSession, name: str) -> None:
     """Hold a transaction-scoped advisory lock on `name` until this transaction ends. For a value computed
     from the table and then inserted (the next resolution number, the next anchor number, a fee block's

@@ -1033,7 +1033,8 @@ async def test_health_degrades_on_unexpected_keyset_log_tamper_stale_tip_faults_
     db.add(SigningSession(id="ks1", kind="keyset", title="rotate", status="submitted", ops_digest="a" * 64,
                           ops=[{"action": "set", "key": "sys.dao_keyset",
                                 "value": '{"keys":["k2","k3"],"threshold":2}'}],
-                          approvals=[], required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0))
+                          approvals=[], required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0,
+                          submitted_index=5, submitted_hash="5" * 64))
     await db.flush()
     assert not (await _check(ctx, db))["ok"]          # session submitted, chain not yet showing it
     state["keyset"] = {"keys": ["k3", "k2"], "threshold": 2}
@@ -1328,8 +1329,11 @@ async def test_cancelled_or_failed_anchor_session_removes_its_anchor_row(db):
     # the next session takes n = 1 again, and only a submitted one is seen by health
     out2 = await records.open_anchor_session(ctx, db)
     assert (await records.latest_anchor(db)).n == 1
-    await records.note_anchor_submitted(db, out2["id"], 7, "7" * 64)
-    assert (await records.latest_anchor(db, written=True)).n == 1
+    s2 = await sessions.get(db, out2["id"])
+    s2.block, s2.block_hash = {"index": 7, "prev_hash": "6" * 64, "timestamp": 1, "hash": "7" * 64}, "7" * 64
+    await sessions._submitted(ctx, db, s2)
+    a = await records.latest_anchor(db, written=True)
+    assert a.n == 1 and a.statechain_index == 7 and a.statechain_hash == "7" * 64, "the row is written with the session"
 
 
 # ---- XE-1003: the snapshot carries tainted XE forward and spends it first ------------------------
@@ -2735,6 +2739,349 @@ async def test_a_resolution_links_only_a_proposal_that_exists(db):
     assert linked.related_proposal == pr.hash
     for blank in ({}, {"related_proposal": ""}, {"related_proposal": None}):
         assert (await resolutions.propose(ctx, db, proposing(**blank))).related_proposal == ""
+
+
+# ---- XE-6873, XE-4148, XE-6256: an ended session is ended once, and its record follows the chain -----------
+
+async def test_an_ended_session_is_not_ended_again_and_follows_the_chain_if_its_block_lands(db):
+    from dao.services import records, resolutions
+    ctx = _ctx()
+    v = _v()
+    v.seat = _member("founder-a")
+
+    async def refuse(blk):
+        raise XeError(400, "block rejected: epoch key already exists")
+    ctx.chain.submit_statechain_block = refuse
+    ended = {}
+    ended["failed"] = await _signing(db, "e1", index=3, n=1)
+    await sessions.submit(ctx, db, ended["failed"])
+    ended["cancelled"] = await _signing(db, "e2", index=4, n=2)
+    await sessions.cancel(ctx, db, ended["cancelled"], v, "withdrawn")
+    ended["submitted"] = await _signing(db, "e3", index=5, n=3)
+    ctx.chain.state_blocks[5] = {"index": 5, "hash": "h" * 64}
+    await sessions.submit(ctx, db, ended["submitted"])
+    await db.flush()
+    assert {k: s.status for k, s in ended.items()} == {k: k for k in ended}
+    # written with the session, not a worker pass later (XE-6256)
+    a = await records.latest_anchor(db, written=True)
+    assert a.session_id == "e3" and a.statechain_index == 5 and a.statechain_hash == "h" * 64
+    # no ended session is ended a second time, by a cancel or by the withdrawal of its resolution; the
+    # node's words stay on the failed one (XE-6873)
+    words = ended["failed"].error
+    assert "epoch key already exists" in words
+    for status, s in ended.items():
+        n_before = len((await db.execute(select(Event).where(Event.ref == f"session:{s.id}"))).scalars().all())
+        with pytest.raises(HTTPException) as e:
+            await sessions.cancel(ctx, db, s, v, "tidying up")
+        assert e.value.status_code == 409 and status in e.value.detail
+        r = Resolution(id=f"r-{s.id}", number=int(s.id[1:]), title="t", body="b", matter="note", ops=[], proposed_by="founder-a",
+                       status="open", session_id=s.id)
+        db.add(r)
+        await db.flush()
+        await resolutions.withdraw(ctx, db, r, v)
+        assert r.status == "withdrawn" and s.status == status
+        assert len((await db.execute(select(Event).where(Event.ref == f"session:{s.id}"))).scalars().all()) == n_before
+    assert ended["failed"].error == words
+    # nothing landed: the pass over ended sessions changes nothing
+    watched = await sessions.ended_holding_a_block(db)
+    assert set(watched) == {"e1", "e2"}, "the ended sessions that hold a block, and not the submitted one"
+    for s in ended.values():
+        assert not await sessions.reconcile_ended(ctx, db, s)
+    assert {k: s.status for k, s in ended.items()} == {k: k for k in ended}
+    # a different block at that index is not this session's block
+    ctx.chain.state_blocks[3] = {"index": 3, "hash": "9" * 64}
+    assert not await sessions.reconcile_ended(ctx, db, ended["failed"]) and ended["failed"].status == "failed"
+    # the blocks land after all: both are recorded submitted, with what they were, and the anchor rows
+    # that went when they ended are written again from the op (XE-4148)
+    for s, n in ((ended["failed"], 1), (ended["cancelled"], 2)):
+        s.ops = [{"action": "set", "key": f"dao.anchor.{n}", "value": '{"event_index":0,"head_hash":"%s","n":%d}' % ("0" * 64, n)}]
+        ctx.chain.state_blocks[int(s.block["index"])] = {"index": int(s.block["index"]), "hash": s.block_hash}
+        was = s.status
+        assert await sessions.reconcile_ended(ctx, db, s)
+        await db.flush()
+        assert s.status == "submitted" and s.submitted_index == int(s.block["index"])
+        row = (await db.execute(select(Anchor).where(Anchor.session_id == s.id))).scalar_one()
+        assert row.n == n and row.statechain_index == s.submitted_index and row.statechain_hash == s.block_hash
+        ev = (await db.execute(select(Event).where(Event.kind == "session.submitted", Event.ref == f"session:{s.id}"))).scalars().one()
+        assert ev.payload["was"] == was
+    assert await sessions.ended_holding_a_block(db) == []
+    # a chain that cannot be read decides nothing
+    late = await _signing(db, "e9", index=9, n=9)
+    await sessions.submit(ctx, db, late)
+    assert late.status == "failed"
+
+    async def down(index):
+        raise XeError(0, "ReadTimeout")
+    ctx.chain.statechain_block = down
+    with pytest.raises(XeError):
+        await sessions.reconcile_ended(ctx, db, late)
+    assert late.status == "failed"
+
+
+async def test_the_worker_reconciles_ended_sessions_even_while_paused(db, monkeypatch):
+    import inspect
+
+    from dao import worker as worker_mod
+    src = inspect.getsource(worker_mod.Worker.job_sessions)
+    assert "ended_holding_a_block" in src and "reconcile_ended" in src and "note_anchor_submitted" not in src
+    assert src.index("ended_holding_a_block") > src.index("for sid in ids"), "outside the loop a pause empties"
+    from dao.services import records
+    assert not hasattr(records, "note_anchor_submitted"), "one writer of the anchor row: sessions._submitted"
+
+
+# ---- XE-4127: the expected keyset is the one last written to the chain ------------------------------------
+
+async def test_the_expected_keyset_is_the_last_on_the_chain_not_the_row_last_touched(db):
+    from dao.services import records
+
+    def rotation(sid, index, keys):
+        return SigningSession(id=sid, kind="keyset", title="rotate", status="submitted", ops_digest="a" * 64,
+                              ops=[{"action": "set", "key": "sys.dao_keyset", "value": '{"keys":%s,"threshold":2}' % keys}],
+                              approvals=[], required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0,
+                              submitted_index=index, submitted_hash="%064x" % index)
+    older, newer = rotation("k-old", 10, '["k1","k2"]'), rotation("k-new", 20, '["k3","k4"]')
+    db.add_all([newer, older])
+    await db.commit()
+    assert (await records.expected_keyset(db))["keys"] == ["k3", "k4"]
+    # the older row is touched after the newer one (any later write to it): the answer does not move
+    older.title = "rotate (annotated)"
+    await db.commit()
+    db.expunge_all()
+    rows = {s.id: s.updated_at for s in (await db.execute(select(SigningSession))).scalars().all()}
+    assert rows["k-old"] >= rows["k-new"]
+    assert (await records.expected_keyset(db))["keys"] == ["k3", "k4"]
+
+
+# ---- XE-4131: what a session writes is checked against the seats each time it moves toward the chain ------
+
+async def test_a_keyset_session_the_seats_no_longer_meet_is_not_built_signed_or_submitted(db):
+    k1, k2, k3 = (KeyPair.generate() for _ in range(3))
+    ctx = _ctx()
+    signers = [_member("a", ("sign_statechain",), k1.pub_key_hex), _member("b", ("sign_statechain",), k2.pub_key_hex)]
+    ctx.config.human_seats = signers
+    value = '{"keys":["%s","%s"],"threshold":2}' % tuple(sorted((k1.pub_key_hex, k2.pub_key_hex)))
+    ops = [{"action": "set", "key": "sys.dao_keyset", "value": value}]
+    sessions.check_ops("keyset", ops, sessions.seat_keys_of(ctx.config))
+
+    def held(sid, status):
+        s = SigningSession(id=sid, kind="keyset", title="rotate", ops=ops, ops_digest="f" * 64, status=status,
+                           approvals=[{"public_key": "k1"}, {"public_key": "k2"}], required_approvals=2,
+                           block={"index": 1, "prev_hash": "0" * 64, "timestamp": 0, "hash": "h" * 64} if status == "signing" else None,
+                           block_hash="h" * 64 if status == "signing" else "",
+                           block_signatures=[{"public_key": "k1", "signature": "s"}, {"public_key": "k2", "signature": "s"}] if status == "signing" else [],
+                           rebuilds=0, not_before=None)
+        db.add(s)
+        return s
+    sent = []
+
+    async def take(blk):
+        sent.append(blk)
+        return {"ok": True}
+    ctx.chain.submit_statechain_block = take
+    # one seat changes its key, and in the other case keeps the key and loses the right to sign: either
+    # way the approved keyset needs a signature no seat can give
+    for i, changed in enumerate(([signers[0], _member("b", ("sign_statechain",), k3.pub_key_hex)],
+                                 [signers[0], _member("b", ("pause",), k2.pub_key_hex)])):
+        ctx.config.human_seats = changed
+        approving, signing = held(f"a{i}", "approving"), held(f"s{i}", "signing")
+        await db.flush()
+        for move in (lambda: sessions.rebuild(ctx, db, approving), lambda: sessions.rebuild(ctx, db, signing),
+                     lambda: sessions.sign(ctx, db, signing, k1.pub_key_hex, "00" * 64, "a"),
+                     lambda: sessions.submit(ctx, db, signing)):
+            with pytest.raises(HTTPException) as e:
+                await move()
+            assert e.value.status_code == 409 and "can no longer be executed as approved" in e.value.detail
+        assert approving.status == "approving" and signing.status == "signing" and not sent
+        # a member can still end it
+        v = _v()
+        v.seat = _member("founder-a")
+        await sessions.cancel(ctx, db, signing, v, "seats changed")
+        assert signing.status == "cancelled"
+    # with the seats as they were when it was approved, it goes through
+    ctx.config.human_seats = signers
+    ok = held("ok", "signing")
+    await db.flush()
+    await sessions.submit(ctx, db, ok)
+    assert len(sent) == 1
+
+
+# ---- XE-6048: a condition that lasts is logged when it begins and when it ends -----------------------------
+
+async def test_a_degraded_spell_is_one_log_entry_at_each_edge_however_many_checks_it_lasts(db):
+    from dao.services import records
+    ctx, state = _health_ctx()
+    await ctx.events.append(db, "x", "harness", {}, public=True)
+    await db.commit()
+
+    async def check():
+        EventLog._verify_cache = None
+        d = await records.health_pass(ctx, db)
+        await db.commit()
+        return d
+
+    async def logged():
+        rows = (await db.execute(select(Event).where(Event.kind.in_(("health.degraded", "health.recovered"))).order_by(Event.index))).scalars().all()
+        return [(e.kind, e.payload.get("failing") or e.payload.get("was_failing")) for e in rows]
+    for _ in range(3):
+        assert (await check())["ok"]
+    assert await logged() == [], "a healthy check adds nothing to the log"
+    state["fail"].add("tip")
+    for _ in range(4):
+        d = await check()
+        assert not d["ok"] and d["failing"] == ["statechain_error"]
+    assert await logged() == [("health.degraded", ["statechain_error"])], "one entry for the spell, not one a check"
+    # what is failing changes: said once more
+    state["fail"].add("keyset")
+    for _ in range(3):
+        await check()
+    assert (await logged())[1:] == [("health.degraded", ["keyset_error", "statechain_error"])]
+    state["fail"].clear()
+    for _ in range(3):
+        assert (await check())["ok"]
+    assert (await logged())[2:] == [("health.recovered", ["keyset_error", "statechain_error"])]
+    # every check is still a row: uptime is counted from those, not from the log
+    assert len((await db.execute(select(HealthCheck))).scalars().all()) == 13
+    # each way a check is not ok is on the list by name, and `ok` is the list being empty
+    state["ready"] = False
+    state["tip"]["timestamp"] = time.time_ns() - 10 * 3600 * 10**9
+    d = await check()
+    assert d["failing"] == ["node_not_ready", "tip_stale"] and not d["ok"]
+    # a lapsed directory entry is one of them (XE-12324)
+    state["ready"], state["tip"]["timestamp"] = True, time.time_ns()
+    ctx.signer._kp["dao"] = KeyPair.generate()
+    EventLog._verify_cache = None
+    d = await records.health(ctx, db)
+    assert d["failing"] == ["directory_unregistered"] and not d["ok"]
+    # the edge rule on its own
+    edge = records.health_edge
+    bad, worse, good = {"ok": False, "failing": ["a"]}, {"ok": False, "failing": ["a", "b"]}, {"ok": True, "failing": []}
+    assert [edge(None, good), edge(good, good), edge(None, bad), edge(good, bad), edge(bad, bad), edge(bad, worse), edge(bad, good)] == \
+        [None, None, "health.degraded", "health.degraded", None, "health.degraded", "health.recovered"]
+    assert edge({"ok": False}, bad) == "health.degraded", "a row from before the list existed starts the spell once"
+
+
+async def test_a_failed_directory_registration_is_retried_soon_and_logged_once_a_spell(db, monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from dao import worker as worker_mod
+    from dao import worker_schedule as ws
+    ctx = _ctx()
+    ctx.signer = FakeSigner(("harness", "fee", "dao"))
+    ctx.directory_node_peer = "12D3KooWTestPeer"
+    ctx.config.cadence = {"directory_reregister_minutes": 20}
+    answers = {"fail": True, "calls": 0, "identity": ""}
+
+    async def register(reg):
+        answers["calls"] += 1
+        if answers["fail"]:
+            raise XeError(503, "directory unavailable")
+
+    async def refresh_node():
+        ctx.node.network_id = answers["identity"]
+    ctx.chain.directory_register, ctx.refresh_node = register, refresh_node
+    sm = async_sessionmaker(db.bind, expire_on_commit=False)
+
+    @asynccontextmanager
+    async def fake_session():
+        async with sm() as s:
+            yield s
+    monkeypatch.setattr(worker_mod, "session", fake_session)
+    w = worker_mod.Worker(ctx)
+
+    async def events():
+        rows = (await db.execute(select(Event).where(Event.kind.like("directory.%")).order_by(Event.index))).scalars().all()
+        return [e.kind for e in rows]
+    # a node that has not said which network it is: asked again, and the run is a failure on the record
+    ctx.node.network_id = ""
+    await w.job_directory()
+    assert answers["calls"] == 0 and await events() == ["directory.register_failed"]
+    answers["identity"] = "xe-test"
+    for _ in range(3):
+        await w.job_directory()
+    assert answers["calls"] == 3 and await events() == ["directory.register_failed"], "one entry for the spell"
+    db.expire_all()   # the mark is written through a session of the worker's own
+    last = (await ws.last_runs(db))["directory"]
+    assert not ws.due_interval(last, 1200) and time.time_ns() - last >= (1200 - worker_mod.DIRECTORY_RETRY_S) * ws.NS, \
+        "due again a retry interval from now, not a cadence from now"
+    assert (await ws.last_detail(db, "directory"))["failures"] == 4
+    answers["fail"] = False
+    await w.job_directory()
+    await w.job_directory()
+    assert await events() == ["directory.register_failed", "directory.registered"]
+    db.expire_all()
+    assert time.time_ns() - (await ws.last_runs(db))["directory"] < 60 * ws.NS, "a good run is marked as run now"
+
+
+# ---- XE-4601 / XE-3250: waiting work is listed oldest first with a count, and every page has a total order ----
+
+async def test_waiting_work_is_listed_oldest_first_with_a_count_and_pages_have_a_total_order(db):
+    import inspect
+
+    from dao.services import pause, resolutions
+    ctx = _ctx()
+    now = time.time_ns()
+    n = 205
+    for i in range(n):
+        h = "%064x" % (i + 1)
+        db.add(Proposal(hash=h, title=f"p{i}", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64,
+                        author_signature="s", author_timestamp=now, fee_block_hash=h, status="closed",
+                        opened_at=now - (n - i) * 1000 if i >= 5 else now - 10**15, closes_at=now - 1, rules={}, analysis=[],
+                        result={"outcome": "passed", "participating_wallets": 0, "quorum_wallets": 20}))
+        db.add(Resolution(id=f"r{i}", number=i + 1, title="t", body="b", matter="note", ops=[], proposed_by="founder-a",
+                          status="open" if i < 3 else "passed"))
+    await db.flush()
+    assert await portal.count_awaiting_decision(db) == n
+    first = await portal.awaiting_decision(db, 200)
+    assert len(first) == 200 and [p.title for p in first[:6]] == ["p0", "p1", "p2", "p3", "p4", "p5"], \
+        "the longest waiting are on the first page, and rows opened at one instant come in one order"
+    rest = await portal.awaiting_decision(db, 200, offset=200)
+    assert {p.hash for p in first} | {p.hash for p in rest} == {"%064x" % (i + 1) for i in range(n)} and len(rest) == 5
+    # the register: a page, a total, and the open ones whole
+    assert await resolutions.count_resolutions(db) == n and await resolutions.count_resolutions(db, "open") == 3
+    page = await resolutions.list_resolutions(db)
+    assert len(page) == 200 and page[0].number == n
+    assert [r.number for r in await resolutions.list_resolutions(db, offset=200)] == [5, 4, 3, 2, 1]
+    assert [r.number for r in await resolutions.open_resolutions(db)] == [1, 2, 3], "past the first page of the register, and still listed"
+    # every paged or limited listing ends its order on the primary key
+    for fn, key in ((sessions.list_sessions, "SigningSession.id"), (sessions.open_sessions, "SigningSession.id"),
+                    (portal.list_proposals, "Proposal.hash"), (portal.awaiting_decision, "Proposal.hash"),
+                    (inbox.list_messages, "InboxMessage.id"), (inbox.list_public, "InboxMessage.id"),
+                    (inbox.list_untriaged, "InboxMessage.id"), (pause.history, "PauseRecord.id")):
+        src = inspect.getsource(fn)
+        assert key in src[src.index("order_by("):].split("\n")[0], fn.__name__
+
+
+# ---- XE-6258: a row read under its lock is read as the database holds it now ------------------------------
+
+async def test_a_locked_read_returns_the_row_as_it_is_now_not_the_copy_the_session_holds(db):
+    import pathlib
+
+    from dao.models import PauseRecord
+    from dao.services import resolutions
+    s = SigningSession(id="lk1", kind="parameter", title="t", ops=[], ops_digest="d", status="approving", approvals=[],
+                       required_approvals=2, block=None, block_hash="", block_signatures=[], rebuilds=0)
+    r = Resolution(id="lk2", number=1, title="t", body="b", matter="note", ops=[], proposed_by="founder-a")
+    m = InboxMessage(id="lk3", channel="http", from_account="c" * 64, to_account="d" * 64, body="hi", timestamp=1,
+                     verified=True, status="new")
+    db.add_all([s, r, m])
+    await db.commit()
+    async with async_sessionmaker(db.bind, expire_on_commit=False)() as other:
+        await other.execute(text("UPDATE signing_sessions SET status = 'cancelled' WHERE id = 'lk1'"))
+        await other.execute(text("UPDATE resolutions SET status = 'withdrawn' WHERE id = 'lk2'"))
+        await other.execute(text("UPDATE inbox_messages SET status = 'closed' WHERE id = 'lk3'"))
+        await other.commit()
+    assert (s.status, r.status, m.status) == ("approving", "open", "new"), "this session still holds what it loaded"
+    assert (await sessions.get(db, "lk1")).status == "approving", "an unlocked read hands back the held copy"
+    assert (await sessions.get(db, "lk1", lock=True)).status == "cancelled"
+    assert (await resolutions.get(db, "lk2", lock=True)).status == "withdrawn"
+    assert (await inbox.get(db, "lk3", lock=True)).status == "closed"
+    await db.rollback()
+    # and no FOR UPDATE in the tree is taken any other way than through `db.locked`
+    root = pathlib.Path(sessions.__file__).resolve().parents[1]
+    outside = [str(f.relative_to(root)) for f in root.rglob("*.py") if ".with_for_update(" in f.read_text() and f.name != "db.py"]
+    assert outside == [], outside
+
+
 # ---- XE-4593: a message is public from when its text reaches the public log, whatever its status after ----
 
 async def test_a_published_message_stays_public_and_out_of_the_untriaged_list_whatever_its_status(db):

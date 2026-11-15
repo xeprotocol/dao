@@ -7,7 +7,7 @@ resolution.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 
 from .. import __version__
 from ..log import EventLog
@@ -39,7 +39,8 @@ async def identifier(request: Request, ctx: Ctx, db: Db):
             "update_authority": "sys.dao_keyset",
             "keyset": ks,
             "registry_key": "dao.registry",
-            "registry_present": onchain is not None,
+            "registry_present": records.registry_present(onchain),
+            **({"registry_error": onchain["error"]} if "error" in onchain else {}),
             "registry_endpoint": f"{ctx.settings.xe_node_url}/statechain/kv/dao.registry",
             "keyset_endpoint": f"{ctx.settings.xe_node_url}/statechain/keyset",
         },
@@ -62,7 +63,10 @@ async def identifier(request: Request, ctx: Ctx, db: Db):
 async def registry(request: Request, ctx: Ctx):
     """dao.registry as intended (from config) and as present on the state chain."""
     enforce_ip(request, NODE_READ)
-    return {"intended": records.registry_value(ctx), "onchain": await records.onchain_registry(ctx)}
+    read = await records.onchain_registry(ctx)
+    if "error" in read:
+        return {"intended": records.registry_value(ctx), "error": read["error"]}
+    return {"intended": records.registry_value(ctx), "onchain": read["value"]}
 
 
 @router.get("/keyset")
@@ -96,9 +100,11 @@ async def schedule(ctx: Ctx):
 
 
 @router.get("/resolutions")
-async def list_resolutions(ctx: Ctx, db: Db, status: str | None = None):
-    rows = await resolutions.list_resolutions(db, status)
-    return {"resolutions": [resolutions.to_dict(r, ctx.config) for r in rows]}
+async def list_resolutions(ctx: Ctx, db: Db, status: str | None = Query(None, max_length=32),
+                           offset: int = Query(0, ge=0, le=2**31 - 1), limit: int = Query(200, ge=1, le=200)):
+    rows = await resolutions.list_resolutions(db, status, limit, offset)
+    return {"resolutions": [resolutions.to_dict(r, ctx.config) for r in rows],
+            "total": await resolutions.count_resolutions(db, status), "offset": offset, "limit": limit}
 
 
 @router.get("/resolutions/{res_id}")
@@ -107,14 +113,17 @@ async def get_resolution(res_id: str, ctx: Ctx, db: Db):
 
 
 @router.get("/pause")
-async def pause_state(ctx: Ctx, db: Db):
+async def pause_state(ctx: Ctx, db: Db, offset: int = Query(0, ge=0, le=2**31 - 1), limit: int = Query(50, ge=1, le=200)):
+    """`history` is a page, newest first, and `history_total` how many there are: every pause there has
+    been can be read (XE-4601)."""
     a = await pause_svc.active(db)
     return {
         "paused": a is not None,
         "active": pause_svc.to_dict(ctx, a) if a else None,
         "rules": ctx.config.pause,
         "notice": ctx.config.copy_legal.get("pause_notice", "").strip(),
-        "history": [pause_svc.to_dict(ctx, r) for r in await pause_svc.history(db)],
+        "history": [pause_svc.to_dict(ctx, r) for r in await pause_svc.history(db, limit, offset)],
+        "history_total": await pause_svc.count_history(db), "offset": offset, "limit": limit,
     }
 
 
@@ -125,5 +134,6 @@ async def treasury(request: Request, ctx: Ctx):
 
 
 @router.get("/anchors")
-async def anchors(db: Db):
-    return {"anchors": await records.anchors(db)}
+async def anchors(db: Db, offset: int = Query(0, ge=0, le=2**31 - 1), limit: int = Query(50, ge=1, le=200)):
+    return {"anchors": await records.anchors(db, limit, offset), "total": await records.count_anchors(db),
+            "offset": offset, "limit": limit}

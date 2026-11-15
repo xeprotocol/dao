@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from datetime import datetime, timezone
@@ -80,13 +81,23 @@ async def public_keyset(ctx: Context) -> dict:
     return await _shared("keyset", read)
 
 
-async def onchain_registry(ctx: Context) -> dict | None:
+async def onchain_registry(ctx: Context) -> dict:
+    """`dao.registry` as the chain holds it, for display: {"value": what is written, or None if the key
+    is not set} or, when the node could not be read, {"error": ...}. The two are different answers: a
+    read that failed says nothing about whether the entry is there, and reported as "not written" it
+    had the legal identifier deny an entry that exists whenever the node was slow (XE-8855, the rule
+    `public_keyset` keeps)."""
     async def read():
         try:
-            return await ctx.chain.statechain_key("dao.registry")
-        except XeError:
-            return None
+            return {"value": await ctx.chain.statechain_key("dao.registry")}
+        except XeError as e:
+            return {"error": str(e)}
     return await _shared("registry", read)
+
+
+def registry_present(read: dict) -> bool | None:
+    """True or False as the chain says; None when it could not be asked."""
+    return None if "error" in read else read["value"] is not None
 
 
 async def _sole_open(db: AsyncSession, kind: str) -> None:
@@ -136,15 +147,12 @@ async def open_anchor_session(ctx: Context, db: AsyncSession, actor: str = "harn
     return sessions.to_dict(s)
 
 
-async def note_anchor_submitted(db: AsyncSession, session_id: str, index: int, h: str) -> None:
-    a = (await db.execute(select(Anchor).where(Anchor.session_id == session_id))).scalar_one_or_none()
-    if a:
-        a.statechain_index = index
-        a.statechain_hash = h
+async def count_anchors(db: AsyncSession) -> int:
+    return int((await db.execute(select(func.count()).select_from(Anchor))).scalar_one())
 
 
-async def anchors(db: AsyncSession, limit: int = 50) -> list[dict]:
-    rows = (await db.execute(select(Anchor).order_by(Anchor.n.desc()).limit(limit))).scalars().all()
+async def anchors(db: AsyncSession, limit: int = 50, offset: int = 0) -> list[dict]:
+    rows = (await db.execute(select(Anchor).order_by(Anchor.n.desc()).offset(offset).limit(limit))).scalars().all()
     return [{"n": a.n, "event_index": a.event_index, "head_hash": a.head_hash, "session_id": a.session_id,
              "statechain_index": a.statechain_index, "statechain_hash": a.statechain_hash,
              "created_at": a.created_at.isoformat() if a.created_at else None} for a in rows]
@@ -204,9 +212,13 @@ def _keyset_shape(ks: dict | None) -> dict | None:
 
 async def expected_keyset(db: AsyncSession) -> dict | None:
     """The keyset the members last wrote through a keyset session; before any, the keyset as it was when
-    the harness started watching (the earliest health check that saw one)."""
-    s = (await db.execute(select(SigningSession).where(SigningSession.kind == "keyset", SigningSession.status == "submitted")
-                          .order_by(SigningSession.updated_at.desc()).limit(1))).scalar_one_or_none()
+    the harness started watching (the earliest health check that saw one). Last is by place on the chain
+    (`submitted_index`), not by when the row was last touched: `updated_at` moves with any later write to
+    the row, and an older rotation touched after a newer one made health report the live keyset as
+    changed (XE-4127)."""
+    s = (await db.execute(select(SigningSession).where(SigningSession.kind == "keyset", SigningSession.status == "submitted",
+                                                       SigningSession.submitted_index.isnot(None))
+                          .order_by(SigningSession.submitted_index.desc()).limit(1))).scalar_one_or_none()
     if s is not None:
         for op in s.ops or []:
             try:
@@ -308,12 +320,53 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
     errors = sorted(k for k in detail if k.endswith("_error"))
     if errors:
         detail["errors"] = errors
-        ok = False
+    # Everything that makes the check not ok, by name, in one list: the legs that could not be read and
+    # the ones that read something wrong. `ok` is that list being empty, and the list is what tells one
+    # degraded spell from the next (`health_edge`). A directory entry that has lapsed is on it: nothing
+    # sent to the DAO over chat arrives while it is missing (XE-12324).
+    failing = set(errors) | {k for k in ("tip_stale", "keyset_unexpected", "anchor_overdue") if detail.get(k)}
+    if not detail.get("node_ready") and "node_error" not in detail:
+        failing.add("node_not_ready")
+    if detail.get("log_verified") is False:
+        failing.add("log_unverified")
+    if detail.get("directory_registered") is False:
+        failing.add("directory_unregistered")
+    ok = not failing
+    detail["failing"] = sorted(failing)
     detail["ok"] = ok
     detail["ts"] = now
     if record:
         db.add(HealthCheck(ts=now, ok=ok, detail=detail))
     return detail
+
+
+def health_edge(before: dict | None, now: dict) -> str | None:
+    """What a health check adds to the public log, given the check before it: `health.degraded` when a
+    spell begins or what is failing changes, `health.recovered` when it ends, nothing while it lasts. A
+    condition that persists across passes is written when it begins and when it ends, as the other
+    writers do (`sessions._deferred`, `resolutions._owed`, `fees._note`); written on every failing pass
+    it was 144 signed public entries a day for one fault (XE-6048). The per-check record that uptime is
+    counted from is the `HealthCheck` row, which every pass still writes."""
+    was_ok = before is None or bool(before.get("ok"))
+    if now["ok"]:
+        return None if was_ok else "health.recovered"
+    if was_ok or before.get("failing") != now.get("failing"):
+        return "health.degraded"
+    return None
+
+
+async def health_pass(ctx: Context, db: AsyncSession) -> dict:
+    """One scheduled check: the row, and the log entry if this check is an edge (`health_edge`)."""
+    before = await last_health(db)
+    d = await health(ctx, db, record=True)
+    edge = health_edge(before, d)
+    if edge == "health.degraded":
+        await ctx.events.append(db, edge, "harness", {k: v for k, v in d.items() if k != "node"}, public=True)
+    elif edge == "health.recovered":
+        await ctx.events.append(db, edge, "harness", {
+            "was_failing": (before or {}).get("failing") or (before or {}).get("errors") or [], "ts": d["ts"],
+        }, public=True)
+    return d
 
 
 def health_age_s(last: dict | None, now_ns: int | None = None) -> int | None:
@@ -359,6 +412,23 @@ async def uptime_30d(ctx: Context, db: AsyncSession) -> dict:
         return {"checks": 0, "ok": 0, "expected": 0, "fraction": None}
     expected = max(total, expected_checks([(int(ts), int(c) if c else None) for ts, _, c in rows], max(since, first), now, cadence_s(ctx)))
     return {"checks": total, "ok": good, "expected": expected, "fraction": (good / expected) if expected else None}
+
+
+UPTIME_SHOWN_S = 60.0
+_uptime_shown: tuple[float, dict] | None = None
+_uptime_lock = asyncio.Lock()
+
+
+async def uptime_30d_shown(ctx: Context, db: AsyncSession) -> dict:
+    """`uptime_30d` for a public read: worked out at most once a minute in each process, and handed to
+    every request in between. The figure is a pass over thirty days of checks and moves only when the
+    worker records one, every ten minutes; computed per request, anyone could have it computed as often
+    as they could ask (XE-6119). One caller computes while the rest wait for its answer."""
+    global _uptime_shown
+    async with _uptime_lock:
+        if _uptime_shown is None or time.monotonic() - _uptime_shown[0] >= UPTIME_SHOWN_S:
+            _uptime_shown = (time.monotonic(), await uptime_30d(ctx, db))
+        return _uptime_shown[1]
 
 
 def expected_checks(rows: list[tuple[int, int | None]], start_ns: int, now_ns: int, default_s: int) -> int:

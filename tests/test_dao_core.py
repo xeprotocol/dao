@@ -1559,7 +1559,7 @@ async def test_the_snapshot_preview_answers_what_the_vote_would(monkeypatch):
     # of a proposal is under the rules that proposal pinned, as its votes are, not under these
     today = {"participating_wallet": {"min_balance_micro_xe": 1}, "weight_asset": "XE", "excluded_accounts": [], "agents": {}}
     ctx = SimpleNamespace(chain=chain, config=SimpleNamespace(pinned_rules=lambda: today, agent_accounts={agent}))
-    proposals = {f"{i:064x}": SimpleNamespace(rules=rules, opened_at=at + SNAPSHOT_LEAD_NS) for i, at in enumerate((T, T - 15 * H, 0))}
+    proposals = {f"{i:064x}": SimpleNamespace(rules=rules, opened_at=at + SNAPSHOT_LEAD_NS, status="open") for i, at in enumerate((T, T - 15 * H, 0))}
 
     async def get(db, h):
         if h not in proposals:
@@ -1670,6 +1670,39 @@ async def test_a_block_signature_from_a_key_no_longer_in_the_keyset_is_counted_n
     # the second live signature is the one that sends it
     await sessions.sign(ctx, None, s, k2.pub_key_hex, sig(k2), "member:b")
     assert submitted == [3] and sessions.ready_to_submit(s, ks) and await sessions._moved_under(ctx, s) is None
+
+
+# ---- XE-3709: the log is replayed once at a time, whoever asks ----------------------------------
+
+async def test_callers_that_arrive_during_a_replay_wait_for_it_and_share_its_answer(monkeypatch):
+    import asyncio
+
+    from dao.log import EventLog
+    replays, release = [], asyncio.Event()
+
+    async def slow(db, expected_signer=""):
+        replays.append(expected_signer)
+        await release.wait()
+        return {"ok": True, "count": len(replays), "head": "h", "first_error": None}
+
+    monkeypatch.setattr(EventLog, "verify", staticmethod(slow))
+    monkeypatch.setattr(EventLog, "_verify_cache", None)
+    monkeypatch.setattr(EventLog, "_verify_lock", None)
+    waiting = [asyncio.ensure_future(EventLog.verify_cached(None, "k")) for _ in range(25)]
+    for _ in range(5):
+        await asyncio.sleep(0)   # every caller has found the cache empty and is at the lock or past it
+    assert len(replays) == 1
+    release.set()
+    out = await asyncio.gather(*waiting)
+    assert len(replays) == 1 and [o["count"] for o in out] == [1] * 25
+    assert [o["cached"] for o in out].count(False) == 1   # the one that ran it; the rest took its answer
+    # the answer is kept from when the replay ended, so one that took most of the minute is not stale at once
+    assert (await EventLog.verify_cached(None, "k"))["cached"] is True and len(replays) == 1
+    monkeypatch.setattr(EventLog, "_verify_cache", (EventLog._verify_cache[0] - EventLog.VERIFY_CACHE_S - 1, out[0]))
+    assert (await EventLog.verify_cached(None, "k"))["cached"] is False and len(replays) == 2
+
+
+
 # ---- XE-10452: a per-client allowance is counted against the client's network ------------------------------
 
 def test_a_client_allowance_is_keyed_by_network_not_by_one_address(monkeypatch):
@@ -1847,6 +1880,59 @@ def test_the_keyfile_is_created_private_and_replaced_whole_by_both_writers(tmp_p
     assert "write_text" not in src and src.count("os.replace(") == 1 and src.count("_write_keyfile(path, contents, passphrase)") == 2
 
 
+# ---- XE-3974: a use of a company key that was refused is counted where it was refused ----------------------
+
+def test_a_refused_use_of_a_key_is_counted_by_the_signer_and_logged_once_per_spell():
+    import asyncio
+
+    from dao import worker as worker_mod
+    s = Signer({"fee": KeyPair.generate()}, {"fee": {"block.receive"}})
+    s.keypair("fee", "block.receive")
+    assert s.drain_denials() == [], "an allowed use is not a refusal"
+    for name, scope in (("fee", "block.burn"), ("fee", "block.burn"), ("dao", "chat.send")):
+        with pytest.raises(SignerError):
+            s.keypair(name, scope)
+    with pytest.raises(SignerError):
+        s.sign("fee", "event.sign", b"x")     # `sign` goes through `keypair`
+    want = [{"key": "dao", "scope": "chat.send", "count": 1}, {"key": "fee", "scope": "block.burn", "count": 2},
+            {"key": "fee", "scope": "event.sign", "count": 1}]
+    logged = []
+
+    class Events:
+        async def append(self, db, kind, actor, payload, **kw):
+            logged.append((kind, actor, payload, kw))
+    w = worker_mod.Worker.__new__(worker_mod.Worker)
+    w.ctx = SimpleNamespace(signer=s, events=Events())
+    asyncio.run(w._log_signer_denials(None))
+    assert logged == [("signer.denied", "harness", {"denied": want}, {"public": True})]
+    assert s.drain_denials() == [], "the count starts again"
+    # the same refusals going on are not an entry per check; a change in what is refused is
+    for _ in range(3):
+        for name, scope in (("fee", "block.burn"), ("dao", "chat.send"), ("fee", "event.sign")):
+            with pytest.raises(SignerError):
+                s.keypair(name, scope)
+        asyncio.run(w._log_signer_denials(None))
+    assert len(logged) == 1
+    with pytest.raises(SignerError):
+        s.keypair("fee", "block.send.refund")
+    asyncio.run(w._log_signer_denials(None))
+    # the entry for the change counts every refusal since the last entry, the three checks in between included
+    assert len(logged) == 2 and logged[1][2] == {"denied": [
+        {"key": "dao", "scope": "chat.send", "count": 3}, {"key": "fee", "scope": "block.burn", "count": 3},
+        {"key": "fee", "scope": "block.send.refund", "count": 1}, {"key": "fee", "scope": "event.sign", "count": 3}]}
+    asyncio.run(w._log_signer_denials(None))   # nothing refused and nothing uncounted: nothing logged, and the spell is over
+    assert len(logged) == 2
+    for _ in range(2):
+        with pytest.raises(SignerError):
+            s.keypair("fee", "block.send.refund")
+        asyncio.run(w._log_signer_denials(None))
+    assert len(logged) == 3 and logged[2][2] == {"denied": [{"key": "fee", "scope": "block.send.refund", "count": 1}]}
+    asyncio.run(w._log_signer_denials(None))   # the spell stops with a refusal no entry has counted: a closing entry counts it
+    assert len(logged) == 4 and logged[3][2] == {"denied": [{"key": "fee", "scope": "block.send.refund", "count": 1}], "ended": True}
+    asyncio.run(w._log_signer_denials(None))
+    assert len(logged) == 4
+
+
 # ---- XE-6656 / XE-4124 / XE-5982: what a signed request may carry is settled before anything hashes it -----
 
 def test_a_signed_request_carries_no_float_no_deep_nesting_and_a_u64_nonce():
@@ -1991,6 +2077,33 @@ def test_the_node_identity_has_a_network_only_when_the_node_reports_the_configur
     assert Settings.model_fields["xe_network_id"].default == "", "there is no network a deployment is for by default"
 
 
+# ---- XE-6119: a public figure that costs a pass over stored history is worked out once an interval ---------
+
+async def test_the_public_uptime_figure_is_computed_once_an_interval_however_many_ask(monkeypatch):
+    import asyncio
+    import inspect
+
+    from dao.api import public
+    from dao.services import records
+    calls = []
+
+    async def counted(ctx, db):
+        calls.append(1)
+        await asyncio.sleep(0.01)
+        return {"n": len(calls)}
+    monkeypatch.setattr(records, "uptime_30d", counted)
+    monkeypatch.setattr(records, "_uptime_shown", None)
+    monkeypatch.setattr(records, "_uptime_lock", asyncio.Lock())
+    got = await asyncio.gather(*(records.uptime_30d_shown(None, None) for _ in range(25)))
+    assert calls == [1] and got == [{"n": 1}] * 25, "twenty-five requests at once, one pass over the checks"
+    assert await records.uptime_30d_shown(None, None) == {"n": 1}
+    monkeypatch.setattr(records, "_uptime_shown", (time.monotonic() - records.UPTIME_SHOWN_S - 1, {"n": 1}))
+    assert await records.uptime_30d_shown(None, None) == {"n": 2} and await records.uptime_30d_shown(None, None) == {"n": 2}
+    assert len(calls) == 2
+    assert "uptime_30d_shown(" in inspect.getsource(public.health) and "uptime_30d(" not in inspect.getsource(public.health)
+    assert records.UPTIME_SHOWN_S <= 600, "no staler than the cadence the figure moves on"
+
+
 # ---- XE-11401: a path that exists answers for the method it takes -------------------------------------------
 
 def test_the_two_session_opening_paths_read_with_get_say_which_method_they_take():
@@ -2072,6 +2185,28 @@ async def test_a_registry_read_that_failed_says_so_and_is_not_reported_as_absent
     assert "registry_present" in inspect.getsource(legal), "the legal identifier asks the three-way question"
 
 
+# ---- XE-2475 / XE-12010 / XE-3711 / XE-11041: rules held where a run cannot reach them ---------------------
+
+def test_identity_is_asked_again_rows_are_locked_before_the_log_and_the_browser_signer_refuses_what_it_cannot_sign():
+    import inspect
+
+    from dao import main, worker
+    from dao.services import resolutions
+    # the node's identity is not read once at start: the worker asks with each health check, the API on a timer
+    assert "await self.ctx.refresh_node()" in inspect.getsource(worker.Worker.job_health)
+    lifespan = inspect.getsource(main)
+    assert "await asyncio.sleep(NODE_REFRESH_S if ctx.node.network_id else NODE_RETRY_S)" in lifespan
+    assert "await ctx.refresh_node()" in lifespan
+    assert 0 < main.NODE_RETRY_S < main.NODE_REFRESH_S <= 600, "and sooner while the network is not confirmed"
+    # withdraw takes the session row before its first append, the order every other writer takes them in
+    src = inspect.getsource(resolutions.withdraw)
+    assert src.index("sessions.get(db, r.session_id, lock=True)") < src.index("ctx.events.append(")
+    # signer.js: hex is hex or it is refused; an integer the page cannot hold exactly is not signed
+    js = (Path(main.__file__).parent / "static" / "signer.js").read_text(encoding="utf-8")
+    assert "/^(?:[0-9a-f]{2})*$/.test(h)" in js and "Number.isSafeInteger(v)" in js and "Number.isInteger(v)" in js
+    assert "buf.set(pub, 8 + digest.length)" in js, "and the proof of work is over the digest and the signer's key (XE-11360)"
+
+
 # ---- the sibling sweep of 15 November: each rule at the sites the first fixes had not reached ---------------
 
 def test_a_deployment_that_has_not_confirmed_who_it_is_accepts_no_signed_request():
@@ -2148,6 +2283,46 @@ async def test_what_the_client_keeps_of_a_keyset_and_a_balance_is_bounded_field_
     import inspect
     assert "deadline_s=CHAT_STORE_DEADLINE_S" in inspect.getsource(xc.XeClient.chat_messages)
     assert xc.CHAT_STORE_DEADLINE_S > xc.REQUEST_DEADLINE_S and inspect.getsource(xc.XeClient).count("deadline_s=CHAT_STORE_DEADLINE_S") == 1
+
+
+async def test_an_anchor_number_belongs_to_the_block_the_chain_holds():
+    """XE-6256 / XE-4148. An ended session's block lands after a later session has taken its number: the
+    register row goes to the block that is on the chain. A row that already names a block there stands."""
+    from dao.models import Anchor
+    from dao.services import sessions
+
+    class Db:
+        def __init__(self, *answers):
+            self.answers, self.added = list(answers), []
+
+        async def execute(self, _stmt):
+            row = self.answers.pop(0)
+            return SimpleNamespace(scalar_one_or_none=lambda: row)
+
+        def add(self, row):
+            self.added.append(row)
+    s = SimpleNamespace(id="s2", ops=[{"value": json.dumps({"n": 7, "event_index": 70, "head_hash": "h2"})}],
+                        submitted_index=12, submitted_hash="bh")
+
+    def row(index):
+        return SimpleNamespace(n=7, event_index=60, head_hash="h1", session_id="s1", statechain_index=index, statechain_hash="")
+    waiting = row(None)
+    db = Db(None, waiting)
+    await sessions._anchor_written(db, s)
+    assert (waiting.session_id, waiting.event_index, waiting.head_hash, waiting.statechain_index, waiting.statechain_hash) \
+        == ("s2", 70, "h2", 12, "bh") and db.added == []
+    written = row(5)
+    db = Db(None, written)
+    await sessions._anchor_written(db, s)
+    assert (written.session_id, written.event_index, written.statechain_index) == ("s1", 60, 5) and db.added == []
+    db = Db(None, None)
+    await sessions._anchor_written(db, s)
+    assert len(db.added) == 1 and isinstance(db.added[0], Anchor)
+    assert (db.added[0].n, db.added[0].session_id, db.added[0].statechain_index, db.added[0].statechain_hash) == (7, "s2", 12, "bh")
+    own = row(None)
+    db = Db(own)
+    await sessions._anchor_written(db, s)
+    assert (own.statechain_index, own.statechain_hash, own.event_index) == (12, "bh", 60), "its own row is filled as it is"
 
 
 def test_small_rules_of_the_sweep_hold_where_they_are_stated():

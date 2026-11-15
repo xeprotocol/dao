@@ -16,19 +16,20 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from xe.client import XeError
+from xe.client import UNREACHABLE, XeError
 from xe.directory import new_registration
 
 from .auth import purge_seen_signatures
 from .context import Context, build_context, set_context
-from .db import only_one, session
+from .db import locked, only_one, session
 from .log import EventLog
 from .models import SigningSession
 from .services import fees, inbox, pause, portal, records, resolutions, sessions
-from .worker_schedule import due_at, due_interval, job_table, last_runs, mark_run
+from .worker_schedule import due_at, due_interval, job_table, last_detail, last_runs, mark_failed, mark_run
 
 log = logging.getLogger("dao.worker")
 NS = 1_000_000_000
+DIRECTORY_RETRY_S = 120   # a failed registration is tried again this soon; the entry lapses on the node's clock
 
 
 class Worker:
@@ -39,32 +40,67 @@ class Worker:
     # ---- jobs -----------------------------------------------------------------------------
 
     async def job_health(self):
+        # The node's identity is asked again with each check, so a process that started while the node was
+        # down, or outlived a change of difficulty, does not keep what it had at boot (XE-2475). A node
+        # that does not answer leaves it as it is.
+        await self.ctx.refresh_node()
         async with session() as db:
-            d = await records.health(self.ctx, db, record=True)
-            if not d["ok"]:
-                await self.ctx.events.append(db, "health.degraded", "harness", {k: v for k, v in d.items() if k != "node"}, public=True)
+            d = await records.health_pass(self.ctx, db)
+            await self._log_signer_denials(db)
             await mark_run(db, "health", {"ok": d["ok"]}, every_s=records.cadence_s(self.ctx))
             await db.commit()
+
+    async def _log_signer_denials(self, db) -> None:
+        """Uses of a company key the signer refused since the last check, onto the log (XE-3974). Like a
+        degraded spell (XE-6048), a refusal that goes on is one entry when it starts, one when what is
+        being refused changes and one when it stops, not one per check. No refusal goes uncounted for
+        that: the checks in between are carried, and each entry counts every use since the one before it."""
+        denied = self.ctx.signer.drain_denials()
+        pairs = [(x["key"], x["scope"]) for x in denied]
+        carried = getattr(self, "_denied_carried", {})
+        for x in denied:
+            carried[(x["key"], x["scope"])] = carried.get((x["key"], x["scope"]), 0) + x["count"]
+        if (denied and pairs != getattr(self, "_denied_before", [])) or (not denied and carried):
+            entry = [{"key": k, "scope": sc, "count": n} for (k, sc), n in sorted(carried.items())]
+            await self.ctx.events.append(db, "signer.denied", "harness",
+                                         {"denied": entry, **({} if denied else {"ended": True})}, public=True)
+            carried = {}
+        self._denied_before, self._denied_carried = pairs, carried
 
     async def job_directory(self):
         """Keep the DAO's directory entry alive: a fresh signed registration every 20 minutes against the
         node's 30-minute TTL. This runs through a pause on purpose (XE-1445): the entry is addressability,
         not action. It names only the DAO's own node peer and moves nothing, and without it every chat
         sent to the DAO fails at the sender's node thirty minutes into a pause, while the inbox is one of
-        the things a pause keeps open. The `dao` key's narrowest scope, `directory.register`, is all it uses."""
+        the things a pause keeps open. The `dao` key's narrowest scope, `directory.register`, is all it uses.
+
+        A run that fails is tried again in `DIRECTORY_RETRY_S`, not a cadence later, since the entry lapses
+        on the node's clock whatever this job's is (XE-12324). The log says so when a spell of failures
+        begins and when it ends, not on every pass (XE-6048). A node that has not yet said which network
+        it is, is asked again here: before, the job returned without a word on every pass until the worker
+        was restarted (XE-2475)."""
         ctx = self.ctx
-        if not ctx.signer.has("dao") or not ctx.node.network_id:
+        if not ctx.signer.has("dao"):
             return
+        every_s = job_table(ctx)["directory"]["every_s"]
         async with session() as db:
             try:
+                if not ctx.node.network_id:
+                    await ctx.refresh_node()
+                if not ctx.node.network_id:
+                    raise XeError(UNREACHABLE, "the node has not said which network this is; nothing is signed without it")
                 kp = ctx.signer.keypair("dao", "directory.register")
                 reg = new_registration(kp, ctx.node.network_id, ctx.directory_node_peer)
                 await ctx.chain.directory_register(reg.to_json())
+                before = await last_detail(db, "directory")
                 await mark_run(db, "directory", {"ok": True})
+                if before.get("ok") is not True:   # the first there has been, or the first after a spell of failures
+                    await ctx.events.append(db, "directory.registered", "harness", {"after_failures": int(before.get("failures") or 0)}, public=False)
             except Exception as e:
                 log.warning("directory register failed: %s", e)
-                await mark_run(db, "directory", {"ok": False, "error": str(e)[:300]})
-                await ctx.events.append(db, "directory.register_failed", "harness", {"error": str(e)[:300]}, public=False)
+                before = await mark_failed(db, "directory", {"ok": False, "error": str(e)[:300]}, every_s, DIRECTORY_RETRY_S)
+                if before.get("ok") is not False:
+                    await ctx.events.append(db, "directory.register_failed", "harness", {"error": str(e)[:300]}, public=False)
             await db.commit()
 
     @staticmethod
@@ -149,15 +185,17 @@ class Worker:
         return list((await db.execute(select(SigningSession.id).where(SigningSession.status == status))).scalars().all())
 
     @staticmethod
-    async def _take(db, sid: str, status: str) -> SigningSession | None:
+    async def _take(db, sid: str, *status: str) -> SigningSession | None:
         """Lock one session for this pass, or skip it: None if a route holds it or it has left `status`."""
-        q = select(SigningSession).where(SigningSession.id == sid, SigningSession.status == status).with_for_update(skip_locked=True)
+        q = locked(select(SigningSession).where(SigningSession.id == sid, SigningSession.status.in_(status)), skip_locked=True)
         return (await db.execute(q)).scalar_one_or_none()
 
     async def job_sessions(self):
         """A signing session whose block is stale is rebuilt; one that holds a threshold of signatures and
         is not yet on the chain (its submit was deferred by a node that did not answer, XE-1677/XE-1689)
-        is submitted again."""
+        is submitted again. A session that ended without its block on the chain is looked up there while
+        the block could still land, and recorded submitted if it has (XE-4148): that is a record catching
+        up with the chain, not an act on it, so a pause does not stop it."""
         async with session() as db:
             paused = await pause.is_paused(db)
             ids = [] if paused else await self._session_ids(db, "signing")
@@ -185,16 +223,23 @@ class Worker:
                         ks = ks or await sessions.live_keyset(self.ctx)
                         if sessions.ready_to_submit(s, ks):
                             await sessions.submit(self.ctx, db, s)
-                    if s.status == "submitted" and s.kind == "anchor":
-                        await records.note_anchor_submitted(db, s.id, s.submitted_index, s.submitted_hash)
                     await db.commit()
                 except Exception as e:
                     await db.rollback()
                     log.warning("session %s: %s", sid, e)
-            # record anchors whose session submitted via the API
-            subm = (await db.execute(select(SigningSession).where(SigningSession.status == "submitted", SigningSession.kind == "anchor"))).scalars().all()
-            for s in subm:
-                await records.note_anchor_submitted(db, s.id, s.submitted_index, s.submitted_hash)
+            ended = await sessions.ended_holding_a_block(db)
+            await db.commit()
+            for sid in ended:
+                s = await self._take(db, sid, "failed", "cancelled")
+                if s is None:
+                    await db.rollback()
+                    continue
+                try:
+                    await sessions.reconcile_ended(self.ctx, db, s)
+                    await db.commit()
+                except Exception as e:
+                    await db.rollback()
+                    log.warning("ended session %s: %s", sid, e)
             await mark_run(db, "sessions")
             await db.commit()
 
@@ -265,6 +310,12 @@ class Worker:
                 # The backfill cursor comes from the stored inbox (inbox.chat_cursor), not from this loop: a
                 # store that fails below raises out of the stream, and the next pass asks the node again from
                 # what is on disk (XE-1651, XE-1666, XE-1768).
+                #
+                # The stream is not opened past a backfill that failed, and that is deliberate: the cursor
+                # is the newest envelope stored, so a live message taken in over an unread backlog would
+                # move the cursor past the backlog and the next backfill would not ask for it. What keeps
+                # this from being a stall is that the backfill can always be read: its bound is sized to
+                # the most a node holds for one account (xe.client.MAX_CHAT_STORE_BYTES, XE-11882).
                 async with session() as db:
                     n = await inbox.backfill(ctx, db)
                     await db.commit()

@@ -14,6 +14,7 @@ anyone can check the chain against the state chain.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
@@ -24,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from xe.keys import verify_hex_signature
 
 from .canonical import DOMAIN_EVENT, DOMAIN_EVENT_V2, digest
+from .db import locked
 from .models import Event, LogHead
 from .signer import Signer, SignerError
 
@@ -69,8 +71,7 @@ class EventLog:
         still holds the head as it left it, and without `populate_existing` the locked read hands that copy
         back: a worker pass that commits between events would then chain its next event to a head another
         process has since moved, and the append fails on the index it reuses."""
-        head = (await db.execute(select(LogHead).where(LogHead.id == 1).with_for_update()
-                                 .execution_options(populate_existing=True))).scalar_one()
+        head = (await db.execute(locked(select(LogHead).where(LogHead.id == 1)))).scalar_one()
         index = head.index + 1
         ts = ts if ts is not None else time.time_ns()
         h = event_hash(index, ts, kind, actor, payload, head.hash, public=public, ref=ref, v=2)
@@ -97,7 +98,8 @@ class EventLog:
 
     @staticmethod
     async def head(db: AsyncSession) -> Head:
-        head = (await db.execute(select(LogHead).where(LogHead.id == 1))).scalar_one()
+        """The head as the database has it now, not as this session last saw it (see `append`)."""
+        head = (await db.execute(select(LogHead).where(LogHead.id == 1).execution_options(populate_existing=True))).scalar_one()
         return Head(head.index, head.hash)
 
     @staticmethod
@@ -129,12 +131,14 @@ class EventLog:
         return (await db.execute(select(Event).where(Event.index == index))).scalar_one_or_none()
 
     @staticmethod
-    async def iter_all(db: AsyncSession, batch: int = 1000) -> AsyncIterator[Event]:
+    async def iter_all(db: AsyncSession, batch: int = 1000, upto: int | None = None) -> AsyncIterator[Event]:
+        """Events in order, a batch at a time; with `upto`, none past that index."""
         start = 0
         while True:
-            rows = list((await db.execute(
-                select(Event).where(Event.index >= start).order_by(Event.index.asc()).limit(batch)
-            )).scalars().all())
+            q = select(Event).where(Event.index >= start)
+            if upto is not None:
+                q = q.where(Event.index <= upto)
+            rows = list((await db.execute(q.order_by(Event.index.asc()).limit(batch))).scalars().all())
             if not rows:
                 return
             for r in rows:
@@ -142,29 +146,48 @@ class EventLog:
             start = rows[-1].index + 1
 
     _verify_cache: tuple[float, dict] | None = None
+    _verify_lock: asyncio.Lock | None = None
     VERIFY_CACHE_S = 60
 
     @classmethod
     async def verify_cached(cls, db: AsyncSession, expected_signer: str = "") -> dict:
         """`verify()` for the public route: a full replay is O(log); one is kept for a minute per process so
         the route cannot be used to make the database re-read the whole chain on demand."""
-        now = time.monotonic()
-        if cls._verify_cache and now - cls._verify_cache[0] < cls.VERIFY_CACHE_S:
-            return {**cls._verify_cache[1], "cached": True}
-        out = await cls.verify(db, expected_signer)
-        cls._verify_cache = (now, out)
-        return {**out, "cached": False}
+        def fresh() -> dict | None:
+            c = cls._verify_cache
+            return {**c[1], "cached": True} if c and time.monotonic() - c[0] < cls.VERIFY_CACHE_S else None
+
+        if (hit := fresh()) is not None:
+            return hit
+        # One replay at a time. Callers that arrive while one is running wait for it and take its answer:
+        # without this, every request that found the cache empty started a replay of its own, and the
+        # minute's cache bounded nothing at the moment it mattered (XE-3709).
+        if cls._verify_lock is None:
+            cls._verify_lock = asyncio.Lock()
+        async with cls._verify_lock:
+            if (hit := fresh()) is not None:
+                return hit
+            out = await cls.verify(db, expected_signer)
+            cls._verify_cache = (time.monotonic(), out)   # stamped when the replay ended, not when it began
+            return {**out, "cached": False}
 
     @staticmethod
     async def verify(db: AsyncSession, expected_signer: str = "") -> dict:
         """Replay the chain. Returns {ok, count, head, first_error}. With `expected_signer` (the deployment's
         published harness key) every event must carry a signature by that key: a stripped signature or a
-        re-signed chain fails, which is the point of publishing the key."""
+        re-signed chain fails, which is the point of publishing the key.
+
+        A verification is of the chain as it stood at one moment: the head is read first and the replay runs
+        to that head and no further. The log is appended to while this runs (the replay is many reads and
+        each sees what has committed since the last), so a replay of "every row" compared with a head read
+        afterwards compared two different moments, and an append that landed in between was reported as
+        tampering (XE-2960). Events past the sampled head are the next verification's."""
+        at = await EventLog.head(db)
         prev = ZERO
         expected_index = 0
         count = 0
         last_hash = ZERO
-        async for ev in EventLog.iter_all(db):
+        async for ev in EventLog.iter_all(db, upto=at.index):
             if ev.index != expected_index:
                 return {"ok": False, "count": count, "first_error": f"gap at index {expected_index}", "head": last_hash}
             if ev.prev_hash != prev:
@@ -184,9 +207,16 @@ class EventLog:
             last_hash = h
             expected_index += 1
             count += 1
-        head = await EventLog.head(db)
-        ok = head.hash == last_hash and head.index == count - 1
-        return {"ok": ok, "count": count, "head": last_hash, "first_error": None if ok else "head row disagrees with chain"}
+        if at.hash != last_hash or at.index != count - 1:
+            return {"ok": False, "count": count, "head": last_hash, "first_error": "head row disagrees with chain"}
+        # The head only moves forward, in the transaction that adds its event. The highest event is read
+        # before the head, so an append between the two reads moves the head further and never leaves an
+        # event past it: one found there is a head that was wound back.
+        tail = (await db.execute(select(func.max(Event.index)))).scalar()
+        now = await EventLog.head(db)
+        if now.index < at.index or (tail is not None and tail > now.index):
+            return {"ok": False, "count": count, "head": last_hash, "first_error": "head row is behind the chain"}
+        return {"ok": True, "count": count, "head": last_hash, "first_error": None}
 
 
 def event_to_dict(ev: Event) -> dict:

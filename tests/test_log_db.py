@@ -121,3 +121,57 @@ async def test_append_refuses_to_write_unsigned_when_the_key_will_not_sign(db):
     log = EventLog(Refusing({"harness": kp}, {"harness": {"event.sign"}}))
     with pytest.raises(LogError):
         await log.append(db, "test", "harness", {})
+
+
+# ---- XE-2960: a verification is of the chain at one moment -------------------------------------
+
+async def test_an_append_that_lands_during_a_replay_is_not_tampering(db, monkeypatch):
+    """The log is written to while it is replayed. The answer is for the head sampled when the replay began:
+    an event that commits part-way through is neither counted nor held against the chain."""
+    log = EventLog(_signer())
+    for i in range(3):
+        await log.append(db, "test", "harness", {"i": i})
+    await db.commit()
+    real = EventLog.iter_all
+    landed = []
+
+    async def interleaved(db_, batch=1000, upto=None):
+        async for ev in real(db_, batch, upto):
+            if not landed:   # another process appends as soon as the replay has started reading
+                async with async_sessionmaker(db.bind, expire_on_commit=False)() as other:
+                    landed.append(await log.append(other, "test", "app", {"late": True}))
+                    await other.commit()
+            yield ev
+
+    monkeypatch.setattr(EventLog, "iter_all", staticmethod(interleaved))
+    res = await EventLog.verify(db)
+    assert landed and res == {"ok": True, "count": 3, "head": res["head"], "first_error": None}
+    monkeypatch.undo()
+    res = await EventLog.verify(db)
+    assert res["ok"] and res["count"] == 4 and res["head"] == landed[0].hash
+    # and at every batch size, so the answer does not depend on where a batch boundary falls
+    for batch in (1, 2, 3):
+        async def small(db_, _batch=1000, upto=None, n=batch):
+            async for ev in real(db_, n, upto):
+                yield ev
+        monkeypatch.setattr(EventLog, "iter_all", staticmethod(small))
+        assert (await EventLog.verify(db))["count"] == 4
+        monkeypatch.undo()
+
+
+async def test_a_head_wound_back_or_ahead_of_its_events_fails(db):
+    log = EventLog(_signer())
+    evs = [await log.append(db, "test", "harness", {"i": i}) for i in range(3)]
+    await db.commit()
+    await db.execute(text("UPDATE log_head SET index = 1, hash = :h"), {"h": evs[1].hash})
+    await db.commit()
+    assert (await EventLog.verify(db))["first_error"] == "head row is behind the chain"
+    await db.execute(text("UPDATE log_head SET index = 3, hash = :h"), {"h": evs[2].hash})
+    await db.commit()
+    assert (await EventLog.verify(db))["first_error"] == "head row disagrees with chain"
+    await db.execute(text("UPDATE log_head SET index = 2, hash = :h"), {"h": evs[1].hash})
+    await db.commit()
+    assert (await EventLog.verify(db))["first_error"] == "head row disagrees with chain"
+    await db.execute(text("UPDATE log_head SET index = 2, hash = :h"), {"h": evs[2].hash})
+    await db.commit()
+    assert (await EventLog.verify(db))["ok"]

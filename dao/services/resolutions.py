@@ -20,9 +20,8 @@ from xe.client import XeError
 
 from .. import signatures
 from ..auth import Verified
-from ..canonical import DOMAIN_RESOLUTION, digest
 from ..context import Context
-from ..db import serialize
+from ..db import locked, serialize
 from ..log import EventLog
 from ..models import Proposal, Resolution
 from ..text import clean_text, field_text
@@ -52,10 +51,6 @@ def _matter_rule(cfg, matter: str) -> tuple[int, str]:
     if matter in RESERVED_MATTERS:
         return max(n, 1), "all members"
     return (n // 2) + 1, "majority of members"
-
-
-def resolution_target(res_id: str, body_hash: str, decision: str) -> bytes:
-    return digest(DOMAIN_RESOLUTION, {"resolution_id": res_id, "body_hash": body_hash, "decision": decision})
 
 
 async def _next_number(db: AsyncSession) -> int:
@@ -215,8 +210,8 @@ async def _owed(ctx: Context, db: AsyncSession, r: Resolution, kind: str, error:
 async def open_deferred_sessions(ctx: Context, db: AsyncSession) -> int:
     """Worker: passed resolutions with ops whose session could not be opened at the deciding signature.
     Each is tried on its own; one that cannot be opened does not hold up the ones behind it."""
-    q = (select(Resolution).where(Resolution.status == "passed", Resolution.ops.isnot(None), Resolution.session_id == "")
-         .order_by(Resolution.number.asc()).with_for_update(skip_locked=True))
+    q = locked(select(Resolution).where(Resolution.status == "passed", Resolution.ops.isnot(None), Resolution.session_id == "")
+               .order_by(Resolution.number.asc()), skip_locked=True)
     n = 0
     for r in (await db.execute(q)).scalars().all():
         if r.ops and await open_owed_session(ctx, db, r):
@@ -229,15 +224,16 @@ async def withdraw(ctx: Context, db: AsyncSession, r: Resolution, v: Verified) -
         raise HTTPException(409, f"resolution is {r.status}")
     if r.proposed_by != v.seat.id and not v.seat.is_member:
         raise HTTPException(403, "only the proposer or a member may withdraw")
+    # Rows first, then the log head, as everywhere (`sessions.cancel`, `decide`, `inbox._lock_answered`): the
+    # session row is taken before the first append, not after it (XE-12010).
+    s = await sessions.get(db, r.session_id, lock=True) if r.session_id else None
     r.status = "withdrawn"
     r.decided_at = datetime.now(timezone.utc)
     await ctx.events.append(db, "resolution.withdrawn", v.actor, {"resolution_id": r.id}, ref=f"resolution:{r.id}")
-    if r.session_id:
+    if s is not None and s.status in sessions.OPEN:
         # A passing vote that raced this withdrawal may have opened the execution session already; it goes
         # with the resolution, so nothing the record calls withdrawn stays executable (XE-0672).
-        s = await sessions.get(db, r.session_id, lock=True)
-        if s.status not in ("submitted", "cancelled"):
-            await sessions.cancel(ctx, db, s, v, "resolution withdrawn")
+        await sessions.cancel(ctx, db, s, v, "resolution withdrawn")
     return r
 
 
@@ -245,17 +241,31 @@ async def get(db: AsyncSession, res_id: str, *, lock: bool = False) -> Resolutio
     """`lock=True` takes the row FOR UPDATE: every path that changes a resolution loads it this way, so two
     writers queue instead of each saving its own copy of a list over the other's (XE-0672)."""
     q = select(Resolution).where(Resolution.id == res_id)
-    r = (await db.execute(q.with_for_update() if lock else q)).scalar_one_or_none()
+    r = (await db.execute(locked(q) if lock else q)).scalar_one_or_none()
     if r is None:
         raise HTTPException(404, "resolution not found")
     return r
 
 
-async def list_resolutions(db: AsyncSession, status: str | None = None, limit: int = 200) -> list[Resolution]:
-    q = select(Resolution).order_by(Resolution.number.desc()).limit(limit)
+async def list_resolutions(db: AsyncSession, status: str | None = None, limit: int = 200, offset: int = 0) -> list[Resolution]:
+    """A page of the register, newest first. A page is not the register: `count_resolutions` says how many
+    there are, and what is waiting on a member is asked of `open_resolutions` (XE-4601)."""
+    q = select(Resolution).order_by(Resolution.number.desc()).offset(offset).limit(min(limit, 200))
     if status:
         q = q.where(Resolution.status == status)
     return list((await db.execute(q)).scalars().all())
+
+
+async def count_resolutions(db: AsyncSession, status: str | None = None) -> int:
+    q = select(func.count()).select_from(Resolution)
+    if status:
+        q = q.where(Resolution.status == status)
+    return int((await db.execute(q)).scalar_one())
+
+
+async def open_resolutions(db: AsyncSession) -> list[Resolution]:
+    """Every resolution still open, unpaged, oldest first."""
+    return list((await db.execute(select(Resolution).where(Resolution.status == "open").order_by(Resolution.number.asc()))).scalars().all())
 
 
 def to_dict(r: Resolution, cfg) -> dict:

@@ -95,6 +95,30 @@ async def mark_run(db: AsyncSession, job: str, detail: dict | None = None, every
     row.detail = detail or {}
 
 
+async def mark_failed(db: AsyncSession, job: str, detail: dict, every_s: int, retry_s: int) -> dict:
+    """Record that an interval job ran and failed, so that it is tried again `retry_s` from now and not a
+    whole interval from now. For a job whose effect expires on the other side (the directory entry lapses
+    30 minutes after the last registration, and the job runs every 20): one failed run marked like a good
+    one leaves 40 minutes between registrations (XE-12324). Returns the detail of the run before this one,
+    so the caller can tell the first failure of a spell from the ones after it; the count of failures in
+    the spell is kept in the detail."""
+    now = time.time_ns()
+    row = (await db.execute(select(ScheduleRun).where(ScheduleRun.job == job))).scalar_one_or_none()
+    before = dict(row.detail or {}) if row else {}
+    detail = {**detail, "failures": int(before.get("failures") or 0) + 1}
+    ts = now - max(0, every_s - retry_s) * NS
+    if row is None:
+        db.add(ScheduleRun(job=job, last_run_ts=ts, detail=detail))
+    else:
+        row.last_run_ts, row.detail = ts, detail
+    return before
+
+
+async def last_detail(db: AsyncSession, job: str) -> dict:
+    row = (await db.execute(select(ScheduleRun).where(ScheduleRun.job == job))).scalar_one_or_none()
+    return dict(row.detail or {}) if row else {}
+
+
 def due_interval(last_ts: int | None, every_s: int) -> bool:
     return last_ts is None or time.time_ns() - last_ts >= every_s * NS
 
