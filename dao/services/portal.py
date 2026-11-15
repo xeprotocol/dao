@@ -221,7 +221,9 @@ async def rederive_stale(ctx: Context, db: AsyncSession, pr: Proposal) -> list[V
     """Rows written under an earlier snapshot time or rule carry a weight the proposal no longer means.
     Each is re-derived from the chain before the tally reads it; the vote itself (choice, signature,
     time) stands. A node error leaves the row as it is and raises, so the close waits for the next pass
-    rather than closing on stale weight (XE-1617).
+    rather than closing on stale weight (XE-1617). It is raised after the rows read before it are written,
+    each with its entry: a caller that keeps what was done (`rederive_open`) keeps whole rows, never a
+    changed weight the log does not show.
 
     The rows are written before the first entry is appended. Appending takes the log head, and a vote
     being cast holds its row and then waits for the head: rows written one at a time between entries
@@ -232,7 +234,11 @@ async def rederive_stale(ctx: Context, db: AsyncSession, pr: Proposal) -> list[V
         if is_current(ctx, pr, row):
             continue
         is_agent = row.account in ctx.config.agent_accounts
-        snap, reasons, participating, weight = await eligibility(ctx, pr, row.account, is_agent)
+        try:
+            snap, reasons, participating, weight = await eligibility(ctx, pr, row.account, is_agent)
+        except XeError as e:   # this row and the ones behind it stay as they are
+            node_error = e
+            break
         if (row.weight, row.participating, row.is_agent) != (weight, participating, is_agent):
             changed.append(row)
         row.weight, row.participating, row.is_agent = weight, participating, is_agent
@@ -244,13 +250,19 @@ async def rederive_stale(ctx: Context, db: AsyncSession, pr: Proposal) -> list[V
             "proposal": pr.hash, "account": row.account, "weight": row.weight, "participating": row.participating,
             "is_agent": row.is_agent,
         }, ref=f"proposal:{pr.hash}")
+    if node_error is not None:
+        raise node_error
     return stale
 
 
 async def rederive_open(ctx: Context, db: AsyncSession) -> int:
     """Worker: re-derive stale rows on open proposals, so the published open tally (which counts only
     current rows) catches up within a pass of a rule change or a seat change (XE-1664). A transient node
-    error leaves the rest for the next pass."""
+    error leaves the rest for the next pass.
+
+    Each proposal is one step, as in `close_due`: held in a savepoint and named by a hash read before the
+    step, so that whatever fails under it, the database included, undoes that proposal's rows, leaves the
+    session usable, and is logged without asking the session for anything (XE-3724)."""
     n = 0
     for pr in (await db.execute(select(Proposal).where(Proposal.status == "open"))).scalars().all():
         try:
@@ -259,7 +271,11 @@ async def rederive_open(ctx: Context, db: AsyncSession) -> int:
             log.warning("proposal %s: could not re-derive stale votes: %s", pr.hash[:12], e)
             break
         except Exception:   # this proposal's rows, not the node: the proposals behind it are not held up
-            log.exception("proposal %s: re-deriving its stale votes raised", pr.hash[:12])
+            log.exception("proposal %s: re-deriving its stale votes raised", h[:12])
+            continue
+        if node_error is not None:
+            log.warning("proposal %s: could not re-derive stale votes: %s", h[:12], node_error)
+            break
     return n
 
 

@@ -105,31 +105,89 @@ async def offer(ctx: Context, block: dict) -> str:
     return await placed(ctx.chain, block)
 
 
+# One pass over an account's pending sends is bounded in number and in time (XE-3130). Anyone can send
+# dust to a published account, each receive is a block with its own proof of work, and the worker runs
+# its jobs one after another: a pass as long as the list would hold the timers, the sessions and the
+# outbox for as long as someone kept sending. What a pass does not reach is still pending on the node and
+# is reached by a later one. The budget is spent on XE before any other asset and on the largest amount
+# first, so what waits is dust (a fee is not, tried before or not: among sends of one size the ones not
+# yet tried go first, and no number of those puts a larger one back). A send that has been offered a
+# receive twice and is pending all the same waits a doubling time, up to an hour, before it is tried
+# again, so one that can never be received does not hold a place in every pass.
+RECEIVE_PASS_MAX = 25
+RECEIVE_PASS_S = 30.0
+RECEIVE_RETRY_S = 60.0
+RECEIVE_RETRY_MAX_S = 3600.0
+# (account, send hash) -> (passes that offered it a receive, when the last one did). A pass the node or
+# the database stopped before the submit offered nothing and counts against no send. In this process
+# only: after a restart every pending send is new again, which costs one pass. Entries leave with the send.
+_offered: dict[tuple[str, str], tuple[int, float]] = {}
+
+
+def receive_order(account: str, pending: list[dict], now: float) -> list[dict]:
+    """The pending sends one pass offers a receive to, in order (see above). `now` is `time.monotonic()`."""
+    live = {(account, p["send_hash"]) for p in pending}
+    for key in [k for k in _offered if k[0] == account and k not in live]:
+        del _offered[key]
+
+    def tried(p: dict) -> tuple[int, float]:
+        return _offered.get((account, p["send_hash"]), (0, 0.0))
+
+    def waits(p: dict) -> bool:
+        n, at = tried(p)
+        return n >= 2 and now - at < min(RECEIVE_RETRY_S * 2 ** min(n - 1, 16), RECEIVE_RETRY_MAX_S)
+    due = [p for p in pending if not waits(p)]
+    return sorted(due, key=lambda p: (p["asset"] != "XE", -p["amount"], tried(p)[0]))[:RECEIVE_PASS_MAX]
+
+
 async def receive_pending(ctx: Context, key_name: str, paused: Callable[[], Awaitable[bool]],
                           scope: str = "block.receive") -> int:
-    """Offer a receive for every pending send to the account held under `key_name`. Returns how many the
-    node said it took, which is a count for the log and nothing else: no receive is recorded from here. The
-    caller records a receive when it reads it, final, on the account's chain (XE-2380).
+    """Offer a receive for the pending sends to the account held under `key_name`, as many as one pass has
+    the budget for (`receive_order`). Returns how many the node said it took, which is a count for the log
+    and nothing else: no receive is recorded from here. The caller records a receive when it reads it,
+    final, on the account's chain (XE-2380).
 
     `paused()` is asked right before each submit, after the block's proof of work, so a pause that begins
     during a run stops the receives still to come (XE-2483). A send that cannot be received is logged and
-    skipped whatever went wrong, since the ones behind it are independent (XE-0488). A receive is not kept
-    for a retry: one that did not land leaves its send pending on the node, where the next pass finds it,
-    and the node takes one receive per send."""
+    skipped whatever went wrong, since the ones behind it are independent (XE-0488). What is not about the
+    send ends the pass instead, and is held against none of them: the node failing the read of our own tip
+    or not naming its network (the sends behind would be told the same), and the pause check itself
+    failing, which is the caller's database and is raised to it. A receive is not kept for a retry: one
+    that did not land leaves its send pending on the node, where the next pass finds it, and the node
+    takes one receive per send."""
     kp = ctx.signer.keypair(key_name, scope)
     taken = 0
-    for p in await ctx.chain.pending_for(kp.address):
+    started = time.monotonic()
+    pending = await ctx.chain.pending_for(kp.address)
+    todo = receive_order(kp.address, pending, started)
+    for i, p in enumerate(todo):
+        if time.monotonic() - started >= RECEIVE_PASS_S:
+            todo = todo[:i]
+            break
+        b = None
         try:
             prev, bals = await _tip(ctx.chain, kp.address)
             b = await signed(ctx, Block(type="receive", account=kp.address, previous=prev,
                                         balance=bals.get(p["asset"], 0) + p["amount"], timestamp=time.time_ns(),
                                         asset=p["asset"], source=p["send_hash"]), kp)
+        except XeError as e:    # our own tip, or the network's name: the node, and not this send
+            log.warning("receive into %s stopped at %s: %s", key_name, p["send_hash"][:12], e)
+            todo = todo[:i]
+            break
+        except Exception as e:  # a bad entry, proof of work that ran out of time: this send only
+            log.warning("receive of %s into %s failed: %s: %s", p["send_hash"][:12], key_name, type(e).__name__, e)
+        if b is not None:
             if await paused():
                 break
-            await ctx.chain.submit_block(b)
-            taken += 1
-        except Exception as e:  # a refusal, a bad entry, proof of work that ran out of time: this send only
-            log.warning("receive of %s into %s failed: %s: %s", p["send_hash"][:12], key_name, type(e).__name__, e)
+            try:
+                await ctx.chain.submit_block(b)
+                taken += 1
+            except Exception as e:  # a refusal, or no answer: this send only
+                log.warning("receive of %s into %s failed: %s: %s", p["send_hash"][:12], key_name, type(e).__name__, e)
+        key = (kp.address, p["send_hash"])
+        _offered[key] = (_offered.get(key, (0, 0.0))[0] + 1, time.monotonic())
+    if len(todo) < len(pending):
+        log.info("receive into %s: %d of %d pending sends left for a later pass", key_name, len(pending) - len(todo), len(pending))
     return taken
 
 

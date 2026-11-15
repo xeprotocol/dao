@@ -274,24 +274,30 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
     except Exception as e:
         detail["statechain_error"] = _fault("statechain", e)
 
+    # A leg that reads or writes the database does it under a savepoint: a statement that fails there
+    # fails that leg, and the legs behind it and the record of the check itself still have a transaction
+    # to work in (XE-3724).
     try:   # keyset unchanged
         ks = _keyset_shape(await ctx.chain.dao_keyset())
         if ks is None:
-            raise ValueError("node returned no keyset")
-        detail["keyset"] = ks
-        if prev.get("keyset") and ks != prev["keyset"]:
-            await ctx.events.append(db, "keyset.changed", "harness", {"from": prev["keyset"], "to": ks}, public=True)
-        expected = await expected_keyset(db)
-        if expected and ks != expected:
-            detail["keyset_unexpected"] = {"live": ks, "expected": expected}
-            ok = False
+            detail["keyset_error"] = "node returned no keyset"
+        else:
+            detail["keyset"] = ks
+            async with db.begin_nested():
+                if prev.get("keyset") and ks != prev["keyset"]:
+                    await ctx.events.append(db, "keyset.changed", "harness", {"from": prev["keyset"], "to": ks}, public=True)
+                expected = await expected_keyset(db)
+            if expected and ks != expected:
+                detail["keyset_unexpected"] = {"live": ks, "expected": expected}
+                ok = False
     except Exception as e:
         detail["keyset_error"] = _fault("keyset", e)
 
     try:   # log consistent
-        head = await EventLog.head(db)
+        async with db.begin_nested():
+            head = await EventLog.head(db)
+            ver = await EventLog.verify_cached(db, ctx.signer.public_key("harness") if ctx.signer.has("harness") else "")
         detail["log_head"] = {"index": head.index, "hash": head.hash}
-        ver = await EventLog.verify_cached(db, ctx.signer.public_key("harness") if ctx.signer.has("harness") else "")
         detail["log_verified"] = bool(ver.get("ok"))
         if not ver.get("ok"):
             detail["log_first_error"] = ver.get("first_error")
@@ -304,9 +310,11 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
         detail["signer_error"] = "no harness key: events cannot be signed"
 
     try:   # last anchor age: measured from the last written anchor, or from the DAO's start if there is none (XE-1618)
-        a = await latest_anchor(db, written=True)
+        async with db.begin_nested():
+            a = await latest_anchor(db, written=True)
+            started = None if a else await started_at(db)
         detail["last_anchor"] = {"n": a.n, "age_s": round(now / 1e9 - a.created_at.timestamp())} if a else None
-        unanchored_s = detail["last_anchor"]["age_s"] if a else (now - (await started_at(db) or now)) / 1e9
+        unanchored_s = detail["last_anchor"]["age_s"] if a else (now - (started or now)) / 1e9
         if unanchored_s > ANCHOR_OVERDUE_S:
             detail["anchor_overdue"] = True
             ok = False
@@ -315,8 +323,9 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
 
     try:   # pending signatures aging
         cutoff = datetime.fromtimestamp((now - SESSION_AGING_S * 1_000_000_000) / 1e9, tz=timezone.utc)
-        aging = (await db.execute(select(SigningSession).where(SigningSession.status.in_(("approving", "signing")),
-                                                               SigningSession.created_at < cutoff))).scalars().all()
+        async with db.begin_nested():
+            aging = (await db.execute(select(SigningSession).where(SigningSession.status.in_(("approving", "signing")),
+                                                                   SigningSession.created_at < cutoff))).scalars().all()
         detail["sessions_aging"] = [{"id": s.id, "kind": s.kind, "status": s.status,
                                      "signatures": len(s.block_signatures or []), "required": s.required_approvals}
                                     for s in aging]

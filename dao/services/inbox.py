@@ -206,33 +206,42 @@ async def flush_outbox(ctx: Context, db: AsyncSession) -> int:
         return n
     # Members' replies before acknowledgements, oldest first (XE-1845).
     order = (case((OutboxMessage.from_seat == "harness", 1), else_=0), OutboxMessage.created_at.asc())
-    rows = list((await db.execute(select(OutboxMessage).where(OutboxMessage.status == "queued").order_by(*order).limit(10))).scalars().all())
+    ids = list((await db.execute(select(OutboxMessage.id).where(OutboxMessage.status == "queued").order_by(*order).limit(10))).scalars().all())
     now = datetime.now(timezone.utc)
-    for o in rows:
-        if await _retried_long_enough(db, o, now):
-            # retried for a week; the channel is not going to open. Stop, and say so on the record.
-            await _lock_answered(db, o)
-            o.status = "failed"
-            await ctx.events.append(db, "outbox.failed", "harness", {"id": o.id, "to": o.to_account, "error": o.error[:300]},
-                                    ref=f"inbox:{o.in_reply_to}")
-            await _reply_outcome(ctx, db, o, delivered=False)
-            await db.commit()
-            continue
+    for oid in ids:
+        # Each row is a step of its own, named by an id read before it: what fails under one, the database
+        # included, is rolled back and logged, and the rows behind it are still sent (XE-3724).
         try:
-            confirmed_network(ctx)
-            kp = ctx.signer.keypair("dao", "chat.send")
-            env = await asyncio.to_thread(new_envelope, kp, o.to_account, o.body, ctx.node.chat_pow_difficulty,
-                                          None, WORKER_POW_DEADLINE_S)
-        except Exception as e:   # nothing was built, so nothing was offered: the row is still `queued`
-            o.error = str(e)[:500]
-            log.warning("outbox %s: no envelope built: %s", o.id, e)
+            o = await db.get(OutboxMessage, oid)
+            if o is None or o.status != "queued":
+                continue
+            if await _retried_long_enough(db, o, now):
+                # retried for a week; the channel is not going to open. Stop, and say so on the record.
+                await _lock_answered(db, o)
+                o.status = "failed"
+                await ctx.events.append(db, "outbox.failed", "harness", {"id": o.id, "to": o.to_account, "error": o.error[:300]},
+                                        ref=f"inbox:{o.in_reply_to}")
+                await _reply_outcome(ctx, db, o, delivered=False)
+                await db.commit()
+                continue
+            try:
+                confirmed_network(ctx)
+                kp = ctx.signer.keypair("dao", "chat.send")
+                env = await asyncio.to_thread(new_envelope, kp, o.to_account, o.body, ctx.node.chat_pow_difficulty,
+                                              None, WORKER_POW_DEADLINE_S)
+            except Exception as e:   # nothing was built, so nothing was offered: the row is still `queued`
+                o.error = reason(e, 500)
+                log.warning("outbox %s: no envelope built: %s", o.id, e)
+                await db.commit()
+                continue
+            if await pause.is_paused(db):   # read after the work, right before the send (XE-1172)
+                return n                    # the envelope is discarded; the row is still `queued`
+            o.status, o.envelope, o.error = "sending", env.to_json(), ""
             await db.commit()
-            continue
-        if await pause.is_paused(db):   # read after the work, right before the send (XE-1172)
-            return n                    # the envelope is discarded; the row is still `queued`
-        o.status, o.envelope, o.error = "sending", env.to_json(), ""
-        await db.commit()
-        n += await _offer(ctx, db, o)
+            n += await _offer(ctx, db, o)
+        except Exception as e:
+            await db.rollback()
+            log.warning("outbox %s: %s: %s; left as it was last committed", oid, type(e).__name__, e)
     return n
 
 
@@ -307,21 +316,29 @@ async def _resolve_sending(ctx: Context, db: AsyncSession) -> int:
     except Exception as e:   # nothing is concluded for any row; a fresh envelope can still be offered again
         log.warning("outbox: %d replies in play and the node's chat store cannot be read: %s", len(rows), e)
     n = 0
-    for o in rows:
-        age = asked_at - o.envelope["timestamp"]
-        if held is not None and o.envelope["id"] in held:
-            await _sent(ctx, db, o)   # a record of what happened; nothing is written to the node
-            n += 1
-        elif age < FRESH_NS:
-            # the same envelope again, which no reading of the store is needed for: both nodes keep one copy
-            # per id. The pause is read here, after the store was (XE-1172); under one, nothing is offered.
-            if not await pause.is_paused(db):
-                n += await _offer(ctx, db, o)
-        elif held is not None and age > EXPIRED_NS:
-            o.status = "queued"
-            o.error = (f"the node never held the envelope and it is now too old to offer; a new one will be built"
-                       f"{'. The last send said: ' + o.error if o.error else ''}")[:500]
-        await db.commit()
+    for oid in [o.id for o in rows]:
+        # one row, one step, as in `flush_outbox`: a row the database refused does not hold up the rest (XE-3724)
+        try:
+            o = await db.get(OutboxMessage, oid)
+            if o is None or o.status != "sending" or not _in_play(o):
+                continue
+            age = asked_at - o.envelope["timestamp"]
+            if held is not None and o.envelope["id"] in held:
+                await _sent(ctx, db, o)   # a record of what happened; nothing is written to the node
+                n += 1
+            elif age < FRESH_NS:
+                # the same envelope again, which no reading of the store is needed for: both nodes keep one copy
+                # per id. The pause is read here, after the store was (XE-1172); under one, nothing is offered.
+                if not await pause.is_paused(db):
+                    n += await _offer(ctx, db, o)
+            elif held is not None and age > EXPIRED_NS:
+                o.status = "queued"
+                o.error = (f"the node never held the envelope and it is now too old to offer; a new one will be built"
+                           f"{'. The last send said: ' + o.error if o.error else ''}")[:500]
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            log.warning("outbox %s: %s: %s; left as it was last committed", oid, type(e).__name__, e)
     return n
 
 

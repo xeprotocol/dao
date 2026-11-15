@@ -153,7 +153,7 @@ async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, dec
                 async with db.begin_nested():
                     await open_session(ctx, db, r)
             except XeError as e:
-                await _owed(ctx, db, r, "resolution.session_deferred", str(e)[:300])
+                await _owed(ctx, db, r.id, "resolution.session_deferred", str(e)[:300])
     elif againsts > n_members - needed:
         r.status = "rejected"
         r.signatures = live
@@ -183,7 +183,10 @@ async def open_owed_session(ctx: Context, db: AsyncSession, r: Resolution) -> bo
     the session was still owed; XE-1967) are both left on the record as what is owed, and tried again on
     every pass: the first clears when the node is back, the second if the seats change back. Anything
     else that stops it is recorded as refused in the same way, because "nothing" means nothing.
-    Everything the attempt wrote is undone with it (a savepoint), so a failure leaves no half-made session."""
+    Everything the attempt wrote is undone with it (a savepoint), so a failure leaves no half-made session.
+    The resolution is named by an id read before the attempt: a row the savepoint undid is not read again
+    to say what failed (XE-3724)."""
+    rid = r.id
     try:
         async with db.begin_nested():
             await open_session(ctx, db, r)
@@ -193,30 +196,38 @@ async def open_owed_session(ctx: Context, db: AsyncSession, r: Resolution) -> bo
     except HTTPException as e:
         kind, error = "resolution.session_refused", str(e.detail)[:300]
     except Exception as e:
-        log.exception("resolution %s: opening its session raised", r.id)
-        kind, error = "resolution.session_refused", f"{type(e).__name__}: {e}"[:300]
-    await _owed(ctx, db, r, kind, error)
+        log.exception("resolution %s: opening its session raised", rid)
+        kind, error = "resolution.session_refused", reason(e)   # its text is in the server's log above (XE-6983)
+    await _owed(ctx, db, rid, kind, error)
     return False
 
 
-async def _owed(ctx: Context, db: AsyncSession, r: Resolution, kind: str, error: str) -> None:
+async def _owed(ctx: Context, db: AsyncSession, rid: str, kind: str, error: str) -> None:
     """Record why a passed resolution's session is still owed. Written when the reason changes kind, not on
     every pass and not on every rewording: a node that words its failure differently each time (a request
     id, a timestamp) would otherwise add an event to the log every minute for as long as it was down."""
-    last = await EventLog.page(db, limit=1, ref=f"resolution:{r.id}", public_only=False)
+    last = await EventLog.page(db, limit=1, ref=f"resolution:{rid}", public_only=False)
     if not last or last[0].kind != kind:
-        await ctx.events.append(db, kind, "harness", {"resolution_id": r.id, "error": error}, ref=f"resolution:{r.id}")
+        await ctx.events.append(db, kind, "harness", {"resolution_id": rid, "error": error}, ref=f"resolution:{rid}")
 
 
 async def open_deferred_sessions(ctx: Context, db: AsyncSession) -> int:
     """Worker: passed resolutions with ops whose session could not be opened at the deciding signature.
-    Each is tried on its own; one that cannot be opened does not hold up the ones behind it."""
+    Each is tried on its own; one that cannot be opened does not hold up the ones behind it, and neither
+    does one whose attempt, or the record of what it is owed, the database refused: each is a step of its
+    own, in a savepoint, named by an id read before it (XE-3724)."""
     q = locked(select(Resolution).where(Resolution.status == "passed", Resolution.ops.isnot(None), Resolution.session_id == "")
                .order_by(Resolution.number.asc()), skip_locked=True)
     n = 0
-    for r in (await db.execute(q)).scalars().all():
-        if r.ops and await open_owed_session(ctx, db, r):
-            n += 1
+    owed = (await db.execute(q)).scalars().all()
+    for r, rid, has_ops in [(r, r.id, bool(r.ops)) for r in owed]:
+        try:
+            async with db.begin_nested():
+                opened = has_ops and await open_owed_session(ctx, db, r)
+        except Exception:
+            log.exception("resolution %s: recording what its session is owed raised", rid)
+            continue
+        n += 1 if opened else 0
     return n
 
 

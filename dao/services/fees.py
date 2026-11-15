@@ -45,6 +45,8 @@ import time
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from xe.client import XeError
+
 from .. import chainops
 from ..context import Context
 from ..faults import reason
@@ -80,13 +82,23 @@ async def record_receives(ctx: Context, db: AsyncSession) -> int:
     Returns how many were recorded. The fee account's chain is read only when a row is waiting."""
     if not ctx.signer.has("fee"):
         return 0
-    rows = (await db.execute(select(FeeLedger).where(FeeLedger.state.in_(("seen",) + DUE))
-                             .order_by(FeeLedger.fee_block_hash))).scalars().all()
+    keys = list((await db.execute(select(FeeLedger.fee_block_hash).where(FeeLedger.state.in_(("seen",) + DUE))
+                                  .order_by(FeeLedger.fee_block_hash))).scalars().all())
     chain = _FeeChain(ctx)
     n = 0
-    for f in rows:
-        if not (f.tx_hashes or {}).get("receive") and await _record_receive(ctx, db, f, chain):
-            n += 1
+    for key in keys:
+        # Each row is a step of its own, named by a hash read before it (XE-3724): what the database refuses
+        # for one is rolled back and logged, and the rows behind it are still recorded. The node not
+        # answering is not a row's failure but every row's, and ends the pass.
+        try:
+            f = await db.get(FeeLedger, key)
+            if f is not None and not (f.tx_hashes or {}).get("receive") and await _record_receive(ctx, db, f, chain):
+                n += 1
+        except XeError:
+            raise
+        except Exception as e:
+            await db.rollback()
+            log.warning("fee %s: recording its receive failed: %s: %s", key[:12], type(e).__name__, e)
     return n
 
 
@@ -109,7 +121,7 @@ class _FeeChain:
 
     async def arriving(self, send_hash: str) -> bool:
         """Whether a send with no final receive is still on its way in: its receive is on the chain and
-        not final yet, or the node holds the send pending for the fee account, where every pass offers a
+        not final yet, or the node holds the send pending for the fee account, where a pass offers a
         receive for it. Neither is "never received"."""
         if any(b.get("type") == "receive" and b.get("source") == send_hash for b in await self.blocks()):
             return True
@@ -156,14 +168,19 @@ async def settle_due(ctx: Context, db: AsyncSession) -> int:
             elif _stands(f):
                 standing = True
         except Exception as e:  # keep going; the row is as it was last committed, and is taken again next tick
+            log.warning("fee settle failed for %s: %s: %s", key[:12], type(e).__name__, e)
             await db.rollback()
             f = await db.get(FeeLedger, key)
-            f.error = str(e)[:500]
+            f.error = reason(e, 500)
             await db.commit()
-            log.warning("fee settle failed for %s: %s", f.proposal_hash, e)
             # a row whose pass failed (the node could not be read) may hold a block all the same, and
             # that block stands whether or not this pass could look at it
             standing = standing or _stands(f)
+            if isinstance(e, XeError) and e.transient:
+                # the node said nothing, and would say it to every row behind: they wait for the next pass.
+                # Any of them may hold a standing block this pass did not look at, and nothing is built
+                # after this line, so none is built beside it.
+                break
     return n
 
 

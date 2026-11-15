@@ -2595,6 +2595,101 @@ def test_small_rules_of_the_sweep_hold_where_they_are_stated():
     assert "path.exists()" not in inspect.getsource(signer_mod._read_keyfile) + inspect.getsource(signer_mod.Signer.init_keyfile)
     src = inspect.getsource(signer_mod._write_keyfile)
     assert src.index("try:") < src.index("path.parent.mkdir(")
+# ---- XE-3130: one pass over the pending sends is bounded, and spends its budget where it matters -----------
+
+async def test_a_receive_pass_is_bounded_in_number_and_time_and_dust_waits_behind_a_fee(monkeypatch):
+    from dao import chainops
+    monkeypatch.setattr(chainops, "_offered", {})
+    kp = KeyPair.generate()
+    acct = kp.address
+
+    def p(h, amount, asset="XE"):
+        return {"send_hash": h, "source": "s", "destination": acct, "amount": amount, "asset": asset, "timestamp": 0}
+    dust = [p(f"d{i}", 1) for i in range(100)]
+    pending = dust[:50] + [p("junk", 10 ** 12, "JUNK"), p("fee", 5_000_000)] + dust[50:]
+    todo = chainops.receive_order(acct, pending, 0.0)
+    assert len(todo) == chainops.RECEIVE_PASS_MAX < len(pending) and todo[0]["send_hash"] == "fee"
+    assert all(x["asset"] == "XE" for x in todo), "XE before any other asset, whatever number the other carries"
+
+    # offered a receive and pending all the same: it keeps its place ahead of anything smaller, however
+    # much of that has never been tried; among sends of one size the untried go first
+    two = [p("fee", 5_000_000), p("d0", 1)]
+    chainops._offered[(acct, "fee")] = (1, 1000.0)
+    assert [x["send_hash"] for x in chainops.receive_order(acct, two, 1001.0)] == ["fee", "d0"]
+    assert chainops.receive_order(acct, pending, 1001.0)[0]["send_hash"] == "fee"
+    chainops._offered[(acct, "d0")] = (1, 1000.0)
+    assert [x["send_hash"] for x in chainops.receive_order(acct, [p("d0", 1), p("d1", 1)], 1001.0)] == ["d1", "d0"]
+    # from the second time, a doubling wait
+    for n, wait in ((2, 120.0), (3, 240.0), (6, 1920.0), (7, 3600.0), (5000, 3600.0)):
+        chainops._offered[(acct, "fee")] = (n, 1000.0)
+        assert [x["send_hash"] for x in chainops.receive_order(acct, two, 1000.0 + wait - 1)] == ["d0"], n
+        assert [x["send_hash"] for x in chainops.receive_order(acct, two, 1000.0 + wait)] == ["fee", "d0"], n
+    # the record leaves with the send, and another account's is not this pass's to clear
+    chainops._offered[("other", "x")] = (9, 0.0)
+    assert chainops.receive_order(acct, [], 0.0) == [] and chainops._offered == {("other", "x"): (9, 0.0)}
+    chainops._offered.clear()
+
+    class Node:
+        def __init__(self):
+            self.received = []
+
+        async def pending_for(self, address):
+            return list(pending)   # nothing ever lands: every send stays pending
+
+        async def submit_block(self, block):
+            self.received.append(block.source)
+
+    async def tip(chain, address):
+        return "0", {}
+
+    async def signed(ctx_, block, kp_):
+        return block
+
+    async def not_paused():
+        return False
+    monkeypatch.setattr(chainops, "_tip", tip)
+    monkeypatch.setattr(chainops, "signed", signed)
+    ctx = SimpleNamespace(chain=Node(), signer=SimpleNamespace(keypair=lambda name, scope: kp))
+    limit = chainops.RECEIVE_PASS_MAX
+    assert await chainops.receive_pending(ctx, "fee", not_paused) == limit
+    assert ctx.chain.received[0] == "fee" and len(ctx.chain.received) == limit
+    # the next pass offers the fee again, and then dust it has not tried rather than the same dust
+    assert await chainops.receive_pending(ctx, "fee", not_paused) == limit
+    assert ctx.chain.received[limit] == "fee" and len(set(ctx.chain.received)) == 2 * limit - 1
+    # and a pass that has used its time offers nothing more, however long the list
+    monkeypatch.setattr(chainops, "RECEIVE_PASS_S", 0.0)
+    assert await chainops.receive_pending(ctx, "fee", not_paused) == 0 and len(ctx.chain.received) == 2 * limit
+    assert chainops._offered[(acct, "fee")][0] == 2 and all(n == 1 for k, (n, _) in chainops._offered.items() if k[1] != "fee")
+    assert len(chainops._offered) == 2 * limit - 1, "a send the pass did not reach has not been tried"
+
+    # what stops a pass before the submit is not about the send, and is held against none of them: the
+    # node failing our own tip ends the pass, and a pause check that fails is the caller's to hear of
+    from xe.client import XeError
+    monkeypatch.setattr(chainops, "RECEIVE_PASS_S", 30.0)
+    chainops._offered.clear()
+
+    async def no_tip(chain, address):
+        raise XeError(0, "connection refused")
+    monkeypatch.setattr(chainops, "_tip", no_tip)
+    assert await chainops.receive_pending(ctx, "fee", not_paused) == 0
+    monkeypatch.setattr(chainops, "_tip", tip)
+
+    async def no_database():
+        raise RuntimeError("the pause check could not be made")
+    with pytest.raises(RuntimeError):
+        await chainops.receive_pending(ctx, "fee", no_database)
+    assert chainops._offered == {} and len(ctx.chain.received) == 2 * limit
+
+    # a failure that is this send's (its block could not be built) costs it a place and the pass goes on
+    async def one_bad(ctx_, block, kp_):
+        if block.source == "fee":
+            raise ValueError("not a block")
+        return block
+    monkeypatch.setattr(chainops, "signed", one_bad)
+    assert await chainops.receive_pending(ctx, "fee", not_paused) == limit - 1
+    assert chainops._offered[(acct, "fee")][0] == 1 and len(chainops._offered) == limit
+
+
 # ---- XE-11273: nothing a client puts in a header raises out of a middleware --------------------------------
 
 async def test_a_declared_length_is_a_bounded_number_or_the_request_is_refused():
@@ -2619,6 +2714,60 @@ async def test_a_declared_length_is_a_bounded_number_or_the_request_is_refused()
         assert await answer(over) == (413, False), over
     for fits in (b"0", b"2", str(MAX_BODY_BYTES).encode(), b"000002"):
         assert await answer(fits) == (None, True), fits
+
+
+# ---- XE-5883: the chat store is read once the stream is open, so the two overlap ---------------------------
+
+async def test_the_backfill_is_read_after_the_stream_is_open_and_before_anything_from_it():
+    import inspect
+
+    import httpx
+
+    from dao import worker as worker_mod
+    from xe import client as xc
+    order = []
+
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            order.append("first bytes read")
+            yield b'data: {"id":"1"}\n\n'
+
+    def node(status):
+        def handler(request):
+            order.append("stream requested")
+            return httpx.Response(status, stream=Stream())
+        return _node(handler)
+
+    async def caught_up():
+        order.append("store read")
+    c = node(200)
+    got = [item async for item in c.chat_events({"account": "a"}, caught_up)]
+    assert got == [{"id": "1"}] and order == ["stream requested", "store read", "first bytes read"]
+    await c.aclose()
+    # a store that cannot be read ends the stream before anything from it is taken in: a live envelope
+    # stored over an unread backlog would move the cursor past the backlog
+    order.clear()
+
+    async def unreadable():
+        raise xc.XeError(0, "ReadTimeout")
+    c = node(200)
+    with pytest.raises(xc.XeError):
+        async for item in c.chat_events({"account": "a"}, unreadable):
+            order.append(("taken in", item))
+    assert order == ["stream requested"]
+    await c.aclose()
+    # a stream the node refused is not one to catch up behind
+    order.clear()
+    c = node(401)
+    with pytest.raises(xc.XeError):
+        async for item in c.chat_events({"account": "a"}, caught_up):
+            pass
+    assert order == ["stream requested"]
+    await c.aclose()
+    # and the worker reads the store nowhere else: one backfill, handed to the stream
+    src = inspect.getsource(worker_mod.Worker.chat_loop)
+    assert src.count("inbox.backfill(") == 1 and "ctx.chain.chat_events(proof, caught_up)" in src
+    assert src.index("async def caught_up") < src.index("inbox.backfill(") < src.index("ctx.chain.chat_events(")
 
 
 # ---- XE-6983: a failure's own text goes to the server's log, and a response says only that it failed -------

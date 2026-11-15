@@ -313,18 +313,24 @@ class Worker:
                 # store that fails below raises out of the stream, and the next pass asks the node again from
                 # what is on disk (XE-1651, XE-1666, XE-1768).
                 #
-                # The stream is not opened past a backfill that failed, and that is deliberate: the cursor
+                # The stream is not read past a backfill that failed, and that is deliberate: the cursor
                 # is the newest envelope stored, so a live message taken in over an unread backlog would
                 # move the cursor past the backlog and the next backfill would not ask for it. What keeps
                 # this from being a stall is that the backfill can always be read: its bound is sized to
                 # the most a node holds for one account (xe.client.MAX_CHAT_STORE_BYTES, XE-11882).
-                async with session() as db:
-                    n = await inbox.backfill(ctx, db)
-                    await db.commit()
+                #
+                # The backfill is read once the stream is open, not before it: the node sends a stream
+                # only what arrives after it was opened, so an envelope that landed between a backfill and
+                # the stream opened after it was in neither. Read in this order the two overlap, and an
+                # envelope in both is stored once (XE-5883).
+                async def caught_up():
+                    async with session() as db:
+                        n = await inbox.backfill(ctx, db)
+                        await db.commit()
                     if n:
                         log.info("backfilled %d chat messages", n)
                 proof = await inbox.read_proof(ctx)
-                async for d in ctx.chain.chat_events(proof):
+                async for d in ctx.chain.chat_events(proof, caught_up):
                     if self.stop.is_set():
                         break
                     async with session() as db:

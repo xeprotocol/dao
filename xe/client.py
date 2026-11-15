@@ -26,7 +26,7 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 from urllib.parse import quote
 
 import httpx
@@ -528,18 +528,26 @@ class XeClient:
     async def chat_send(self, envelope: dict) -> Any:
         return await self._post_json("/chat/send", envelope)
 
-    async def chat_events(self, proof: dict[str, str]) -> AsyncIterator[dict]:
+    async def chat_events(self, proof: dict[str, str],
+                          opened: Callable[[], Awaitable[None]] | None = None) -> AsyncIterator[dict]:
         """Yield chat envelopes (JSON objects) from the SSE stream for one account. Caller handles
         reconnects. The stream is long-lived, so it has no total deadline; it has an idle limit instead:
         the node pings every 20 seconds, and a stream silent for STREAM_IDLE_S is a dead one that ends
         here as an XeError, so the listener reconnects and backfills (XE-1935). A line longer than any
-        envelope ends it the same way before it is buffered (XE-2305)."""
+        envelope ends it the same way before it is buffered (XE-2305).
+
+        `opened` is awaited once the node has accepted the stream and before anything from it is yielded.
+        The node sends a stream what arrives after it was opened and nothing from before, so that is the
+        moment to read the store: what the store read misses the stream already has (XE-5883). If it
+        raises, the stream ends there and nothing was yielded."""
         idle = httpx.Timeout(self._client.timeout.connect, read=STREAM_IDLE_S)
         try:
             async with self._client.stream("GET", "/chat/events", params=proof, timeout=idle) as r:
                 if r.status_code >= 300:
                     raise XeError(r.status_code, f"chat stream refused: {r.reason_phrase}"[:MAX_ERROR_CHARS])
                 _refuse_compressed(r)
+                if opened is not None:
+                    await opened()
                 buf = bytearray()
                 chunks = r.aiter_bytes().__aiter__()
                 while True:

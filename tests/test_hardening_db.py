@@ -2484,6 +2484,31 @@ async def test_a_passed_resolution_stays_passed_and_a_failed_step_stops_nothing_
     assert (await sessions.get(db, r1.session_id)).kind == "keyset"
     await db.commit()
 
+    # and a fault of the database under one resolution, here as what it is owed is written, undoes that
+    # resolution's step and no other: the one behind it is opened in the same pass (XE-3724)
+    r4, r5 = (Resolution(id=f"r{n}", number=n, title="param", body="b", matter="parameter", ops=param_ops, proposed_by="founder-a",
+                         status="passed", signatures=[]) for n in (4, 5))
+    db.add_all([r4, r5])
+    await db.commit()
+    real_open, real_owed = resolutions.open_session, resolutions._owed
+
+    async def not_this_one(ctx_, db_, r):
+        if r.id == "r4":
+            raise HTTPException(400, "not this one")
+        return await real_open(ctx_, db_, r)
+
+    async def unwritable(ctx_, db_, rid, kind, error):
+        await db_.execute(text("SELECT 1/0"))   # the database refuses a statement, and the transaction with it
+    monkeypatch.setattr(resolutions, "open_session", not_this_one)
+    monkeypatch.setattr(resolutions, "_owed", unwritable)
+    assert await resolutions.open_deferred_sessions(ctx, db) == 1 and r5.session_id
+    await db.commit()   # the session is usable, and the step commits what the pass did
+    monkeypatch.setattr(resolutions, "open_session", real_open)
+    monkeypatch.setattr(resolutions, "_owed", real_owed)
+    assert await resolutions.open_deferred_sessions(ctx, db) == 1
+    assert (await db.execute(select(Resolution.session_id).where(Resolution.id == "r4"))).scalar_one()
+    await db.commit()
+
     # 4. a job step: committed if it returns, rolled back if it raises anything, and the job goes on
     async def half_done():
         db.add(HealthCheck(ts=1, ok=True, detail={}))
@@ -3476,3 +3501,146 @@ async def test_the_statement_handler_recognises_what_asyncpg_raises_for_a_bad_va
             await db.execute(text(ours))
         await db.rollback()
         assert not callers_data(e.value), ours
+
+
+# ---- XE-3724: one item of a worker pass is one step, whatever fails under it -------------------------------
+
+async def test_one_items_database_fault_costs_that_item_and_no_other(db, monkeypatch):
+    """Every loop a worker step runs over independent items: the open tallies, the fee receives, the replies
+    whose outcome is not on disk. The middle item's write is refused by the database, which fails the
+    transaction until it is rolled back. The items either side are done in the same pass, the session is
+    usable afterwards, and the item that failed is done on the next pass."""
+    from dao.models import OutboxMessage
+    ctx, chain, fee = _fee_ctx()
+    ctx.signer._kp["dao"] = KeyPair.generate()
+    real, fault = ctx.events.append, {"on": None}
+
+    async def append(db_, kind, actor, payload, **kw):
+        if fault["on"] and fault["on"](kind, payload):
+            await db_.execute(text("SELECT 1/0"))
+        return await real(db_, kind, actor, payload, **kw)
+    ctx.events.append = append
+
+    async def fresh(model):
+        return (await db.execute(select(model).execution_options(populate_existing=True))).scalars().all()
+
+    # 1. open tallies: three open proposals, each with a row to re-derive (the account has no chain: weight 0)
+    now = time.time_ns()
+    for h in "123":
+        db.add(Proposal(hash=h * 64, title="t", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64,
+                        author_signature="s", author_timestamp=now, fee_block_hash=h * 64, status="open", opened_at=now - D,
+                        closes_at=now + D, rules=ctx.config.pinned_rules(), analysis=[]))
+        db.add(Vote(proposal_hash=h * 64, account="ok", pub_key="p" * 64, choice="for", reason="", timestamp=now,
+                    signature=os.urandom(8).hex(), weight=1, participating=True, is_agent=False, eligibility={}))
+    await db.commit()
+    fault["on"] = lambda kind, payload: kind == "vote.rederived" and payload["proposal"] == "2" * 64
+    assert await portal.rederive_open(ctx, db) == 2
+    await db.commit()
+    assert {v.proposal_hash[0]: v.weight for v in await fresh(Vote)} == {"1": 0, "2": 1, "3": 0}
+    logged = (await db.execute(select(Event).where(Event.kind == "vote.rederived"))).scalars().all()
+    assert sorted(e.payload["proposal"][0] for e in logged) == ["1", "3"], "a changed weight and its entry go together"
+    fault["on"] = None
+    assert await portal.rederive_open(ctx, db) == 1 and await portal.rederive_open(ctx, db) == 0
+    await db.commit()
+    assert {v.weight for v in await fresh(Vote)} == {0}
+
+    # 2. fee receives: three fees whose receives the chain holds final
+    chain.pending = [{"send_hash": h * 64, "source": AUTHOR, "destination": fee, "amount": 1000, "asset": "XE", "timestamp": 0}
+                     for h in "abc"]
+    for h in "abcd":   # the fourth has no receive anywhere
+        db.add(FeeLedger(fee_block_hash=h * 64, proposal_hash=h * 64, payer=AUTHOR, amount=1000, state="seen", tx_hashes={}))
+    await db.commit()
+    assert await fees.receive_all(ctx, db) == 3
+    fault["on"] = lambda kind, payload: kind == "fee.received" and payload["source"] == "b" * 64
+    assert await fees.record_receives(ctx, db) == 2
+    assert {f.fee_block_hash[0]: bool(f.tx_hashes) for f in await fresh(FeeLedger)} == {"a": True, "b": False, "c": True, "d": False}
+    fault["on"] = None
+    assert await fees.record_receives(ctx, db) == 1 and await fees.record_receives(ctx, db) == 0
+    # the node not answering is not one row's failure: the pass ends, and the step says so
+    read = ctx.chain.full_chain
+
+    async def down(account):
+        raise XeError(0, "ReadTimeout")
+    ctx.chain.full_chain = down
+    with pytest.raises(XeError):
+        await fees.record_receives(ctx, db)
+    await db.rollback()
+    ctx.chain.full_chain = read
+
+    # 3. replies whose envelope the node's store holds: recorded sent, each in its own step
+    store = []
+
+    async def messages(proof, since):
+        return [e for e in store if e["timestamp"] > since]
+
+    async def proof(ctx_):
+        return {}
+    ctx.chain.chat_messages = messages
+    monkeypatch.setattr(inbox, "read_proof", proof)
+    for oid in ("o1", "o2", "o3"):
+        env = {"id": f"env-{oid}", "timestamp": now - 3600 * inbox.NS, "message": oid, "to": "c" * 64}
+        store.append(env)
+        db.add(OutboxMessage(id=oid, to_account="c" * 64, body=oid, status="sending", in_reply_to="m", from_seat="harness",
+                             envelope=env, error=""))
+    await db.commit()
+    fault["on"] = lambda kind, payload: kind == "outbox.sent" and payload["id"] == "o2"
+    assert await inbox.flush_outbox(ctx, db) == 2
+    assert {o.id: o.status for o in await fresh(OutboxMessage)} == {"o1": "sent", "o2": "sending", "o3": "sent"}
+    fault["on"] = None
+    assert await inbox.flush_outbox(ctx, db) == 1
+    assert {o.status for o in await fresh(OutboxMessage)} == {"sent"}
+
+
+async def test_a_health_leg_the_database_fails_costs_that_leg_and_the_check_is_still_recorded(db, monkeypatch):
+    from dao.services import records
+    ctx, state = _health_ctx()
+
+    async def broken(db_, written=False):
+        await db_.execute(text("SELECT 1 / 0"))   # a statement the database refuses, which fails the transaction it is in
+    monkeypatch.setattr(records, "latest_anchor", broken)
+    await ctx.events.append(db, "x", "harness", {}, public=True)
+    await db.commit()
+    EventLog._verify_cache = None
+    d = await records.health_pass(ctx, db)
+    await db.commit()
+    # the leg says what kind of failure it was and none of the driver's words (XE-6983)
+    assert "anchor_error" in d["errors"] and " " not in d["anchor_error"] and "zero" not in d["anchor_error"].lower()
+    # the leg behind it had a transaction to read in, and the check is on record with its entry
+    assert "sessions_error" not in d and d["sessions_aging"] == []
+    rows = (await db.execute(select(HealthCheck))).scalars().all()
+    assert len(rows) == 1 and rows[0].ok is False and rows[0].detail["errors"] == d["errors"]
+    kinds = (await db.execute(select(Event.kind))).scalars().all()
+    assert kinds.count("health.degraded") == 1
+
+
+async def test_a_node_that_does_not_answer_ends_the_settle_pass_and_a_refusal_of_one_row_does_not(db, monkeypatch):
+    ctx, chain, fee = _fee_ctx(funded=3000)
+    for n in "12":
+        db.add(FeeLedger(fee_block_hash=n * 64, proposal_hash=n * 64, payer=AUTHOR, amount=1000, state="due_burn",
+                         tx_hashes={"receive": "9" * 64}))
+    await db.commit()
+    asked = []
+
+    def failing(e):
+        async def build(*a, **k):
+            asked.append(e)
+            raise e
+        return build
+
+    async def errors():
+        got = (await db.execute(select(FeeLedger).execution_options(populate_existing=True).order_by(FeeLedger.fee_block_hash))).scalars().all()
+        return [r.error for r in got]
+    # no answer: the rows behind would be told the same, and each would wait out its own timeout
+    monkeypatch.setattr(fees.chainops, "build_burn", failing(XeError(0, "ReadTimeout")))
+    assert await fees.settle_due(ctx, db) == 0 and len(asked) == 1
+    assert await errors() == ["node unreachable: ReadTimeout", ""]
+    # an answer that refuses one row says nothing about the next
+    asked.clear()
+    monkeypatch.setattr(fees.chainops, "build_burn", failing(XeError(400, "previous is not the account's tip")))
+    assert await fees.settle_due(ctx, db) == 0 and len(asked) == 2
+    assert all("400" in e for e in await errors())
+    # nor does a failure that is not the node's at all, and its words stay off the row
+    asked.clear()
+    monkeypatch.setattr(fees.chainops, "build_burn", failing(RuntimeError("connection to 10.0.0.5 lost")))
+    assert await fees.settle_due(ctx, db) == 0 and len(asked) == 2 and await errors() == ["RuntimeError", "RuntimeError"]
+    assert chain.submits == []
