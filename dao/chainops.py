@@ -301,7 +301,11 @@ async def _build_out(ctx: Context, key_name: str, scope: str, type_: str, amount
 # is certain of, and the snapshot says `unsettled`. That is said whatever date the block carries: the place
 # it holds may yet go to another block, and that one can be dated on either side of the snapshot. The
 # source a receive names is held to the same: one that is not final has not happened yet, and its receive
-# is not counted. A row derived from an unsettled snapshot is not
+# is not counted. That too is `unsettled`, and so is a source the node does not hold: either can be final
+# and held on the next read, and a snapshot that left the receive out and called itself settled was never
+# derived again, so the weight stayed short of a balance the chain went on to confirm (XE-14676). Only a
+# source that is final and dated after the snapshot settles its receive as not counted. A row derived
+# from an unsettled snapshot is not
 # current (`portal.is_current`): it is derived again on every pass and at the close, so what is tallied is
 # the chain as final as it was when the proposal closed. Leaving a block out can raise a figure as well as
 # lower it (a send that is not final has not yet left), but never counts one balance twice: the receive
@@ -320,7 +324,7 @@ CAUSAL_LOOKUP_CONCURRENCY = 8
 # Bumped whenever the figure this function derives for the same chain and `at` can change. A vote row
 # stores the result it was derived from; at close, rows derived under another `at` or rule are re-derived
 # before they are tallied (XE-1617).
-SNAPSHOT_RULE = 5
+SNAPSHOT_RULE = 6
 # Block types that raise the asset balance by bringing value from another block, which `source` names.
 ARRIVALS = ("receive", "lease_settle")
 
@@ -382,6 +386,9 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
     sources = sorted(by_amount, key=lambda s_: -by_amount[s_])
     capped = len(sources) > MAX_CAUSAL_LOOKUPS
     causal = await _sends_at_or_before(chain, sources[:MAX_CAUSAL_LOOKUPS], at_ns)
+    # a source that is not final, or not held, has not been decided: its receive is left out of this
+    # figure, and the figure is not the last word (see above)
+    unsettled = unsettled or any(v is None for v in causal.values())
     bal = 0        # the asset's on-chain balance after the last block seen
     tainted = 0    # the part of `bal` that arrived through excluded receives and has not left since
     snap = ""
@@ -415,13 +422,15 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
             "unsettled": unsettled, "at": at_ns, "rule": SNAPSHOT_RULE}
 
 
-async def _sends_at_or_before(chain: XeClient, send_hashes: list[str], at_ns: int) -> dict[str, bool]:
-    """For each source block (a send, or the lease a settle pays out): True when it is on the chain, final,
-    and dated at or before `at_ns`. One read per distinct hash, a bounded number in flight; a hash not in
-    the result is not causal."""
+async def _sends_at_or_before(chain: XeClient, send_hashes: list[str], at_ns: int) -> dict[str, bool | None]:
+    """For each source block (a send, or the lease a settle pays out), one of three answers. True: it is
+    on the chain, final, and dated at or before `at_ns`. False: it is final and is not, or the receive
+    names no source; that does not change. None: the node does not hold it, or holds it and it is not
+    final, and the next read may say otherwise. One read per distinct hash, a bounded number in flight; a
+    hash not in the result is not causal."""
     gate = asyncio.Semaphore(CAUSAL_LOOKUP_CONCURRENCY)
 
-    async def one(h: str) -> bool:
+    async def one(h: str) -> bool | None:
         if not h:
             return False
         async with gate:
@@ -429,10 +438,12 @@ async def _sends_at_or_before(chain: XeClient, send_hashes: list[str], at_ns: in
                 src = await chain.block(h)
             except XeError as e:
                 if e.status == 404:
-                    return False
+                    return None
                 raise
+        if src.get("finalized") is not True:
+            return None
         ts = src.get("timestamp")
-        return src.get("finalized") is True and type(ts) is int and ts <= at_ns
+        return type(ts) is int and ts <= at_ns
 
     found = await asyncio.gather(*(one(h) for h in send_hashes))
     return dict(zip(send_hashes, found))

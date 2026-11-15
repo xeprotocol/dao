@@ -2807,10 +2807,25 @@ async def test_a_snapshot_walks_only_the_blocks_the_node_holds_final():
     # the place it holds may yet go to a block dated before the snapshot
     s = await account_snapshot(Served(opened, b("s", 0, T + 1, "send", finalized=False)), "a", T)
     assert (s["balance"], s["unsettled"]) == (1000, True)
-    # a receive counts only if the source it names is final too, whatever stands in the flag's place
+    # a receive counts only if the source it names is final too, whatever stands in the flag's place. A
+    # source that is not final has not been decided, so the snapshot that left its receive out is not
+    # settled either: it is derived again, and counts the receive once the source is final (XE-14676)
     near = b("r", 1500, T - 1, finalized=True)
-    assert (await account_snapshot(Served(opened, near), "a", T))["balance"] == 1500
-    for flag in ({"finalized": False}, {}, {"finalized": "true"}, {"finalized": True, "timestamp": None}):
+    s = await account_snapshot(Served(opened, near), "a", T)
+    assert (s["balance"], s["excluded_receives"], s["unsettled"]) == (1500, [], False)
+    for flag in ({"finalized": False}, {}, {"finalized": "true"}):
+        s = await account_snapshot(Served(opened, near, source=flag), "a", T)
+        assert (s["balance"], s["excluded_receives"], s["unsettled"]) == (1000, ["r"], True), flag
+
+    class Unheld(Served):
+        async def block(self, h):
+            from xe.client import XeError
+            raise XeError(404, "not found")
+    # a source the node does not hold is the same: it may hold it on the next read
+    s = await account_snapshot(Unheld(opened, near), "a", T)
+    assert (s["balance"], s["excluded_receives"], s["unsettled"]) == (1000, ["r"], True)
+    # a source that is final and is not dated at or before the snapshot is decided, and for good
+    for flag in ({"finalized": True, "timestamp": None}, {"finalized": True, "timestamp": T + 1}):
         s = await account_snapshot(Served(opened, near, source=flag), "a", T)
         assert (s["balance"], s["excluded_receives"], s["unsettled"]) == (1000, ["r"], False), flag
     # an account with nothing final does not exist yet, and says why it may
