@@ -49,7 +49,7 @@ from xe.client import XeError
 
 from .. import chainops
 from ..context import Context
-from ..faults import reason
+from ..faults import Fault, reason
 from ..log import EventLog
 from ..models import FeeLedger, Proposal
 from ..signer import SignerError
@@ -253,8 +253,9 @@ async def _settle(ctx: Context, db: AsyncSession, f: FeeLedger, *, build: bool =
     if "settle_nonce" in (f.tx_hashes or {}):
         # Marked by the release before this one, which named its block by a nonce in the memo and kept no
         # hash. Whether that block went out cannot be told from the row, so no block is built for it here.
-        raise RuntimeError(f"settlement was begun under the memo-nonce scheme (nonce {f.tx_hashes['settle_nonce']}) "
-                           "and is not continued automatically: check the fee account's chain for that memo")
+        # In the service's own words (`Fault`): the row's `error` is where an operator reads what to do.
+        raise Fault(f"settlement was begun under the memo-nonce scheme (nonce {f.tx_hashes['settle_nonce']}) "
+                    "and is not continued automatically: check the fee account's chain for that memo")
     if f.state in DUE:
         _mark(f, "refund" if f.state == "due_refund" else "burn")
         await db.commit()

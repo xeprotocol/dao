@@ -11,11 +11,20 @@ from xe.encoding import EncodingError
 from xe.keys import KeyError_
 from xe.statechain import StateChainError
 
+from .log import LogError
 from .signer import SignerError
 
+
+class Fault(RuntimeError):
+    """A failure this service states in its own words, for whoever reads the row or the log entry it ends up
+    on. Raised where the code has something to tell an operator and no narrower type to tell it with: a bare
+    RuntimeError's text is not kept (`reason`), because most of them are not ours."""
+
+
 # Failures whose message this code or the protocol package wrote: the node's answer as the client words
-# it, a refused key, signature, block, op, keyset or envelope, the signer saying what it does not hold.
-WORDED = (XeError, StateChainError, KeyError_, EncodingError, ChatError, DirectoryError, SignerError)
+# it, a refused key, signature, block, op, keyset or envelope, the signer saying what it does not hold, the
+# log saying it could not be written, and what the service raises as its own (`Fault`).
+WORDED = (XeError, StateChainError, KeyError_, EncodingError, ChatError, DirectoryError, SignerError, LogError, Fault)
 
 
 def worded(e: BaseException) -> bool:

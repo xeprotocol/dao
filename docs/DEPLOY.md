@@ -50,12 +50,12 @@ export GIT_COMMIT=$(git rev-parse --short HEAD)
 docker compose build
 ```
 
-Build before every test run, not only the first. The image holds the code under test (`dao/` and `xe/` are copied in when it is built) and the commands below mount only `tests/`, so tests run without a build are the new tests against the old code. Building does not touch the running services; they change at `docker compose up`.
+Build before every test run, not only the first. The image holds the code under test (`dao/` and `xe/` are copied in when it is built) and the commands below mount only `tests/` and the env template (which the image leaves out and two tests read), so tests run without a build are the new tests against the old code. Building does not touch the running services; they change at `docker compose up`.
 
 Unit tests (no database, no network): byte-exact hashing against blocks captured from the live testnet, signed-request verification, keyfile, tally rules, copy lint, template parse.
 
 ```sh
-docker compose run --rm --no-deps -v $PWD/tests:/app/tests app \
+docker compose run --rm --no-deps -v $PWD/tests:/app/tests -v $PWD/.env.example:/app/.env.example:ro app \
   sh -c "pip install -q pytest pytest-asyncio && pytest -q tests/test_xe_wire.py tests/test_dao_core.py tests/test_templates.py"
 ```
 
@@ -66,7 +66,7 @@ Database-backed tests: the log chain, and the inbox / vote / fee hardening (uses
 ```sh
 docker compose up -d db
 docker compose exec db psql -U dao -d dao -c "CREATE DATABASE dao_test;"   # once; "already exists" on later runs is fine
-docker compose run --rm -v $PWD/tests:/app/tests app sh -c \
+docker compose run --rm -v $PWD/tests:/app/tests -v $PWD/.env.example:/app/.env.example:ro app sh -c \
   'pip install -q pytest pytest-asyncio && DAO_TEST_DATABASE_URL="postgresql+asyncpg://dao:$POSTGRES_PASSWORD@db:5432/dao_test" pytest -q tests/'
 ```
 

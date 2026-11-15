@@ -3117,6 +3117,19 @@ async def test_no_response_carries_the_text_of_a_failure_the_service_did_not_wri
     assert str(e.value) == "node unreachable: ConnectError" and e.value.transient
     await c.aclose()
 
+    # What the service has to tell an operator it raises as its own: the words are kept, on the row or the
+    # entry they were written for. A bare RuntimeError saying the same is not ours to tell from the rest, so
+    # nothing in the services, the chain operations or the worker raises one.
+    from dao.log import LogError
+    told = "settlement was begun under the memo-nonce scheme (nonce ab12cd34)"
+    assert faults.reason(faults.Fault(told), 500) == told and faults.reason(RuntimeError(told), 500) == "RuntimeError"
+    assert faults.reason(LogError("harness key will not sign: scope")) == "harness key will not sign: scope"
+    for path in [*(ROOT / "dao" / "services").glob("*.py"), ROOT / "dao" / "chainops.py", ROOT / "dao" / "worker.py"]:
+        for n in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call):
+                assert ast.unparse(n.exc.func) not in ("RuntimeError", "ValueError", "TypeError", "Exception"), \
+                    f"{path.name}:{n.lineno} words a failure under a type whose words are not kept"
+
 
 # ---- XE-10085: a setting the template offers is read ------------------------------------------------------
 
