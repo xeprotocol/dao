@@ -2654,7 +2654,9 @@ def test_rows_are_written_before_the_log_head_is_taken():
 
 async def test_an_anchor_number_belongs_to_the_block_the_chain_holds():
     """XE-6256 / XE-4148. An ended session's block lands after a later session has taken its number: the
-    register row goes to the block that is on the chain. A row that already names a block there stands."""
+    register row goes to the block that is on the chain. Where the row already names a block there, the
+    chain holds under the number what the later of the two wrote, so the higher index has the row,
+    whichever is recorded first (XE-14127)."""
     from dao.models import Anchor
     from dao.services import sessions
 
@@ -2678,10 +2680,17 @@ async def test_an_anchor_number_belongs_to_the_block_the_chain_holds():
     await sessions._anchor_written(db, s)
     assert (waiting.session_id, waiting.event_index, waiting.head_hash, waiting.statechain_index, waiting.statechain_hash) \
         == ("s2", 70, "h2", 12, "bh") and db.added == []
-    written = row(5)
-    db = Db(None, written)
+    earlier = row(5)
+    db = Db(None, earlier)
     await sessions._anchor_written(db, s)
-    assert (written.session_id, written.event_index, written.statechain_index) == ("s1", 60, 5) and db.added == []
+    assert (earlier.session_id, earlier.event_index, earlier.head_hash, earlier.statechain_index, earlier.statechain_hash) \
+        == ("s2", 70, "h2", 12, "bh") and db.added == [], "a block below this one was written over on the chain"
+    for index in (12, 20):
+        later = row(index)
+        db = Db(None, later)
+        await sessions._anchor_written(db, s)
+        assert (later.session_id, later.event_index, later.head_hash, later.statechain_index) == ("s1", 60, "h1", index) \
+            and db.added == [], "a block at or above this one is what the chain holds"
     db = Db(None, None)
     await sessions._anchor_written(db, s)
     assert len(db.added) == 1 and isinstance(db.added[0], Anchor)
@@ -3737,7 +3746,7 @@ async def test_the_treasury_row_shows_a_keyset_or_says_there_is_none():
     from xe.client import XeError
 
     async def down(account):
-        raise XeError(503, "busy")
+        raise XeError(503, "the node refused", said="busy")      # as the client raises it: its words, then the node's
     ctx.chain.keyset_of = down
     html = tmpl.render(treasury=await records._treasury(ctx))
     assert "could not be read from the node" in html and none not in html
@@ -4153,7 +4162,7 @@ async def test_a_refusal_to_authorise_is_the_nodes_answer_and_not_the_accounts(m
     for status, the_accounts in ((413, True), (400, True), (422, True), (401, False), (403, False), (407, False),
                                  (503, False), (0, False)):
         async def snapshot(chain, account, at, asset, _status=status):
-            raise XeError(_status, "said by whatever answered")
+            raise XeError(_status, "refused", said="said by whatever answered")     # as the client raises it
         monkeypatch.setattr(portal, "account_snapshot", snapshot)
         if not the_accounts:
             with pytest.raises(XeError):

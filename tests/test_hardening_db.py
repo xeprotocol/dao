@@ -1078,11 +1078,12 @@ async def test_health_degrades_on_unexpected_keyset_log_tamper_stale_tip_faults_
     fresh.statechain_index, fresh.statechain_hash = 6, "t" * 64
     await db.flush()
     assert (await _check(ctx, db))["ok"]
-    # a session approving for longer than a day is reported
+    # a session approving for longer than a day is reported, with the signatures that count under the keyset as
+    # it is now (k3, k2): one from k1, which was rotated out above, is held and is not one of them (XE-3877)
     old = SigningSession(id="old1", kind="parameter", title="R", ops=[{"action": "set", "key": "dao.t", "value": "1"}],
                          ops_digest="b" * 64, status="signing", approvals=[], required_approvals=2, block=None,
-                         block_hash="h", block_signatures=[{"public_key": "k1", "signature": "s"}], rebuilds=0,
-                         created_at=datetime.now(timezone.utc) - timedelta(days=30))
+                         block_hash="h", block_signatures=[{"public_key": "k2", "signature": "s"}, {"public_key": "k1", "signature": "s"}],
+                         rebuilds=0, created_at=datetime.now(timezone.utc) - timedelta(days=30))
     db.add(old)
     await db.flush()
     d = await _check(ctx, db)
