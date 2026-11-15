@@ -21,9 +21,36 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+class _OneOfEachName(yaml.SafeLoader):
+    """YAML as `safe_load` reads it, except that a mapping which gives one name twice is refused. YAML
+    keeps the last and says nothing, so a second `fee_micro_xe` further down a schedule replaced the
+    first, and the check of names and domains (`require_valid_schedules`) saw one well-formed value and
+    never the other: a name the file should not have there, which is what that check exists to refuse
+    (XE-14108). A merge key (`<<`) is refused with it: what it merges in is spliced into the mapping
+    without being read as one, so a name given twice inside it was taken, and a name it gives beside
+    one the mapping gives is two values for one name whichever wins. No file here uses one."""
+
+    def construct_mapping(self, node, deep=False):
+        seen: set = set()
+        for key_node, _ in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                raise ValueError(f"{Path(key_node.start_mark.name).name}: line {key_node.start_mark.line + 1} merges "
+                                 f"another mapping in (`<<`); each name is given where it is read")
+            key = self.construct_object(key_node, deep=True)
+            try:
+                twice = key in seen
+                seen.add(key)
+            except TypeError:   # an unhashable key, which the constructor below refuses in its own words
+                continue
+            if twice:
+                raise ValueError(f"{Path(key_node.start_mark.name).name}: line {key_node.start_mark.line + 1} gives "
+                                 f"{str(key)[:60]!r} a second time; a name is given once")
+        return super().construct_mapping(node, deep)
+
+
 def _load_yaml(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        return yaml.load(f, Loader=_OneOfEachName) or {}   # noqa: S506 (a SafeLoader)
 
 
 def slugify(text: str) -> str:
@@ -325,6 +352,14 @@ def seat_conflicts(cfg: Config) -> list[str]:
 # so (XE-3160 and the value-by-value reports after it). The API, the worker and the CLI all come through
 # `load_config`, so one check here is the check for all three. A key that is absent takes the code's
 # default, which is in the domain; a key that is present is checked.
+#
+# A key that is present is also one the file has. The first version of this checked every value it knew
+# and looked at no name it did not: `knd: member` on a founder's seat, `treasuy:` under accounts or
+# `open_vot:` at the top loaded cleanly, the real key was absent, and the default stood in for what the
+# members had written, which is the failure above by the other spelling (XE-14108). So every mapping in
+# the two schedules is closed: the tables below name its keys, and a name that is not there refuses the
+# load. That includes the parts the code only publishes (the thresholds, the two lists of what the agents
+# decide), which are in the tables with the shape their readers assume (XE-14107).
 
 U64_MAX = 2**64 - 1
 FEE_ACTIONS = ("refund", "burn")                       # `fees.DUE` is `due_` + each
@@ -358,7 +393,36 @@ def _strings(ok, words: str, *, empty: bool):
     return check, words
 
 
+def _text():
+    return (lambda v: type(v) is str and bool(v.strip())), "a word or a phrase"
+
+
+def _phrases():
+    return _strings(lambda x: bool(x.strip()), "a list of distinct phrases", empty=True)
+
+
+def _unknown(where: str, section: dict, known) -> list[str]:
+    """The names in `section` that are not among `known`, each as a fault that says which names are."""
+    known = sorted(known)
+    return [f"{where}{str(key)[:60]!r} is not a name this file has there; the names are {', '.join(known)}"
+            for key in section if key not in known]
+
+
+# Section by section, the keys Schedule B has and the domain of each. "" is the top of the file; a
+# dotted name is a section inside a section, and is itself a key of the one it is in.
 SCHEDULE_B_DOMAINS: dict[str, dict[str, tuple]] = {
+    "": {
+        "version": _whole(1, 10**6),
+        "agents_decide": _phrases(),
+        "agents_do_not_decide": _phrases(),
+        "agent_budget_micro_xe": _whole(0, U64_MAX),
+    },
+    "quorums": {"member": _text(), "specialist_agents": _text()},
+    "thresholds": {"reserved_matters": _text(), "other_oa_rules": _text()},
+    "thresholds.charter_core_principles": {
+        "members_fraction": ((lambda v: type(v) in (int, float) and 0 < v <= 1), "a number above 0, up to 1"),
+        "specialists": _text(),
+    },
     "cadence": {
         "health_check_minutes": _whole(1, 60),
         "directory_reregister_minutes": _whole(1, 29),      # inside the node's 30-minute directory TTL
@@ -372,6 +436,7 @@ SCHEDULE_B_DOMAINS: dict[str, dict[str, tuple]] = {
     "windows": {
         "open_vote_days": _whole(1, 365),
         "protocol_parameter_days": _whole(1, 365),
+        "reserved_matter": _text(),
         "upgrade_timelock_hours": _whole(0, 8760),
         "upgrade_timelock_status": _one_of(TIMELOCK_STATUSES),
     },
@@ -404,36 +469,73 @@ SCHEDULE_B_DOMAINS: dict[str, dict[str, tuple]] = {
 
 
 def schedule_b_faults(cfg: Config) -> list[str]:
-    """Every Schedule B value that is outside its domain (`SCHEDULE_B_DOMAINS`), in the file's own words."""
+    """Every Schedule B name the file does not have and every value that is outside its domain
+    (`SCHEDULE_B_DOMAINS`), in the file's own words."""
     out: list[str] = []
     if not isinstance(cfg.schedule_b, dict):
         return ["the file is not a mapping"]
     for path, domain in SCHEDULE_B_DOMAINS.items():
         section: Any = cfg.schedule_b
-        for name in path.split("."):
+        for name in (path.split(".") if path else ()):
             section = section.get(name, {}) if isinstance(section, dict) else None
         if not isinstance(section, dict):
             out.append(f"{path} must be a mapping")
             continue
+        where = f"{path}." if path else ""
+        inside = {p.rpartition(".")[2] for p in SCHEDULE_B_DOMAINS if p and p.rpartition(".")[0] == path}
+        out += _unknown(where, section, set(domain) | inside)
         for key, (ok, words) in domain.items():
             if key in section and not ok(section[key]):
-                out.append(f"{path}.{key} is {section[key]!r}; it must be {words}")
+                out.append(f"{where}{key} is {section[key]!r}; it must be {words}")
+    # One matter is in one of the two lists. In both, the page that prints them said the agents decide it
+    # and do not, and each list was well formed on its own (XE-14107).
+    lists = [cfg.schedule_b.get(k) for k in ("agents_decide", "agents_do_not_decide")]
+    if all(_phrases()[0](x) for x in lists):
+        both = sorted({p.strip().lower() for p in lists[0]} & {p.strip().lower() for p in lists[1]})
+        if both:
+            out.append(f"agents_decide and agents_do_not_decide both hold {', '.join(repr(p[:60]) for p in both)}; "
+                       "a matter is in one of them")
     w = cfg.schedule_b.get("windows")
     if isinstance(w, dict) and w.get("upgrade_timelock_status") == "active" and w.get("upgrade_timelock_hours", 0) == 0:
         out.append("windows.upgrade_timelock_status is active with upgrade_timelock_hours of 0: an armed timelock runs for at least an hour")
     return out
 
 
+# The keys Schedule C has, mapping by mapping. `accounts` names the three accounts the code reads; a
+# fourth name there is read by nothing.
+SCHEDULE_C_KEYS: dict[str, tuple[str, ...]] = {
+    "": ("version", "mode", "repository", "human_seats", "agent_seats", "tool_scopes", "model_candidates", "accounts"),
+    "repository": ("url", "licence", "audit"),
+    "accounts": ("dao", "fee", "treasury"),
+    "human seat": ("id", "name", "kind", "role", "public_key", "may"),
+    "agent seat": ("id", "role", "class", "status", "model", "account", "tool_scopes", "optional", "summary"),
+}
+
+
 def schedule_c_faults(cfg: Config) -> list[str]:
-    """Every seat attribute in Schedule C that is outside its vocabulary, read from the file as written
-    (the `human_seats` property turns `may: pause` into a tuple of letters, and a seat whose `kind` is
-    not exactly `member` into an officer). A seat's key, where given, is one a signature can verify
-    under: a seat that is counted and can never sign is the deadlock of XE-2073 by another spelling."""
+    """Every name in Schedule C the file does not have (`SCHEDULE_C_KEYS`) and every seat attribute that
+    is outside its vocabulary, read from the file as written (the `human_seats` property turns
+    `may: pause` into a tuple of letters, and a seat whose `kind` is not exactly `member` into an
+    officer). A seat's key, where given, is one a signature can verify under: a seat that is counted and
+    can never sign is the deadlock of XE-2073 by another spelling."""
     out: list[str] = []
+    if not isinstance(cfg.schedule_c, dict):
+        return ["the file is not a mapping"]
+    out += _unknown("", cfg.schedule_c, SCHEDULE_C_KEYS[""])
+    repository = cfg.schedule_c.get("repository")
+    if repository is not None and not isinstance(repository, dict):
+        out.append("repository must be a mapping")
+    out += _unknown("repository.", repository if isinstance(repository, dict) else {}, SCHEDULE_C_KEYS["repository"])
+    candidates = cfg.schedule_c.get("model_candidates")
+    if candidates is not None and not _phrases()[0](candidates):
+        out.append(f"model_candidates is {candidates!r}; it must be {_phrases()[1]}")
+    if "version" in cfg.schedule_c and not _whole(1, 10**6)[0](cfg.schedule_c["version"]):
+        out.append(f"version is {cfg.schedule_c['version']!r}; it must be {_whole(1, 10**6)[1]}")
     if "mode" in cfg.schedule_c and not _one_of(MODES)[0](cfg.schedule_c["mode"]):
         out.append(f"mode is {cfg.schedule_c['mode']!r}; it must be one of {', '.join(MODES)}")
     for i, s in enumerate(cfg.schedule_c.get("human_seats") or []):
         seat = f"human seat {i + 1} ({s.get('id')})"
+        out += _unknown(f"{seat}: ", s, SCHEDULE_C_KEYS["human seat"])
         if "kind" in s and not _one_of(SEAT_KINDS)[0](s["kind"]):
             out.append(f"{seat}: kind is {s['kind']!r}; it must be one of {', '.join(SEAT_KINDS)}")
         if "may" in s and not _strings(lambda x: x in SEAT_RIGHTS, "", empty=True)[0](s["may"]):
@@ -444,28 +546,31 @@ def schedule_c_faults(cfg: Config) -> list[str]:
     accounts = cfg.schedule_c.get("accounts")
     if accounts is not None and not isinstance(accounts, dict):
         out.append("accounts must be a mapping of names to accounts")
+    out += _unknown("accounts.", accounts if isinstance(accounts, dict) else {}, SCHEDULE_C_KEYS["accounts"])
     for name, account in (accounts.items() if isinstance(accounts, dict) else ()):
         # every signed request is addressed to `dao`, fees are paid to `fee`, and the vote leaves these
         # out of the weight: a value that is no account is one nothing on the chain can ever match
-        if account not in (None, "") and not (isinstance(account, str) and _HEX64_ANY.fullmatch(account)):
+        if name in SCHEDULE_C_KEYS["accounts"] and account not in (None, "") and not (isinstance(account, str) and _HEX64_ANY.fullmatch(account)):
             out.append(f"accounts.{name} is {account!r}; it must be a 64-hex account, or left empty")
     scopes = cfg.schedule_c.get("tool_scopes")
     if scopes is not None and not isinstance(scopes, dict):
         out.append("tool_scopes must be a mapping of scope names to what each allows")
     for i, s in enumerate(cfg.schedule_c.get("agent_seats") or []):
         seat = f"agent seat {i + 1} ({s.get('id')})"
+        out += _unknown(f"{seat}: ", s, SCHEDULE_C_KEYS["agent seat"])
         for key, names in (("class", AGENT_CLASSES), ("status", AGENT_STATUSES)):
             if key in s and not _one_of(names)[0](s[key]):
                 out.append(f"{seat}: {key} is {s[key]!r}; it must be one of {', '.join(names)}")
         if "optional" in s and type(s["optional"]) is not bool:
             out.append(f"{seat}: optional is {s['optional']!r}; it must be true or false")
-        if "tool_scopes" in s and not _strings(lambda x: not isinstance(scopes, dict) or x in scopes, "", empty=True)[0](s["tool_scopes"]):
+        # from the glossary, which has to be there for a seat to name one: with none, every name passed
+        if "tool_scopes" in s and not _strings(lambda x: isinstance(scopes, dict) and x in scopes, "", empty=True)[0](s["tool_scopes"]):
             out.append(f"{seat}: tool_scopes is {s['tool_scopes']!r}; it must be a list of distinct scopes from the glossary")
     return out
 
 
 def require_valid_schedules(cfg: Config) -> None:
-    """Refuse a config whose schedules carry a value outside its domain, naming every one. Called by
+    """Refuse a config whose schedules carry a name they do not have or a value outside its domain, naming every one. Called by
     `load_config` after the seats are known to be well formed (`require_distinct_seats`)."""
     faults = [f"schedule_b.yaml: {f}" for f in schedule_b_faults(cfg)] + [f"schedule_c.yaml: {f}" for f in schedule_c_faults(cfg)]
     if faults:

@@ -1748,14 +1748,18 @@ def test_a_schedule_value_outside_its_domain_is_refused_at_load(tmp_path):
     assert schedule_b_faults(cfg) == [] and schedule_c_faults(cfg) == [], "the committed schedules load"
 
     def section_of(doc, path):
-        for name in path.split("."):
+        for name in (path.split(".") if path else ()):
             doc = doc[name]
         return doc
-    # every value the committed Schedule B carries in a checked section has a domain; the one that does
-    # not is prose nothing reads
+    # every value the committed Schedule B carries has a domain, the prose the code only publishes included
     for path, domain in SCHEDULE_B_DOMAINS.items():
         loose = {k for k, v in section_of(cfg.schedule_b, path).items() if not isinstance(v, dict)} - set(domain)
-        assert loose <= {"reserved_matter"}, (path, loose)
+        assert loose == set(), (path, loose)
+    walked = {k for d in SCHEDULE_B_DOMAINS.values() for k in d} | {p.rpartition(".")[2] for p in SCHEDULE_B_DOMAINS if p}
+
+    def names(doc):
+        return set(doc) | {k for v in doc.values() if isinstance(v, dict) for k in names(v)}
+    assert names(cfg.schedule_b) <= walked, "every name the committed Schedule B uses is one the tables have"
     # the vocabularies are the ones the code acts on
     assert tuple(f"due_{a}" for a in FEE_ACTIONS) == fees.DUE
     assert {resolutions.SIGN_RIGHT, sessions.SIGN_RIGHT, "pause", "operational_review"} <= set(SEAT_RIGHTS)
@@ -1780,20 +1784,26 @@ def test_a_schedule_value_outside_its_domain_is_refused_at_load(tmp_path):
         "min_balance_micro_xe": (-1, 2**64), "must_exist_before_open": ("yes", 1, 0), "exclude_agent_accounts": ("no", 1),
         "stipend_micro_xe": (-1, 2**64), "max_weight_share": (1.01, -0.01, 5, float("nan"), True),
         "count_toward_quorum": ("false", 0),
+        "version": (0, -1, True), "agent_budget_micro_xe": (-1, 2**64, True),
+        "agents_decide": ([""], ["a", "a"], "membership", [["a"]], [" "]),
+        "agents_do_not_decide": ([""], ["a", "a"], "membership", [None]),
+        "members_fraction": (0, 1.5, -0.1, float("nan"), True),
     }
+    prose = ("member", "specialist_agents", "reserved_matters", "other_oa_rules", "specialists", "reserved_matter")
+    outside.update({key: ("", "  ", 8, True) for key in prose})
     assert {k for d in SCHEDULE_B_DOMAINS.values() for k in d} == set(outside), "every checked value is walked"
     for path, domain in SCHEDULE_B_DOMAINS.items():
         for key in domain:
-            for value in (None, "8", [1], {"a": 1}) + outside[key]:
+            for value in (None, [1], {"a": 1}, 8.5) + (() if key in prose else ("8",)) + outside[key]:
                 found = b_faults(path, key, value)
-                assert len(found) == 1 and found[0].startswith(f"{path}.{key} "), (path, key, value, found)
+                assert len(found) == 1 and found[0].startswith((f"{path}." if path else "") + f"{key} "), (path, key, value, found)
             # absent is the code's default, which is in the domain
             c = load_config(ROOT / "config")
             c.schedule_b = copy.deepcopy(c.schedule_b)
             del section_of(c.schedule_b, path)[key]
             assert schedule_b_faults(c) == [], (path, key)
     # a section that is not a mapping, and an armed timelock that runs for no time
-    for path in SCHEDULE_B_DOMAINS:
+    for path in filter(None, SCHEDULE_B_DOMAINS):
         c = load_config(ROOT / "config")
         c.schedule_b = copy.deepcopy(c.schedule_b)
         head, _, leaf = path.rpartition(".")
@@ -1855,6 +1865,87 @@ def test_a_schedule_value_outside_its_domain_is_refused_at_load(tmp_path):
     for words in ("schedule_b.yaml: cadence.daily_note_hour_utc", "schedule_b.yaml: open_vote.fee_on_quorum", "schedule_c.yaml: human seat 1"):
         assert words in str(e.value), words
     require_valid_schedules(cfg)
+
+
+def test_a_schedule_name_the_file_does_not_have_is_refused_at_load(tmp_path):
+    """XE-14108 / XE-14107. A schedule key that is present is one the file has, or the config does not
+    load. A misspelt key was read by nothing and its default stood in for what the members wrote: `knd:
+    member` made a founder an officer, `treasuy:` left the treasury out of the vote exclusion, `open_vot:`
+    ran every vote on the code's defaults. Asserted for every mapping in both schedules, by adding a name
+    and by misspelling each one the committed file carries."""
+    import copy
+    import shutil
+
+    import yaml
+
+    from dao.config import SCHEDULE_B_DOMAINS, SCHEDULE_C_KEYS, schedule_b_faults, schedule_c_faults
+
+    def section_of(doc, path):
+        for name in (path.split(".") if path else ()):
+            doc = doc[name]
+        return doc
+
+    def b_faults(edit):
+        c = load_config(ROOT / "config")
+        c.schedule_b = copy.deepcopy(c.schedule_b)
+        edit(c.schedule_b)
+        return schedule_b_faults(c)
+
+    def c_faults(edit):
+        c = load_config(ROOT / "config")
+        c.schedule_c = copy.deepcopy(c.schedule_c)
+        edit(c.schedule_c)
+        return schedule_c_faults(c)
+
+    def misspell(section, key):
+        section[key + "x"] = section.pop(key)
+    cfg = load_config(ROOT / "config")
+    # Schedule B: every mapping, the top of the file included
+    for path in SCHEDULE_B_DOMAINS:
+        where = f"{path}." if path else ""
+        for name in ("knd", "", 7, None, True):
+            found = b_faults(lambda d, p=path, n=name: section_of(d, p).update({n: 1}))
+            assert len(found) == 1 and found[0].startswith(f"{where}{str(name)!r} is not a name"), (path, name, found)
+        for key in list(section_of(cfg.schedule_b, path)):
+            found = b_faults(lambda d, p=path, k=key: misspell(section_of(d, p), k))
+            assert len(found) == 1 and found[0].startswith(f"{where}{key + 'x'!r} is not a name"), (path, key, found)
+    # Schedule C: the top, the repository, the accounts, and every seat of both kinds
+    mappings = {
+        "": lambda d: [d], "repository.": lambda d: [d["repository"]], "accounts.": lambda d: [d["accounts"]],
+        "human seat": lambda d: d["human_seats"], "agent seat": lambda d: d["agent_seats"],
+    }
+    assert {w.rstrip(".") for w in mappings} == set(SCHEDULE_C_KEYS)
+    for where, find in mappings.items():
+        for i, section in enumerate(find(cfg.schedule_c)):
+            assert set(section) <= set(SCHEDULE_C_KEYS[where.rstrip(".")]), (where, i)
+            said = where if where.endswith(".") or not where else f"{where} {i + 1} ({section['id']}): "
+            found = c_faults(lambda d, f=find, i=i: f(d)[i].update(knd="member"))
+            assert found == [f for f in found if f.startswith(f"{said}'knd' is not a name")] and len(found) == 1, (where, i, found)
+            for key in section:
+                if key == "id":
+                    continue      # a seat with no id is refused before this, as a seat that is not one
+                found = c_faults(lambda d, f=find, i=i, k=key: misspell(f(d)[i], k))
+                assert any(f.startswith(f"{said}{key + 'x'!r} is not a name") for f in found), (where, i, key, found)
+    # a fourth account name is read by nothing, and the published prose has a shape
+    assert len(c_faults(lambda d: d["accounts"].update(claim_pool="c" * 64))) == 1
+    assert c_faults(lambda d: d.update(repository="https://github.com/xeprotocol/dao")) == ["repository must be a mapping"]
+    for bad in ("Grok", [""], ["a", "a"], [7]):
+        assert len(c_faults(lambda d, v=bad: d.update(model_candidates=v))) == 1, bad
+    # and the load itself refuses, naming each: the path the API, the worker and the CLI take
+    d = tmp_path / "config"
+    shutil.copytree(ROOT / "config", d)
+    b, sc = (yaml.safe_load((d / f).read_text()) for f in ("schedule_b.yaml", "schedule_c.yaml"))
+    b["open_vot"] = b.pop("open_vote")
+    b["agents_do_not_decide"] = "membership"
+    sc["human_seats"][0]["knd"] = sc["human_seats"][0].pop("kind")
+    sc["accounts"]["treasuy"] = sc["accounts"].pop("treasury")
+    (d / "schedule_b.yaml").write_text(yaml.safe_dump(b))
+    (d / "schedule_c.yaml").write_text(yaml.safe_dump(sc))
+    with pytest.raises(ValueError) as e:
+        load_config(d)
+    for words in ("schedule_b.yaml: 'open_vot' is not a name", "schedule_b.yaml: agents_do_not_decide is 'membership'",
+                  "'knd' is not a name", "schedule_c.yaml: accounts.'treasuy' is not a name"):
+        assert words in str(e.value), words
 
 
 # ---- XE-10452: a per-client allowance is counted against the client's network ------------------------------
@@ -3686,6 +3777,57 @@ async def test_a_node_answer_is_kept_as_its_named_fields_at_a_bounded_size():
         await c.chat_messages(proof)
     assert "longer than any envelope" in e.value.message
     await c.aclose()
+
+
+# ---- sibling sweep of the seventh pass: the rules above, at the sites the reports did not name -------------
+
+def test_a_schedule_gives_a_name_once_a_matter_is_in_one_list_and_a_scope_is_in_the_glossary(tmp_path):
+    """XE-14108 and XE-14107 at the sites beside the ones reported: a name given twice in any of the
+    files (YAML keeps the last and says nothing), a matter the agents both decide and do not, and a seat
+    whose scopes were checked against a glossary that is not there."""
+    import copy
+    import shutil
+
+    import yaml
+
+    from dao.config import _OneOfEachName, schedule_b_faults, schedule_c_faults
+    d = tmp_path / "config"
+    shutil.copytree(ROOT / "config", d)
+    load_config(d)
+    for name in ("schedule_b.yaml", "schedule_c.yaml", "registry.yaml", "copy/public.yaml", "copy/legal.yaml", "copy/kill_list.yaml"):
+        text = (d / name).read_text(encoding="utf-8")
+        top = next(line.split(":")[0] for line in text.splitlines() if line[:1].isalpha() and ":" in line)
+        (d / name).write_text(f"{text}\n{top}: 1\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="a second time") as e:
+            load_config(d)
+        assert name.rpartition("/")[2] in str(e.value) and repr(top) in str(e.value), name
+        (d / name).write_text(text, encoding="utf-8")
+    load_config(d)
+
+    def read(text):
+        return yaml.load(text, Loader=_OneOfEachName)
+    with pytest.raises(ValueError, match="'fee_micro_xe' a second time"):
+        read("open_vote:\n  fee_micro_xe: 1\n  quorum_wallets: 3\n  fee_micro_xe: 2\n")   # inside a section too
+    with pytest.raises(ValueError, match="a second time"):
+        read("seats:\n  - {id: a, id: b}\n")
+    # one name in two mappings is two names
+    assert read("a: {b: 1}\nc: {b: 2}\n") == {"a": {"b": 1}, "c": {"b": 2}}
+    # a merge key splices names in without their being read as a mapping, so it is refused with them
+    for merged in ("x: &x {a: 1, b: 1}\ny: {<<: *x, a: 2}\n", "y:\n  <<: {a: 1, a: 2}\n  b: 1\n"):
+        with pytest.raises(ValueError, match="merges another mapping in"):
+            read(merged)
+
+    c = load_config(ROOT / "config")
+    c.schedule_b, c.schedule_c = copy.deepcopy(c.schedule_b), copy.deepcopy(c.schedule_c)
+    assert schedule_b_faults(c) == [] and schedule_c_faults(c) == []
+    decided = c.schedule_b["agents_decide"][0]
+    c.schedule_b["agents_do_not_decide"].append(f" {decided.upper()} ")
+    faults = schedule_b_faults(c)
+    assert len(faults) == 1 and faults[0].startswith("agents_decide and agents_do_not_decide both hold"), faults
+    scoped = [s for s in c.schedule_c["agent_seats"] if s.get("tool_scopes")]
+    del c.schedule_c["tool_scopes"]
+    faults = schedule_c_faults(c)
+    assert scoped and len(faults) == len(scoped) and all("from the glossary" in f for f in faults), faults
 
 
 def test_a_registration_and_an_envelope_are_built_only_as_their_verifiers_accept_them():
