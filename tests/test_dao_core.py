@@ -4377,6 +4377,66 @@ def test_what_draws_nothing_is_refused_whatever_its_category():
             field_text({"proposal": bad}, "proposal")
         assert text.has_bad_control(bad) and scrub(bad)[at] == "\ufffd" and len(scrub(bad)) == len(bad), bad
         assert [i for i in range(len(bad)) if text._refused(bad, i)] == [at], bad
+
+
+# ---- XE-14722: a HEAD is the GET without its body, on every route -----------------------------------------
+
+def test_a_head_is_answered_as_the_get_without_its_body_on_every_route():
+    """Every route is declared for GET and the router refuses what a route does not name, so HEAD was a 405
+    on every page and every read. It is answered once, outside everything else, as the GET of the same
+    path with the body left off: a route is covered by being a GET route, the markdown twins included."""
+    import asyncio
+
+    from fastapi import FastAPI
+    from fastapi.responses import HTMLResponse, StreamingResponse
+    from fastapi.testclient import TestClient
+
+    from dao.main import HeadAsGet, app
+    from dao.mirror import MarkdownMirror
+    inner = FastAPI()
+
+    async def stream(request):
+        async def ticks():
+            while not await request.is_disconnected():
+                yield b"tick\n"
+                await asyncio.sleep(0.01)
+        return StreamingResponse(ticks(), media_type="text/event-stream")
+    inner.add_route("/v1/stream", stream)
+
+    @inner.get("/page", response_class=HTMLResponse)
+    async def page():
+        return "<html><head><title>T</title></head><body><h1>T</h1><p>words</p></body></html>"
+
+    @inner.get("/v1/thing")
+    async def thing():
+        return {"a": 1}
+
+    @inner.post("/v1/write")
+    async def write():
+        return {}
+    inner.add_middleware(MarkdownMirror, base_url="https://dao.example")
+    inner.add_middleware(HeadAsGet)
+    c = TestClient(inner)
+    for path in ("/page", "/v1/thing", "/page.md", "/missing"):
+        got, head = c.get(path), c.head(path)
+        assert head.status_code == got.status_code and head.content == b"", path
+        assert int(got.headers["content-length"]) == len(got.content) > 0, path
+        assert (head.headers["content-type"], head.headers["content-length"]) == \
+            (got.headers["content-type"], got.headers["content-length"]), path
+    assert c.get("/page.md").headers["content-type"].startswith("text/markdown")
+    # a route that takes no GET takes no HEAD, and says which method it does take
+    head = c.head("/v1/write")
+    assert head.status_code == 405 == c.get("/v1/write").status_code and head.headers["allow"] == "POST"
+    assert c.post("/v1/write").status_code == 200
+    # a response that never ends by itself is answered at its headers, and ends there: the route is told
+    # its reader has gone, as it is when the reader of a GET leaves
+    head = c.head("/v1/stream")
+    assert head.status_code == 200 and head.content == b"" and head.headers["content-type"].startswith("text/event-stream")
+    # where it lives: the outermost layer of the app, so every route of every router is under it
+    assert app.user_middleware[0].cls is HeadAsGet
+    assert not [r.path for r in app.routes if "HEAD" in (getattr(r, "methods", None) or ()) and "GET" not in r.methods]
+
+
 # ---- XE-3894: nothing offers a sender what the log cannot do ----------------------------------------------
 
 def test_nothing_offers_a_sender_a_redaction_the_log_cannot_make():

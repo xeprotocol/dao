@@ -136,7 +136,7 @@ class MarkdownMirror:
         return (b or "").rstrip("/")
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope.get("method") not in ("GET", "HEAD"):
+        if scope["type"] != "http" or scope.get("method") != "GET":   # a HEAD arrives here as a GET (main.HeadAsGet)
             return await self.app(scope, receive, send)
         path = scope["path"]
         target = md_target(path)
@@ -177,7 +177,7 @@ class MarkdownMirror:
         keep += [(b"content-type", b"text/markdown; charset=utf-8"), (b"content-length", str(len(out)).encode()),
                  (b"vary", b"Accept")]
         await send({"type": "http.response.start", "status": status, "headers": keep})
-        await send({"type": "http.response.body", "body": out if scope["method"] == "GET" else b""})
+        await send({"type": "http.response.body", "body": out})
 
 
 # ---- llms.txt ---------------------------------------------------------------------------------------

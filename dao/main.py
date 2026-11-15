@@ -240,6 +240,43 @@ async def unhandled_error(request: Request, exc: Exception):
     return render(request, "error.html", {"status": 500, "detail": "internal error"}, status_code=500)
 
 
+class HeadAsGet:
+    """Pure ASGI, outermost. A HEAD is answered as the GET of the same path with the body left off: the
+    status and the headers a GET would get, its content-length included. Every route here is declared
+    for GET, and a router refuses a method a route does not name, so HEAD was a 405 on every page and
+    every `/v1` read that exists (XE-14722). Answered here, once, a route is covered by being a GET
+    route, the markdown twins and the static files with the rest, and one added later is too.
+
+    The answer is complete when the headers are out, whatever the route goes on to write: the empty body
+    that ends it is sent with them, and from then on the app is told the client has gone. A response
+    that never ends by itself (the event stream) ends on that, as it does when a reader of the GET
+    leaves; a HEAD that waited for the route to finish would wait on that one for as long as the
+    connection lasted, and the connection's next request with it."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method") != "HEAD":
+            return await self.app(scope, receive, send)
+        answered = False
+
+        async def headers_only(message):
+            nonlocal answered
+            if message["type"] == "http.response.start" and not answered:
+                answered = True
+                await send(message)
+                await send({"type": "http.response.body", "body": b""})
+            # the body, every part of it, goes nowhere
+
+        async def left():
+            if answered:
+                return {"type": "http.disconnect"}
+            return await receive()
+
+        await self.app({**scope, "method": "GET"}, left, headers_only)
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     resp = await call_next(request)
@@ -259,3 +296,7 @@ async def security_headers(request: Request, call_next):
         resp.headers.setdefault("Access-Control-Allow-Origin", "*")
         resp.headers.setdefault("Cache-Control", "no-store")
     return resp
+
+
+# added last, so it is the first to see a request: everything below it sees a GET
+app.add_middleware(HeadAsGet)
