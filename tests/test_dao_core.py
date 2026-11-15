@@ -4182,3 +4182,25 @@ async def test_a_reply_is_not_queued_to_a_message_that_names_no_sender():
     with pytest.raises(HTTPException) as e:
         await inbox.reply(None, None, SimpleNamespace(from_account=""), v)   # refused before anything is read or written
     assert e.value.status_code == 409 and "no sender" in e.value.detail
+
+
+# ---- XE-3894: nothing offers a sender what the log cannot do ----------------------------------------------
+
+def test_nothing_offers_a_sender_a_redaction_the_log_cannot_make():
+    """The brief and the community seat's prompt said a sender's address is redacted in the public log on
+    request. A verified message is logged with its sender when it arrives and the log is append-only, so
+    it never could be; the column that stood for it had no writer and two of three readers ignored it.
+    The promise is gone from everything a seat or a reader is given, and the column with it."""
+    from dao.models import InboxMessage
+    from dao.services import inbox
+    assert not hasattr(InboxMessage, "redact_sender")
+    m = SimpleNamespace(id="m1", channel="chat", from_account="a" * 64, body="b", timestamp=1, verified=True, status="new",
+                        classification="")
+    assert inbox.to_dict(m)["from"] == "a" * 64
+    said = [*sorted((ROOT / "docs").glob("*.md")), *sorted((ROOT / "config").rglob("*.md")), *sorted((ROOT / "config").rglob("*.yaml")),
+            *sorted((ROOT / "dao/templates").glob("*.html")), *sorted((ROOT / "dao/static").glob("*.js")), ROOT / "README.md"]
+    assert len(said) > 20
+    for path in said:
+        assert "redact" not in path.read_text(encoding="utf-8").lower(), path.name
+    migration = (ROOT / "alembic/versions/0008_block_displaced_no_redact_flag.py").read_text(encoding="utf-8")
+    assert 'op.drop_column("inbox_messages", "redact_sender")' in migration and '"block_displaced"' in migration

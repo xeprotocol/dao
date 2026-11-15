@@ -196,7 +196,6 @@ class InboxMessage(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="new")  # new | read | replying | answered | closed | spam
     classification: Mapped[str] = mapped_column(String(32), nullable=False, default="")
     reply_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
-    redact_sender: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # an HTTP message's text is on the public log (`inbox.published`); set once, never unset (XE-4593)
     published: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

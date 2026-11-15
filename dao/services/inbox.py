@@ -524,7 +524,7 @@ async def replies_for(db: AsyncSession, mid: str) -> list[OutboxMessage]:
 
 
 def to_dict(m: InboxMessage, replies: list[OutboxMessage] | None = None) -> dict:
-    d = {"id": m.id, "channel": m.channel, "from": m.from_account if not m.redact_sender else "redacted", "body": m.body,
+    d = {"id": m.id, "channel": m.channel, "from": m.from_account, "body": m.body,
          "timestamp": m.timestamp, "verified": m.verified, "status": m.status, "classification": m.classification}
     if replies is not None:
         d["replies"] = [{"id": o.id, "from_seat": o.from_seat, "body": o.body, "status": o.status,

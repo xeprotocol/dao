@@ -203,7 +203,7 @@ Inbound channels, all producing the same `InboundMessage` event:
 2. **`POST /v1/inbox`**: the same envelope shape (from, to, body, timestamp, signature) over HTTPS for parties without an XE client yet. Unsigned messages are accepted into a low-priority queue and marked unsigned.
 3. **Portal**: proposals and comments.
 
-Triage: Community/Research classify (question, proposal, service offer, complaint, legal notice, spam). Routine questions get a drafted reply from the relevant specialist, reviewed by the orchestrator, sent as a signed envelope from that seat's account, logged publicly (with the sender's address redacted if they ask). Anything touching a reserved matter is routed to the human queue with a drafted response and never answered autonomously. Legal notices go to Legal and both members immediately.
+Triage: Community/Research classify (question, proposal, service offer, complaint, legal notice, spam). Routine questions get a drafted reply from the relevant specialist, reviewed by the orchestrator, sent as a signed envelope from that seat's account, logged publicly. The sender's address is part of that record: a message that goes on the public log goes on with its sender, the log is append-only, and no request takes an address off it. Anything touching a reserved matter is routed to the human queue with a drafted response and never answered autonomously. Legal notices go to Legal and both members immediately.
 
 Agent-to-agent: publish an agent card (`/.well-known/agent.json` style, plus the XE directory entry) describing what the DAO can be asked, in which formats, and at which addresses. Keep the format boring and documented; interoperability with external A2A conventions is a nice-to-have, not a dependency.
 
