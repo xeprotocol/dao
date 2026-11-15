@@ -1792,6 +1792,28 @@ def test_a_deployment_that_has_not_confirmed_who_it_is_accepts_no_signed_request
         assert e.value.status_code == 503, to
 
 
+async def test_the_dao_key_signs_nothing_for_a_node_whose_network_is_not_confirmed():
+    """XE-12620. The rule was held at the block and the directory entry; a chat read proof and a chat
+    envelope are the DAO key's signature too, and the node they are made for is the one not yet known."""
+    import inspect
+
+    from xe.client import XeError
+
+    from dao.services import inbox
+
+    class Never:
+        def __getattr__(self, name):
+            raise AssertionError(f"{name} was reached")
+    ctx = SimpleNamespace(node=SimpleNamespace(network_id=""), chain=Never(), signer=Never())
+    with pytest.raises(XeError) as e:
+        await inbox.read_proof(ctx)
+    assert e.value.status == 0 and "not confirmed" in e.value.message
+    src = inspect.getsource(inbox.flush_outbox)
+    assert src.index("confirmed_network(ctx)") < src.index('ctx.signer.keypair("dao", "chat.send")')
+    src = inspect.getsource(inbox.read_proof)
+    assert src.index("confirmed_network(ctx)") < src.index("ctx.chain.chat_challenge()") < src.index("ctx.signer.keypair(")
+
+
 def test_what_the_door_refuses_in_a_payload_the_cli_refuses_to_sign_and_the_startup_lint_reads_the_pages():
     import inspect
 

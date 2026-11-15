@@ -2735,3 +2735,181 @@ async def test_a_resolution_links_only_a_proposal_that_exists(db):
     assert linked.related_proposal == pr.hash
     for blank in ({}, {"related_proposal": ""}, {"related_proposal": None}):
         assert (await resolutions.propose(ctx, db, proposing(**blank))).related_proposal == ""
+# ---- XE-4593: a message is public from when its text reaches the public log, whatever its status after ----
+
+async def test_a_published_message_stays_public_and_out_of_the_untriaged_list_whatever_its_status(db):
+    from datetime import datetime, timedelta, timezone
+    ctx = _ctx()
+    ctx.signer = FakeSigner(("harness", "fee", "dao"))
+    m = await inbox.http_submit(ctx, db, _v(payload={"message": "a question"}))
+    await db.commit()
+    assert not m.published and not inbox.is_public(m) and [x.id for x in await inbox.list_untriaged(db)] == [m.id]
+    member = _v(payload={"text": "an answer"})
+    member.seat = _member("cto")
+    o = await inbox.reply(ctx, db, m, member)
+    assert m.published and m.status == "replying" and inbox.is_public(m)
+    # the reply is given up: the status is `new` again, and the message is where the log says it is
+    o.created_at = datetime.now(timezone.utc) - timedelta(days=inbox.OUTBOX_RETRY_DAYS + 1)
+    await db.commit()
+    await inbox.flush_outbox(ctx, db)
+    await db.refresh(m)
+    assert o.status == "failed" and m.status == "new" and m.published
+    assert inbox.is_public(m) and [x.id for x in await inbox.list_public(db)] == [m.id]
+    assert (await inbox.get_public(db, m.id)).id == m.id
+    assert await inbox.list_untriaged(db) == [] and await inbox.count_untriaged(db) == 0
+    # a member setting it back to `new` by hand is the same; spam is never public; published is never unset
+    for status, public in (("read", True), ("new", True), ("spam", False), ("closed", True)):
+        sv = _v(payload={"status": status})
+        sv.seat = _member("cto")
+        await inbox.set_status(ctx, db, m, sv)
+        await db.commit()
+        assert m.published and inbox.is_public(m) is public, status
+        assert [x.id for x in await inbox.list_public(db)] == ([m.id] if public else []), status
+        assert await inbox.list_untriaged(db) == [], status
+    assert len((await db.execute(select(Event).where(Event.kind == "inbox.published"))).scalars().all()) == 1
+    # the rule and its SQL twin agree on every row there can be
+    rows = []
+    for ch in ("http", "chat"):
+        for st in ("new", "read", "replying", "answered", "closed", "spam"):
+            for pub in (False, True):
+                for ver in (False, True):
+                    rows.append(InboxMessage(id=f"{ch}-{st}-{pub}-{ver}", channel=ch, from_account="a" * 64, to_account="d" * 64,
+                                             body="b", timestamp=len(rows) + 1, verified=ver, status=st, published=pub))
+    db.add_all(rows)
+    await db.commit()
+    listed = {x.id for x in await inbox.list_public(db, 1000)} - {m.id}
+    assert listed == {r.id for r in rows if inbox.is_public(r)}
+    untriaged = {x.id for x in await inbox.list_untriaged(db, 1000)}
+    assert untriaged == {r.id for r in rows if r.channel == "http" and r.status == "new" and not r.published}
+    for r in rows:
+        if r.channel == "http" and r.verified and r.status == "new":
+            assert (r.id in listed) != (r.id in untriaged), f"{r.id}: a new HTTP message is in exactly one of the two lists"
+
+
+# ---- XE-12755: a reply's outcome is recorded whatever order the outbox reaches the replies in ---------------
+
+async def test_a_reply_still_in_play_keeps_the_message_replying_when_a_later_one_is_given_up(db):
+    ctx = _ctx()
+    now = time.time_ns()
+
+    async def message(mid):
+        m = InboxMessage(id=mid, channel="chat", from_account="a" * 64, to_account="d" * 64, pub_key="p" * 64, body="q",
+                         timestamp=now, signature="s", pow_nonce=0, verified=True, status="new")
+        db.add(m)
+        await db.flush()
+        return m
+    for in_play in ("sending", "queued"):
+        m = await message(f"m-{in_play}")
+        first = await inbox.queue_reply(ctx, db, m, "the answer", from_seat="cto")
+        second = await inbox.queue_reply(ctx, db, m, "a correction", from_seat="cto")
+        ack = await inbox.queue_reply(ctx, db, m, "ack", from_seat="harness", kind="ack")
+        assert m.reply_id == second.id and m.status == "replying"
+        first.status, second.status = in_play, "failed"   # the later reply is given up while the earlier is still out
+        await db.flush()
+        await inbox._reply_outcome(ctx, db, second, delivered=False)
+        assert (m.status, m.reply_id) == ("replying", first.id), "the message waits on the reply that can still land"
+        first.status, first.sent_at = "sent", inbox.datetime.now(inbox.timezone.utc)
+        await db.flush()
+        await inbox._reply_outcome(ctx, db, first, delivered=True)
+        assert (m.status, m.reply_id) == ("answered", first.id), in_play
+        assert ack.status == "queued", "an acknowledgement in the queue is not a reply the message waits on"
+    # and when the one it waited on is given up as well, with nothing delivered, the message is new again
+    m = await message("m-none")
+    first = await inbox.queue_reply(ctx, db, m, "the answer", from_seat="cto")
+    second = await inbox.queue_reply(ctx, db, m, "a correction", from_seat="cto")
+    first.status, second.status = "sending", "failed"
+    await db.flush()
+    await inbox._reply_outcome(ctx, db, second, delivered=False)
+    first.status = "failed"
+    await db.flush()
+    await inbox._reply_outcome(ctx, db, first, delivered=False)
+    assert (m.status, m.reply_id) == ("new", "")
+    # a member's own status in the meantime is theirs: the link still moves, the status does not
+    m = await message("m-closed")
+    first = await inbox.queue_reply(ctx, db, m, "the answer", from_seat="cto")
+    second = await inbox.queue_reply(ctx, db, m, "a correction", from_seat="cto")
+    first.status, second.status, m.status = "sending", "failed", "closed"
+    await db.flush()
+    await inbox._reply_outcome(ctx, db, second, delivered=False)
+    assert (m.status, m.reply_id) == ("closed", first.id)
+    await db.rollback()
+
+
+# ---- XE-2480: the day is where an empty inbox starts, not a floor under the stored cursor ------------------
+
+async def test_the_chat_cursor_follows_the_newest_stored_envelope_however_old(db, monkeypatch):
+    now = time.time_ns()
+    assert abs(await inbox.chat_cursor(db) - (now - inbox.CURSOR_START_NS)) < 5 * inbox.NS, "nothing stored: a day"
+    three_days = now - 3 * 86400 * inbox.NS
+    db.add(InboxMessage(id="old", channel="chat", from_account="a" * 64, to_account="d" * 64, pub_key="p" * 64, body="x",
+                        timestamp=three_days, signature="s", pow_nonce=0, verified=True, status="new"))
+    await db.commit()
+    cursor = await inbox.chat_cursor(db)
+    assert cursor == three_days - inbox.CURSOR_MARGIN_NS, "everything the node took in since the last stored message is asked for"
+    assert cursor < now - inbox.CURSOR_START_NS
+    asked = []
+
+    async def messages(proof, since):
+        asked.append(since)
+        return []
+    ctx = _ctx()
+    ctx.signer = FakeSigner(("harness", "fee", "dao"))
+    ctx.chain.chat_messages = messages
+
+    async def proof(ctx):
+        return {}
+    monkeypatch.setattr(inbox, "read_proof", proof)
+    await inbox.backfill(ctx, db)
+    assert asked == [cursor]
+
+
+# ---- XE-12679: a reply is given up after a week of being retried, and a week paused is not that ------------
+
+async def test_time_under_a_pause_does_not_count_toward_giving_a_reply_up(db):
+    from datetime import datetime, timedelta, timezone
+
+    from dao.models import PauseRecord
+    from dao.services import pause
+    ctx = _ctx()
+    ctx.signer = FakeSigner(("harness", "fee", "dao"))
+    D = 86400 * inbox.NS
+    now = time.time_ns()
+
+    def rec(pid, start, *, expires=None, lifted=None, status="expired", indefinite=False):
+        return PauseRecord(id=pid, determined_by="founder-a", ground="g", determination="d" * 20, started_at=start,
+                           expires_at=expires if expires is not None else start, indefinite=indefinite, extensions=[],
+                           lifted_by=[], lifted_at=lifted, status=status)
+    # paused from day -9 to day -4 (lifted), and for half a day at day -2 (ran out)
+    db.add_all([rec("p1", now - 9 * D, expires=now - 2 * D, lifted=now - 4 * D, status="lifted"),
+                rec("p2", now - 2 * D, expires=now - 2 * D + D // 2)])
+    await db.commit()
+    assert await pause.paused_ns(db, now - 10 * D, now) == 5 * D + D // 2
+    assert await pause.paused_ns(db, now - 8 * D, now) == 4 * D + D // 2, "only the part inside the span"
+    assert await pause.paused_ns(db, now - D, now) == 0
+    assert await pause.paused_ns(db, now - 20 * D, now - 9 * D) == 0
+    m = InboxMessage(id="m1", channel="chat", from_account="a" * 64, to_account="d" * 64, pub_key="p" * 64, body="q",
+                     timestamp=now, signature="s", pow_nonce=0, verified=True, status="new")
+    db.add(m)
+    await db.flush()
+    held = await inbox.queue_reply(ctx, db, m, "queued the hour before the pause", from_seat="cto")
+    stale = await inbox.queue_reply(ctx, db, m, "queued three weeks ago", from_seat="cto")
+    wall = datetime.now(timezone.utc)
+    held.created_at = wall - timedelta(days=9, hours=1)     # 9 days old, 5.5 of them paused: 3.5 days of sends
+    stale.created_at = wall - timedelta(days=21)            # 21 days old, 5.5 paused: more than a week of sends
+    await db.commit()
+    assert not await inbox._retried_long_enough(db, held, wall)
+    assert await inbox._retried_long_enough(db, stale, wall)
+    sent = []
+
+    async def send(env):
+        sent.append(env["message"])
+    ctx.chain.chat_send = send
+    await inbox.flush_outbox(ctx, db)
+    assert held.status == "sent" and sent == [held.body], "it gets the sends the pause kept from it"
+    assert stale.status == "failed"
+    # a pause still in force counts up to now, by its clock
+    db.add(rec("p3", now - D // 4, expires=now + D, status="active"))
+    await db.commit()
+    assert abs(await pause.paused_ns(db, now - D) - D // 4) < 60 * inbox.NS
+
+
