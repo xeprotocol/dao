@@ -26,7 +26,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Any
 
-from .keys import KeyPair, exact_hex, is_hex, verify_hex_signature
+from .keys import KeyPair, exact_hex, exact_uint, is_hex, verify_hex_signature
 
 ACTION_SET = "set"
 ACTION_DELETE = "delete"
@@ -201,7 +201,7 @@ class StateBlock:
 
 def marshal_state_canonical(b: StateBlock) -> bytes:
     buf = bytearray()
-    buf += struct.pack(">Q", b.index)
+    buf += struct.pack(">Q", exact_uint(b.index, 64, "index", StateChainError))
     buf += exact_hex(b.prev_hash, 32, "prev_hash", StateChainError)
     buf += struct.pack(">I", len(b.ops))
     for op in b.ops:
@@ -215,7 +215,8 @@ def marshal_state_canonical(b: StateBlock) -> bytes:
             buf += struct.pack(">I", len(val)) + val
         else:
             buf += b"\x00\x00\x00\x00"
-    buf += struct.pack(">Q", b.timestamp & 0xFFFFFFFFFFFFFFFF)
+    # as it is or not at all: masked to its width, the hash was of another timestamp than `to_wire` sends (XE-3020)
+    buf += struct.pack(">Q", exact_uint(b.timestamp, 64, "timestamp", StateChainError))
     return bytes(buf)
 
 

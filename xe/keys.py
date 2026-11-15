@@ -42,6 +42,18 @@ def exact_hex(value: object, n: int | None, what: str, err: type[Exception] = Ke
     return bytes.fromhex(value)
 
 
+def exact_uint(value: object, bits: int, what: str, err: type[Exception] = KeyError_) -> int:
+    """An integer field as the integer it is, and the one test of it before an encoder packs it: an `int`
+    from 0 to the most `bits` bits hold. Not a bool, a float or a string of digits, which Python would
+    convert and the node's JSON decoder refuses; and not a number outside the field, which the encoders
+    used to mask to its width. Either way the hash, and the signature over it, were of a number the
+    object did not carry: 2^64 + 5 was signed as 5 and sent as written (XE-3020). `err` is the calling
+    module's own error, as for `exact_hex`."""
+    if type(value) is not int or not 0 <= value < (1 << bits):
+        raise err(f"invalid {what}: want an integer from 0 to 2^{bits} - 1")
+    return value
+
+
 def _hex(value: str, n: int, what: str) -> bytes:
     return exact_hex(value, n, what)
 

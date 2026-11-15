@@ -25,7 +25,6 @@ old is refused by the timestamp check anyway.
 from __future__ import annotations
 
 import hashlib
-import os
 import struct
 import time
 from dataclasses import dataclass
@@ -38,6 +37,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.keys import KeyError_, derive_address, exact_hex, verify_hex_signature
+from xe.pow import WORKER_POW_DEADLINE_S, search_nonce
 
 from .canonical import DOMAIN_MEMBER_ACTION, digest
 from .config import Config, HumanSeat
@@ -185,14 +185,12 @@ def validate_http_pow(target: bytes, nonce: int, difficulty: int) -> bool:
     return difficulty == 0 or http_pow_hash(nonce, target) >= difficulty
 
 
-def compute_http_pow(target: bytes, difficulty: int) -> int:
-    """Brute force; ~2^18 hashes at the chat difficulty. For CLI clients and tests."""
+def compute_http_pow(target: bytes, difficulty: int, deadline_s: float = WORKER_POW_DEADLINE_S) -> int:
+    """Brute force; ~2^18 hashes at the chat difficulty. For CLI clients and tests. Raises TimeoutError
+    once `deadline_s` has passed, as every search does (`xe.pow.search_nonce`)."""
     if difficulty == 0:
         return 0
-    nonce = struct.unpack("<Q", os.urandom(8))[0]
-    while http_pow_hash(nonce, target) < difficulty:
-        nonce = (nonce + 1) & 0xFFFFFFFFFFFFFFFF
-    return nonce
+    return search_nonce(lambda nonce: http_pow_hash(nonce, target) >= difficulty, deadline_s)
 
 
 def require_pow(v: Verified, difficulty: int) -> None:

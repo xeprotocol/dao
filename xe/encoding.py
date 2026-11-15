@@ -17,7 +17,7 @@ import struct
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
-from .keys import KeyPair, derive_address, exact_hex, verify_hex_signature
+from .keys import KeyPair, derive_address, exact_hex, exact_uint, verify_hex_signature
 
 VERSION_BYTE = 0x02
 
@@ -46,12 +46,20 @@ class EncodingError(ValueError):
     pass
 
 
-def _u64(v: int) -> bytes:
-    return struct.pack(">Q", int(v) & 0xFFFFFFFFFFFFFFFF)
+def _u64(v: int, what: str = "integer field") -> bytes:
+    return struct.pack(">Q", exact_uint(v, 64, what, EncodingError))
 
 
-def _u32(v: int) -> bytes:
-    return struct.pack(">I", int(v))
+def _u32(v: int, what: str = "integer field") -> bytes:
+    return struct.pack(">I", exact_uint(v, 32, what, EncodingError))
+
+
+# Every integer a block carries, whatever its type hashes. `to_json` sends each one that is not zero, so
+# each is one the node's decoder must take: checked by name before anything is encoded.
+BLOCK_UINT64 = ("balance", "timestamp", "amount", "pow_nonce", "vcpus", "memory_mb", "disk_gb", "duration",
+                "locked_r", "locked_payout_cap", "locked_twap_milli", "lease_min_duration_secs",
+                "lease_settle_grace_ns", "lease_force_settle_gap_ns", "lease_escrow_expiry_ns",
+                "lease_archive_gap_ns", "max_attestation_skew_ns")
 
 
 def _hex(value: str, what: str, size: int = 32) -> bytes:
@@ -145,6 +153,12 @@ def marshal_block_canonical(b: Block) -> bytes:
         raise EncodingError(f"unknown block type {b.type!r}")
     if b.memo and b.type not in ("send", "burn"):
         raise EncodingError(f"memo not allowed on {b.type} blocks")
+    if b.type in ("burn", "mint") and (b.source or b.destination):
+        # The tail of these two is the amount alone, so neither field is in the hash, and `to_json` sends
+        # both: the node refuses the block for carrying them. Refused here, as the memo is (XE-14118).
+        raise EncodingError(f"source and destination not allowed on {b.type} blocks")
+    for name in BLOCK_UINT64:
+        exact_uint(getattr(b, name), 64, name, EncodingError)
     validate_memo(b.memo)
     asset = b.asset.encode("utf-8")
     if len(asset) > 8:
@@ -178,7 +192,7 @@ def marshal_block_canonical(b: Block) -> bytes:
         # decode to the same bytes whatever their case; `pub_key` in the aux section is hashed as text and
         # is lowercased there (XE-9785).
         keys = sorted(k.lower() for k in b.keyset["keys"])
-        buf += _u32(b.keyset["threshold"]) + _u32(len(keys))
+        buf += _u32(b.keyset["threshold"], "keyset threshold") + _u32(len(keys), "keyset size")
         for k in keys:
             buf += _hex(k, "keyset key")
     elif t in ("lease_cancel", "lease_force_settle"):
@@ -227,7 +241,7 @@ def marshal_block_aux(b: Block) -> bytes:
     buf += _u64(len(atts))
     for a in atts:
         buf += _len_prefixed(a["public_key"].encode("ascii"))
-        buf += _u64(a["timestamp"])
+        buf += _u64(a["timestamp"], "attestation timestamp")
         buf += _len_prefixed(a["signature"].encode("ascii"))
     return bytes(buf)
 

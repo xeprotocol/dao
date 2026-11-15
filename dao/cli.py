@@ -126,7 +126,11 @@ def sign_request(domain: str = typer.Argument(..., help="e.g. xe-dao/vote/v1"),
         digits = pow_difficulty[2:] if pow_difficulty[:2] in ("0x", "0X") else pow_difficulty
         if not digits or not is_hex(digits.rjust(16, "0"), 8):
             raise typer.BadParameter("--pow is the difficulty the inbox publishes: up to 16 hex digits")
-        out["pow_nonce"] = compute_http_pow(pow_target(d, kp.pub_key_hex), int(digits, 16))
+        try:
+            out["pow_nonce"] = compute_http_pow(pow_target(d, kp.pub_key_hex), int(digits, 16))
+        except TimeoutError as e:
+            # a difficulty of 16 digits can still be one no machine meets: the search says so and stops (XE-14351)
+            raise typer.BadParameter(f"--pow {pow_difficulty}: {e}; check it against GET /v1/inbox")
     typer.echo(json.dumps(out))
 
 

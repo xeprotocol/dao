@@ -233,6 +233,12 @@ async def flush_outbox(ctx: Context, db: AsyncSession) -> int:
                 o.error = reason(e, 500)
                 log.warning("outbox %s: no envelope built: %s", o.id, e)
                 await db.commit()
+                if isinstance(e, TimeoutError):
+                    # The proof of work ran out of time, which is this machine and the difficulty and
+                    # not the row: the rows behind would search as long and find as little, each for
+                    # the whole deadline, with every other job of the worker waiting behind the pass.
+                    # The pass ends, as a fee settlement's does (`fees.settle_due`, XE-14351).
+                    return n
                 continue
             if await pause.is_paused(db):   # read after the work, right before the send (XE-1172)
                 return n                    # the envelope is discarded; the row is still `queued`

@@ -3347,3 +3347,178 @@ async def test_a_replay_fails_a_v1_event_that_is_not_as_it_was_sealed(monkeypatc
     job = inspect.getsource(worker_mod.Worker.job_health)
     assert job.index("_seal_legacy_log()") < job.index("health_pass(")
     assert '.get("sealed") is False' in inspect.getsource(records.health)
+
+
+# ---- XE-3020: an integer field is encoded as the integer it is, or the encoder refuses ----------------------
+
+def test_an_integer_field_is_encoded_as_the_integer_it_is_or_refused():
+    """The encoders masked a number to its field's width, so 2^64 + 5 was hashed and signed as 5 while the
+    block's JSON said 2^64 + 5; and `int()` took a bool, a float or a string of digits. One test of an
+    integer field (`exact_uint`), asked by every encoder, with its own error."""
+    import dataclasses
+    import inspect
+
+    from xe import chat, encoding, statechain
+    from xe.chat import ChatError, compute_envelope_id
+    from xe.encoding import BLOCK_UINT64, Block, EncodingError, hash_block
+    from xe.keys import KeyError_, exact_uint
+    from xe.statechain import StateBlock, StateChainError, hash_state_block
+    top = 2**64 - 1
+    not_a_u64 = (2**64, 2**64 + 5, -1, True, False, 1.0, "5", None)
+    assert exact_uint(0, 64, "x") == 0 and exact_uint(top, 64, "x") == top and exact_uint(2**32 - 1, 32, "x") == 2**32 - 1
+    for bad in not_a_u64:
+        with pytest.raises(KeyError_, match=r"invalid x: want an integer from 0 to 2\^64 - 1"):
+            exact_uint(bad, 64, "x")
+    with pytest.raises(KeyError_):
+        exact_uint(2**32, 32, "x")
+
+    a, good = "ab" * 32, "cd" * 32
+
+    def block(**over):
+        return Block(**{**dict(type="send", account=a, previous="0" * 64, balance=5, timestamp=1, asset="XE",
+                               destination=good, amount=5), **over})
+    # every integer a block carries, by name, whatever its type hashes: `to_json` sends each one
+    assert {f.name for f in dataclasses.fields(Block) if f.type == "int"} == set(BLOCK_UINT64)
+    assert hash_block(block(balance=top, timestamp=top, amount=top, pow_nonce=top), "net")
+    for name in BLOCK_UINT64:
+        for bad in not_a_u64:
+            with pytest.raises(EncodingError, match=f"invalid {name}: want an integer"):
+                hash_block(block(**{name: bad}), "net")
+    # and the two integers a block holds inside another field
+    assert hash_block(block(type="multisig_open", keyset={"keys": [a, good], "threshold": 2}), "net")
+    for bad in (2**32, -1, True, 2.0, "2", None):
+        with pytest.raises(EncodingError, match="keyset threshold"):
+            hash_block(block(type="multisig_open", keyset={"keys": [a, good], "threshold": bad}), "net")
+    assert hash_block(block(type="lease", attestations=[{"public_key": a, "timestamp": top, "signature": "00"}]), "net")
+    for bad in not_a_u64:
+        with pytest.raises(EncodingError, match="attestation timestamp"):
+            hash_block(block(type="lease", attestations=[{"public_key": a, "timestamp": bad, "signature": "00"}]), "net")
+
+    # a state block's index and timestamp, and an envelope's timestamp
+    assert hash_state_block(StateBlock(index=top, prev_hash=good, ops=[], timestamp=top))
+    for bad in not_a_u64:
+        for over in (dict(index=bad), dict(timestamp=bad)):
+            with pytest.raises(StateChainError, match="want an integer"):
+                hash_state_block(StateBlock(**{**dict(index=1, prev_hash=good, ops=[], timestamp=1), **over}))
+        with pytest.raises(ChatError, match="envelope timestamp"):
+            compute_envelope_id("f", "p", "t", "m", bad)
+    assert compute_envelope_id("f", "p", "t", "m", top)
+    # nothing in the three masks a number to its field's width
+    for mod in (encoding, statechain, chat):
+        assert "0xFFFFFFFFFFFFFFFF" not in inspect.getsource(mod), mod.__name__
+
+
+# ---- XE-14118: a block the node refuses for a field it carries is refused before it is signed --------------
+
+def test_a_burn_or_a_mint_that_names_a_source_or_a_destination_is_refused_before_it_is_signed():
+    """Neither field is in what a burn or a mint hashes, and both go out in its JSON, where the node refuses
+    the block for carrying them. The memo was refused here on the types that do not hash it; these were not."""
+    from xe.encoding import Block, EncodingError, hash_block, sign_block
+    kp, other = KeyPair.generate(), "cd" * 32
+
+    def block(t, **over):
+        return Block(type=t, account=kp.address, previous="0" * 64, balance=5, timestamp=1, asset="XE", amount=5, **over)
+    for t in ("burn", "mint"):
+        assert sign_block(block(t), kp, "net").signature, "the control: the same block without them is signed"
+        for over in (dict(source=other), dict(destination=other), dict(source=other, destination=other)):
+            b = block(t, **over)
+            with pytest.raises(EncodingError, match=f"source and destination not allowed on {t} blocks"):
+                sign_block(b, kp, "net")
+            assert b.signature == "" and b.hash == "", "and nothing was put on it"
+            with pytest.raises(EncodingError):
+                hash_block(b, "net")
+    with pytest.raises(EncodingError, match="memo not allowed on mint blocks"):
+        hash_block(block("mint", memo="m"), "net")
+    # the types that hash the two fields still take them
+    assert hash_block(block("send", destination=other), "net") and hash_block(block("receive", source=other), "net")
+
+
+# ---- XE-3108: an envelope is built only as the verifier and the node accept it -----------------------------
+
+def test_an_envelope_with_no_message_is_refused_before_it_is_signed_or_worked_for():
+    from xe.chat import ChatError, new_envelope, verify_envelope
+    kp, to = KeyPair.generate(), "cd" * 32
+    # refused, not searched for: at this difficulty a search would end in TimeoutError
+    with pytest.raises(ChatError, match="message is empty"):
+        new_envelope(kp, to, "", difficulty=2**64 - 1, deadline_s=0.01)
+    env = new_envelope(kp, to, "x", difficulty=1)
+    verify_envelope(env, difficulty=1)
+    env.message = ""
+    with pytest.raises(ChatError, match="missing required fields"):
+        verify_envelope(env, difficulty=1)   # the reader's rule, which the builder now keeps too
+
+
+# ---- XE-14351: every proof-of-work search ends, in a nonce or in a refusal ---------------------------------
+
+def test_every_proof_of_work_search_ends_in_a_nonce_or_a_refusal(monkeypatch):
+    """`compute_http_pow` had a loop of its own with no deadline: `dao sign-request --pow ffffffffffffffff`
+    ran until it was killed. One loop (`search_nonce`), and no search takes "no deadline"."""
+    import inspect
+
+    from typer.testing import CliRunner
+
+    from dao import auth, cli
+    from xe import chat, pow as xpow
+    target = b"\x00" * 64
+    for f in (xpow.compute_pow, auth.compute_http_pow, chat.new_envelope):
+        assert inspect.signature(f).parameters["deadline_s"].default == xpow.WORKER_POW_DEADLINE_S, f.__name__
+    assert inspect.signature(xpow.search_nonce).parameters["deadline_s"].default is inspect.Parameter.empty
+    for f in (xpow.compute_pow, auth.compute_http_pow):
+        src = inspect.getsource(f)
+        assert "search_nonce(" in src and "while" not in src, f.__name__
+    for search in (lambda: xpow.compute_pow(b"\x00" * 32, 2**64 - 1, 0.05),
+                   lambda: auth.compute_http_pow(target, 2**64 - 1, 0.05),
+                   lambda: xpow.search_nonce(lambda nonce: False, 0.05)):
+        with pytest.raises(TimeoutError, match="no proof of work found"):
+            search()
+    nonce = auth.compute_http_pow(target, 1 << 60)
+    assert 0 <= nonce < 2**64 and auth.validate_http_pow(target, nonce, 1 << 60)
+    nonce = xpow.compute_pow(b"\x00" * 32, 1 << 60)
+    assert 0 <= nonce < 2**64 and xpow.validate_pow(b"\x00" * 32, nonce, 1 << 60)
+
+    # the command says so and stops: a usage error, with nothing printed that could be sent
+    real = auth.compute_http_pow
+    monkeypatch.setattr(auth, "compute_http_pow", lambda t, d: real(t, d, 0.05))
+    r = CliRunner().invoke(cli.app, ["sign-request", "xe-dao/inbox/v1", "{}", "--dao", "xe_dao", "--network", "testnet-x",
+                                     "--pow", "f" * 16], env={"XE_SEED": KeyPair.generate().seed.hex()})
+    assert r.exit_code == 2 and "pow_nonce" not in r.output, r.output
+
+    # the two searches that are not a caller of those: the outbox ends its pass on one that ran out of
+    # time (ten rows searching for the whole deadline each held every other job of the worker), and the
+    # browser's loop has a deadline of its own
+    from dao.services import fees, inbox
+    src = inspect.getsource(inbox.flush_outbox)
+    at = src.index("isinstance(e, TimeoutError)")
+    assert "WORKER_POW_DEADLINE_S" in src and src.index("return n", at) < src.index("continue", at)
+    assert "isinstance(e, TimeoutError)" in inspect.getsource(fees.settle_due)
+    js = (ROOT / "dao/static/signer.js").read_text(encoding="utf-8")
+    loop = js[js.index("async pow("):js.index("body(payload")]
+    assert "Date.now() - started > POW_DEADLINE_MS" in loop and "throw new Error" in loop
+
+
+def test_a_registration_and_an_envelope_are_built_only_as_their_verifiers_accept_them():
+    """XE-3020 and XE-3108 at the two builders they did not name. A registration signs its timestamp as
+    decimal digits, so it is an integer in the field or the encoder refuses; and neither builder signs
+    (or searches a proof of work for) what its own verifier refuses for an empty field."""
+    import dataclasses
+
+    from xe.chat import ChatError, new_envelope
+    from xe.directory import DirectoryError, canonical_bytes, new_registration, verify_registration
+    kp, to = KeyPair.generate(), "cd" * 32
+    for ts in (True, 1.5, "5", -1, 2**64, None):
+        with pytest.raises(DirectoryError, match="registration timestamp"):
+            canonical_bytes("xe-test", "a", "b", "peer", ts)
+    for ts in (True, 1.5, "5", -1, 2**64):
+        with pytest.raises(DirectoryError):
+            new_registration(kp, "xe-test", "peer", timestamp_ns=ts)
+    for peer, ts, says in (("", None, "missing node_peer"), ("peer", 0, "missing timestamp")):
+        with pytest.raises(DirectoryError, match=says):
+            new_registration(kp, "xe-test", peer, timestamp_ns=ts)
+    reg = new_registration(kp, "xe-test", "peer", timestamp_ns=2**64 - 1)
+    verify_registration(reg, "xe-test")
+    with pytest.raises(DirectoryError):
+        verify_registration(dataclasses.replace(reg, timestamp=True), "xe-test")   # 1 to Python, "True" to `str`
+    # refused, not searched for: at this difficulty a search would end in TimeoutError
+    for kw, says in (({"to": ""}, "recipient is empty"), ({"to": to, "timestamp_ns": 0}, "timestamp is zero")):
+        with pytest.raises(ChatError, match=says):
+            new_envelope(kp, kw.pop("to"), "x", difficulty=2**64 - 1, deadline_s=0.01, **kw)

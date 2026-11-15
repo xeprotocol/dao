@@ -15,8 +15,8 @@ import time
 from dataclasses import dataclass, asdict
 from typing import Any
 
-from .keys import KeyPair, exact_hex, verify_hex_signature, verify_payload_key
-from .pow import CHAT_POW_DIFFICULTY, compute_pow, validate_pow
+from .keys import KeyPair, exact_hex, exact_uint, verify_hex_signature, verify_payload_key
+from .pow import CHAT_POW_DIFFICULTY, WORKER_POW_DEADLINE_S, compute_pow, validate_pow
 
 MAX_MESSAGE_BYTES = 8192
 MAX_ENVELOPE_SKEW_NS = 5 * 60 * 1_000_000_000
@@ -36,7 +36,7 @@ def envelope_canonical(from_: str, pub_key: str, to: str, message: str, timestam
         + _field(pub_key.encode("utf-8"))
         + _field(to.encode("utf-8"))
         + _field(message.encode("utf-8"))
-        + struct.pack(">Q", timestamp & 0xFFFFFFFFFFFFFFFF)
+        + struct.pack(">Q", exact_uint(timestamp, 64, "envelope timestamp", ChatError))
     )
 
 
@@ -98,10 +98,17 @@ class Envelope:
 
 
 def new_envelope(kp: KeyPair, to: str, message: str, difficulty: int = CHAT_POW_DIFFICULTY,
-                 timestamp_ns: int | None = None, deadline_s: float | None = None) -> Envelope:
+                 timestamp_ns: int | None = None, deadline_s: float = WORKER_POW_DEADLINE_S) -> Envelope:
+    if not message:
+        # What `verify_envelope` below and the node both refuse. Built anyway, it was signed and worked
+        # for, and then refused by the first reader (XE-3108).
+        raise ChatError("message is empty")
     if len(message.encode("utf-8")) > MAX_MESSAGE_BYTES:
         raise ChatError(f"message exceeds {MAX_MESSAGE_BYTES} bytes")
     ts = timestamp_ns if timestamp_ns is not None else time.time_ns()
+    if not to or not ts:
+        # the other two fields a caller chooses, which `verify_envelope` refuses when empty in the same way
+        raise ChatError("recipient is empty" if not to else "timestamp is zero")
     from_ = kp.address
     pub = kp.pub_key_hex
     eid = compute_envelope_id(from_, pub, to, message, ts)

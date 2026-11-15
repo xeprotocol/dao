@@ -20,8 +20,9 @@ TEST_DIFFICULTY = 0x0000000000000002
 # A node-advertised difficulty is taken on trust only within a band around the harness default: no easier
 # than the default (so a node saying "0" cannot switch the inbound gates off, XE-1195) and no harder than
 # MAX_WORK_FACTOR times the default's expected work (so a node saying "near 2^64" cannot park the worker in
-# a grind for years, XE-1188). Outside the band the default is used and the fact is logged. Every grind the
-# harness runs unattended also carries a deadline, as a backstop for the band.
+# a grind for years, XE-1188). Outside the band the default is used and the fact is logged. Every search
+# also ends: in a nonce, or in a TimeoutError once its deadline has passed. No search takes "no deadline",
+# the worker's or the command line's, so a difficulty nothing meets in time is a refusal (XE-14351).
 MAX_WORK_FACTOR = 64
 WORKER_POW_DEADLINE_S = 120.0
 _U64 = 1 << 64
@@ -40,24 +41,33 @@ def validate_pow(hash_bytes: bytes, nonce: int, difficulty: int) -> bool:
     return pow_hash(nonce, hash_bytes) >= difficulty
 
 
-def compute_pow(hash_bytes: bytes, difficulty: int, deadline_s: float | None = None) -> int:
-    """Brute force from a random start. Raises TimeoutError if deadline_s elapses."""
-    if difficulty == 0:
-        return 0
+def search_nonce(meets, deadline_s: float) -> int:
+    """The one search loop: a u64 nonce `meets` accepts, from a random start, or a TimeoutError once
+    `deadline_s` has passed. The clock is read every 2^12 tries, counted from the start, so the deadline
+    holds wherever the random start falls."""
     nonce = struct.unpack("<Q", os.urandom(8))[0]
     started = time.monotonic()
-    blake = hashlib.blake2b
-    pack = struct.pack
-    unpack = struct.unpack
-    while True:
+    tries = 0
+    while not meets(nonce):
+        nonce = (nonce + 1) & 0xFFFFFFFFFFFFFFFF
+        tries += 1
+        if (tries & 0xFFF) == 0 and time.monotonic() - started > deadline_s:
+            raise TimeoutError(f"no proof of work found in {deadline_s:g}s")
+    return nonce
+
+
+def compute_pow(hash_bytes: bytes, difficulty: int, deadline_s: float = WORKER_POW_DEADLINE_S) -> int:
+    """Brute force from a random start. Raises TimeoutError once deadline_s has passed."""
+    if difficulty == 0:
+        return 0
+    blake, pack, unpack = hashlib.blake2b, struct.pack, struct.unpack
+
+    def meets(nonce: int) -> bool:
         h = blake(digest_size=8)
-        h.update(pack("<Q", nonce & 0xFFFFFFFFFFFFFFFF))
+        h.update(pack("<Q", nonce))
         h.update(hash_bytes)
-        if unpack(">Q", h.digest())[0] >= difficulty:
-            return nonce & 0xFFFFFFFFFFFFFFFF
-        nonce += 1
-        if deadline_s is not None and (nonce & 0xFFFF) == 0 and time.monotonic() - started > deadline_s:
-            raise TimeoutError("proof of work deadline exceeded")
+        return unpack(">Q", h.digest())[0] >= difficulty
+    return search_nonce(meets, deadline_s)
 
 
 _DIFFICULTY_RE = re.compile(r"[0-9a-fA-F]{1,16}")

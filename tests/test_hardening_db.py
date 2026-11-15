@@ -3696,4 +3696,10 @@ async def test_a_node_that_does_not_answer_ends_the_settle_pass_and_a_refusal_of
     asked.clear()
     monkeypatch.setattr(fees.chainops, "build_burn", failing(RuntimeError("connection to 10.0.0.5 lost")))
     assert await fees.settle_due(ctx, db) == 0 and len(asked) == 2 and await errors() == ["RuntimeError", "RuntimeError"]
+    # a proof-of-work search that ran out its time ends the pass as no answer does: the row behind would
+    # search for as long, and the job behind this one waits on both (XE-14351)
+    asked.clear()
+    monkeypatch.setattr(fees.chainops, "build_burn", failing(TimeoutError("no nonce inside the deadline")))
+    assert await fees.settle_due(ctx, db) == 0 and len(asked) == 1
+    assert sorted(await errors()) == ["RuntimeError", "TimeoutError"]
     assert chain.submits == []

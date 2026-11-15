@@ -17,6 +17,9 @@
  */
 (function () {
   const PKCS8_PREFIX = "302e020100300506032b657004220420";
+  // A search for proof of work ends, here as in every other place one is run: in a nonce, or in saying
+  // that none was found. Ten minutes is many times what the published difficulty takes in a browser.
+  const POW_DEADLINE_MS = 600000;
   const enc = new TextEncoder();
 
   // Hex is pairs of 0-9a-f or it is refused. parseInt alone reads "zz" as NaN, which a Uint8Array stores as 0:
@@ -157,11 +160,14 @@
       const buf = new Uint8Array(8 + digest.length + pub.length); buf.set(digest, 8); buf.set(pub, 8 + digest.length);
       const view = new DataView(buf.buffer);
       let nonce = crypto.getRandomValues(new BigUint64Array(1))[0];
+      const started = Date.now();
       for (let i = 0; ; i++) {
         view.setBigUint64(0, nonce, true);
         const h = await crypto.subtle.digest("SHA-256", buf);
         if (new DataView(h).getBigUint64(0, false) >= diff) return nonce.toString();
         nonce = (nonce + 1n) & 0xFFFFFFFFFFFFFFFFn;
+        if ((i & 0xfff) === 0xfff && Date.now() - started > POW_DEADLINE_MS)
+          throw new Error("no proof of work found in " + POW_DEADLINE_MS / 60000 + " minutes; reload the page for the difficulty as it is now and send again");
         if (onProgress && (i & 0x3fff) === 0) onProgress(i);
       }
     },

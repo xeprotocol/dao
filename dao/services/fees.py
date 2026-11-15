@@ -176,10 +176,11 @@ async def settle_due(ctx: Context, db: AsyncSession) -> int:
             # a row whose pass failed (the node could not be read) may hold a block all the same, and
             # that block stands whether or not this pass could look at it
             standing = standing or _stands(f)
-            if isinstance(e, XeError) and e.transient:
+            if (isinstance(e, XeError) and e.transient) or isinstance(e, TimeoutError):
                 # the node said nothing, and would say it to every row behind: they wait for the next pass.
                 # Any of them may hold a standing block this pass did not look at, and nothing is built
-                # after this line, so none is built beside it.
+                # after this line, so none is built beside it. A proof-of-work search that ran out its
+                # time is the same: the next row's would too, each for the whole deadline (XE-14351).
                 break
     return n
 

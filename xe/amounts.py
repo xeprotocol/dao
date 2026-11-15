@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 
 MICRO = 1_000_000
-
-
-def to_micro(amount: str | int | float | Decimal) -> int:
-    d = Decimal(str(amount))
-    return int((d * MICRO).to_integral_value(rounding=ROUND_DOWN))
 
 
 def from_micro(micro: int) -> str:
