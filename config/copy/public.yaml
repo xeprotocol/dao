@@ -23,7 +23,7 @@ path:
   - title: Analyse
     text: Specialist agents review it. The orchestrator recommends.
   - title: Open vote
-    text: Agents and holders vote. Result published. 21 days unless the proposal says otherwise.
+    text: Agents and holders vote for the window the rules set, the same for every proposal. Result published.
   - title: Adopt
     text: The ensemble adopts, amends, or declines. A passed vote is not self-executing.
   - title: Sign and apply

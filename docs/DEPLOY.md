@@ -116,7 +116,7 @@ curl -s https://dao.test.network/v1/health | jq .
 curl -s https://dao.test.network/v1/log/verify
 ```
 
-`GET /v1` must show `"network": "testnet"` and the `dao` and `fee` accounts. Within 20 minutes the worker registers the `dao` account in the node directory (`/v1/health` → `directory_registered: true`).
+`GET /v1` must show `"network": "testnet"`, the `dao` and `fee` accounts, and a `network_id` equal to the `XE_NETWORK_ID` you set. An empty `network_id` means the node has not been reached or names another network: nothing is signed and no signed request verifies until it does. Within 20 minutes the worker registers the `dao` account in the node directory (`/v1/health` → `directory_registered: true`).
 
 ## 6. First actions in the members console
 
@@ -124,7 +124,7 @@ Open `https://dao.test.network/members`, load your seat key (it stays in the tab
 
 1. **Write `dao.registry`**: "Open registry session" → keyset holders "Approve ops" (durable) → when enough approvals land the harness builds a block at the live tip → keyset holders "Sign block hash" → the harness submits. If the oracle writes an epoch block in between, the block is rebuilt and signatures are collected again; approvals stand.
 2. **First resolution**: propose an ordinary `note` resolution ("Harness v1 live on testnet"), both members sign. It lands in `/v1/legal/resolutions` and the log.
-3. **Smoke the portal**: from any XE wallet send 10 XE to the fee account, submit a proposal with the send hash at `/proposals/new`, vote from a second wallet, check `/v1/proposals/<hash>`. The window is 21 days; to test close-out on testnet, temporarily set `windows.open_vote_days: 0` in `config/schedule_b.yaml`, restart `worker`, open a proposal, wait a minute, restore the value.
+3. **Smoke the portal**: from any XE wallet send 10 XE to the fee account, submit a proposal with the send hash at `/proposals/new`, vote from a second wallet, check `/v1/proposals/<hash>`. The window is 21 days, and a proposal keeps the window that was in force when it was submitted; to test close-out on testnet, temporarily set `windows.open_vote_days: 1` (the shortest the config accepts) in `config/schedule_b.yaml`, restart `app worker`, open a proposal, restore the value, and look again a day later.
 4. **Chat**: from any XE account send a chat envelope to the `dao` account; the worker logs it (`inbox.received`), acknowledges it, and your reply from the console goes out as `outbox.sent`.
 
 ## 7. Operating
@@ -138,4 +138,4 @@ Open `https://dao.test.network/members`, load your seat key (it stays in the tab
 
 ## 8. Mainnet (`dao.xe.network`)
 
-Same steps with `XE_NODE_URL` set to a mainnet node and `PUBLIC_BASE_URL=https://dao.xe.network`. Create a fresh keyfile; never reuse testnet company keys. Check `GET /v1` reports `"network": "mainnet"` before publishing the URL anywhere.
+Same steps with `XE_NODE_URL` set to a mainnet node, `XE_NETWORK_ID` set to the id that node reports, and `PUBLIC_BASE_URL=https://dao.xe.network`. Create a fresh keyfile; never reuse testnet company keys. Check `GET /v1` reports `"network": "mainnet"` and that `network_id` before publishing the URL anywhere.

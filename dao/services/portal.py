@@ -1,7 +1,7 @@
 """The open portal: anyone proposes for a fee, anyone with XE votes, the result advises the DAO.
 
 Rules are pinned to a proposal at open time (`proposal.rules`) so a later Schedule B change never
-moves a live vote. Weight is the voter's XE balance at the snapshot, an hour before open. Quorum is a count of
+moves a live vote. Weight is the voter's XE balance at the snapshot, an hour and five minutes before open. Quorum is a count of
 participating wallets, not an amount of XE. Agents' weight is bounded and they never count toward
 quorum. Nothing here executes anything: a passed proposal becomes a decision item for the DAO.
 """
@@ -24,7 +24,7 @@ from xe.statechain import strict_loads
 from ..auth import Verified, bind
 from ..canonical import DOMAIN_PROPOSAL, canonical_json, sha256_hex
 
-from ..chainops import SNAPSHOT_RULE, account_snapshot, empty_snapshot, snapshot_time
+from ..chainops import SNAPSHOT_LEAD_TEXT, SNAPSHOT_RULE, account_snapshot, empty_snapshot, snapshot_time
 from ..context import Context
 from ..db import locked, serialize
 from ..models import FeeLedger, Proposal, Resolution, Vote
@@ -197,7 +197,7 @@ async def eligibility_at(ctx: Context, rules: dict, at: int, account: str, is_ag
     if excluded:
         reasons.append("excluded account")
     if pw.get("must_exist_before_open", True) and not snap["exists"]:
-        reasons.append("account did not exist at the snapshot, an hour before the proposal opened")
+        reasons.append(f"account did not exist at the snapshot, {SNAPSHOT_LEAD_TEXT} before the proposal opened")
     if snap["balance"] < int(pw.get("min_balance_micro_xe", 0)):
         reasons.append("balance below the participation minimum at snapshot")
     if is_agent and (pw.get("exclude_agent_accounts", True) or not rules.get("agents", {}).get("count_toward_quorum", False)):

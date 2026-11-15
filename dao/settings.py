@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import logging
 import os
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,8 +24,20 @@ class Settings(BaseSettings):
     directory_node_peer: str = Field(default="", alias="DAO_DIRECTORY_NODE_PEER")
     git_commit: str = Field(default=os.environ.get("DAO_GIT_COMMIT", "unknown"), alias="GIT_COMMIT")
     log_level: str = Field(default="info", alias="LOG_LEVEL")
-    role: str = Field(default="api", alias="DAO_ROLE")
-    blob_dir: Path = Field(default=Path("blobs"), alias="DAO_BLOB_DIR")
+
+    @field_validator("log_level")
+    @classmethod
+    def _a_level(cls, value: str) -> str:
+        # read by both entry points (`logging_level`); a name that is not a level stops the process rather
+        # than leaving it at a level nobody chose (XE-10085)
+        name = value.strip().lower()
+        if name not in ("debug", "info", "warning", "error", "critical"):
+            raise ValueError("LOG_LEVEL must be one of debug, info, warning, error, critical")
+        return name
+
+    @property
+    def logging_level(self) -> int:
+        return getattr(logging, self.log_level.upper())
 
     @property
     def sync_database_url(self) -> str:

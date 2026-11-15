@@ -26,6 +26,7 @@ from .faults import reason
 from .log import EventLog
 from .models import SigningSession
 from .services import fees, inbox, pause, portal, records, resolutions, sessions
+from .settings import get_settings
 from .worker_schedule import due_at, due_interval, job_table, last_detail, last_runs, mark_failed, mark_run
 
 log = logging.getLogger("dao.worker")
@@ -398,7 +399,7 @@ class Worker:
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    logging.basicConfig(level=get_settings().logging_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     ctx = build_context()
     set_context(ctx)
     w = Worker(ctx)

@@ -225,7 +225,10 @@
     renderKeyBox();
     const f = $("#keyform"); if (f) f.addEventListener("submit", async e => {
       e.preventDefault();
-      try { await Signer.setSeed($("#seed").value); $("#seed").value = ""; await renderKeyBox(); }
+      // The field held a signing seed: it is emptied when the attempt ends, whichever way it ends (XE-10901).
+      const field = $("#seed"), seed = field.value;
+      field.value = "";
+      try { await Signer.setSeed(seed); await renderKeyBox(); }
       catch (err) { say("#keymsg", err.message, false); }
     });
     const forget = $("#keyforget"); if (forget) forget.addEventListener("click", () => { Signer.forget(); renderKeyBox(); });

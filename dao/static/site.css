@@ -107,8 +107,8 @@ tr:hover td { background:rgba(28,28,28,.025); }
 
 /* ---- forms ------------------------------------------------------------------------------ */
 form.block label { display:block; margin:16px 0 6px; font:500 12px/1.2 var(--mono); letter-spacing:.06em; text-transform:uppercase; color:var(--mute); }
-input[type=text], textarea, select { width:100%; padding:11px 12px; border:1px solid var(--line-thin); background:#fff; color:var(--fg); font:inherit; font-size:15px; transition:border-color .2s ease; }
-input[type=text]:focus, textarea:focus, select:focus { outline:none; border-color:var(--ink); }
+input[type=text], input[type=password], textarea, select { width:100%; padding:11px 12px; border:1px solid var(--line-thin); background:#fff; color:var(--fg); font:inherit; font-size:15px; transition:border-color .2s ease; }
+input[type=text]:focus, input[type=password]:focus, textarea:focus, select:focus { outline:none; border-color:var(--ink); }
 textarea { min-height:140px; }
 button { font:500 14px/1.2 var(--sans); letter-spacing:.14px; height:44px; padding:0 24px; border:1px solid var(--brand); background:var(--brand); color:#fff; cursor:pointer; transition:background .2s ease, border-color .2s ease, transform .16s var(--ease); }
 button:hover { background:var(--brand-high); border-color:var(--brand-high); }

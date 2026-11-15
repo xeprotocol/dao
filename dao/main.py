@@ -24,6 +24,7 @@ from .config import lint_public_copy, public_template_prose
 from .context import get_context
 from .db import session
 from .mirror import MarkdownMirror
+from .settings import get_settings
 from .ui import router as ui_router
 
 log = logging.getLogger("dao.app")
@@ -34,7 +35,7 @@ HERE = Path(__file__).parent
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    logging.basicConfig(level=get_settings().logging_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     ctx = get_context()
     await ctx.refresh_node()
     violations = lint_public_copy(ctx.config, public_template_prose())   # the pages too, as `dao copy-lint` reads them (XE-5986)

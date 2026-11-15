@@ -27,7 +27,7 @@ dao/       the harness: settings, config-as-data, event log, signer, services, A
 config/    Schedule B, Schedule C, registry, charter, copy registers (public / legal / kill list)
 alembic/   database migrations
 tests/     byte-exact fixtures from the live testnet + harness unit tests
-docs/      DEPLOY.md
+docs/      BRIEF.md, DEPLOY.md, MAINNET_REQS.md
 ```
 
 ## Signing convention

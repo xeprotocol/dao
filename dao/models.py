@@ -152,7 +152,7 @@ class Vote(Base):
     reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
     timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)      # signer's ns timestamp
     signature: Mapped[str] = mapped_column(String(128), nullable=False)
-    weight: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)   # µXE at the snapshot (an hour before open)
+    weight: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)   # µXE at the snapshot (an hour and five minutes before open)
     participating: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_agent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     eligibility: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)

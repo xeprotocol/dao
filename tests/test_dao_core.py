@@ -2883,6 +2883,31 @@ async def test_a_declared_length_is_a_bounded_number_or_the_request_is_refused()
         assert await answer(fits) == (None, True), fits
 
 
+# ---- XE-10113 / XE-9506: the copy states the snapshot lead and the vote window the code applies --------------
+
+def test_every_statement_of_the_snapshot_lead_and_the_vote_window_is_the_one_the_code_applies():
+    import inspect
+
+    from dao import chainops
+    from dao.services import portal
+    root = Path(__file__).resolve().parent.parent
+    assert chainops.SNAPSHOT_LEAD_NS == 65 * 60 * 10 ** 9 and chainops.SNAPSHOT_LEAD_TEXT == "an hour and five minutes"
+    assert "{SNAPSHOT_LEAD_TEXT} before the proposal opened" in inspect.getsource(portal.eligibility_at)
+    said = [root / "README.md", root / "config" / "schedule_b.yaml", root / "config" / "copy" / "public.yaml"]
+    said += sorted((root / "dao").rglob("*.py")) + sorted((root / "dao" / "templates").glob("*.html"))
+    for path in said:
+        assert "an hour before" not in path.read_text(), f"{path.relative_to(root)} gives the snapshot a rounder lead than the code does"
+    for path in (root / "README.md", root / "config" / "schedule_b.yaml", root / "dao" / "templates" / "proposal.html",
+                 root / "dao" / "models.py", root / "dao" / "services" / "portal.py"):
+        assert chainops.SNAPSHOT_LEAD_TEXT in path.read_text() or "SNAPSHOT_LEAD_TEXT" in path.read_text(), path.name
+    # a proposal carries no window of its own: the window is the pinned rules', and the copy does not say otherwise
+    copy = (root / "config" / "copy" / "public.yaml").read_text()
+    assert "unless the proposal says otherwise" not in copy
+    assert 'closes_at=now + int(rules["window_days"]) * D' in inspect.getsource(portal.submit)
+    cfg = load_config(root / "config")
+    assert lint_public_copy(cfg) == []
+
+
 # ---- XE-4318: a public read does not wait on the node with a pooled connection in hand ---------------------
 
 async def test_a_public_read_asks_the_node_without_holding_a_database_connection(monkeypatch):
@@ -3093,6 +3118,22 @@ async def test_no_response_carries_the_text_of_a_failure_the_service_did_not_wri
     await c.aclose()
 
 
+# ---- XE-10085: a setting the template offers is read ------------------------------------------------------
+
+def test_the_log_level_in_the_template_is_the_level_both_entry_points_set():
+    import logging
+    from dao.settings import Settings
+    assert Settings(_env_file=None, LOG_LEVEL="debug").logging_level == logging.DEBUG
+    assert Settings(_env_file=None, LOG_LEVEL=" Warning ").logging_level == logging.WARNING
+    for bad in ("verbose", "", "10", "notset"):
+        with pytest.raises(ValueError):
+            Settings(_env_file=None, LOG_LEVEL=bad)
+    assert "LOG_LEVEL=" in (ROOT / ".env.example").read_text()
+    for entry in ("dao/main.py", "dao/worker.py"):
+        src = (ROOT / entry).read_text()
+        assert "basicConfig(level=get_settings().logging_level" in src and "level=logging.INFO" not in src, entry
+
+
 # ---- XE-10697, XE-8172: the schema the migrations build is the one the models declare ---------------------
 
 def test_the_migrations_build_the_timestamps_and_the_indexes_the_models_declare():
@@ -3139,6 +3180,26 @@ def test_the_migrations_build_the_timestamps_and_the_indexes_the_models_declare(
     m.downgrade()
     assert [n for n, _, _ in down.did] == ["drop_index"] * 3 + ["alter_column"] * 9
     assert all(k["nullable"] is True for n, _, k in down.did if n == "alter_column")
+
+
+# ---- XE-10901: a field that took a seed is emptied when the attempt ends, and never shows it --------------
+
+def test_the_seed_field_is_masked_and_emptied_before_the_key_is_tried():
+    import re
+    box = (ROOT / "dao/templates/_keybox.html").read_text()
+    field = re.search(r'<input[^>]*id="seed"[^>]*>', box).group(0)
+    assert 'type="password"' in field and 'autocomplete="off"' in field and 'spellcheck="false"' in field
+    js = (ROOT / "dao/static/signer.js").read_text()
+    handler = js[js.index('$("#keyform")'):js.index('$("#keyforget")')]
+    assert handler.index('field.value = ""') < handler.index("Signer.setSeed(seed)"), "emptied before the load can fail"
+    assert js.count('$("#seed")') == 1, "the field is read in one place"
+    # masked is still a form field: the stylesheet's rule for a text input names it too
+    css = (ROOT / "dao/static/site.css").read_text()
+    assert css.count("input[type=text]") == css.count("input[type=password]") == 2
+    # the one field on any page that takes key material
+    for page in (ROOT / "dao/templates").glob("*.html"):
+        text = page.read_text()
+        assert page.name == "_keybox.html" or not re.search(r'<input[^>]*(seed|secret|private)', text, re.I), page.name
 
 
 # ---- sweep of XE-4318: the one unauthenticated read that asks the node on every request --------------------
