@@ -1687,15 +1687,30 @@ async def test_a_block_signature_from_a_key_no_longer_in_the_keyset_is_counted_n
     async def tip():
         return {"hash": "tip", "index": 2, "timestamp": 1}
 
-    async def submit(ctx_, db_, s_):
+    # a submit is two halves (`attempt` asks the node, `settle` records what came of it); the first is the send
+    async def attempt(ctx_, db_, s_):
         submitted.append(len(s_.block_signatures))
-    ctx = SimpleNamespace(chain=SimpleNamespace(dao_keyset=keyset, statechain_tip=tip), events=SimpleNamespace(append=nothing))
-    monkeypatch.setattr(sessions, "require_unpaused", nothing)
+        return sessions.Outcome("deferred", "not sent: this is a test")
+
+    async def settle(ctx_, db_, s_, out):
+        return s_
+    order = []
+
+    async def asked(db_):
+        order.append("pause?")
+
+    async def appended(db_, kind, *a, **k):
+        order.append(kind)
+    ctx = SimpleNamespace(chain=SimpleNamespace(dao_keyset=keyset, statechain_tip=tip), events=SimpleNamespace(append=appended))
+    monkeypatch.setattr(sessions, "require_unpaused", asked)
     monkeypatch.setattr(sessions, "require_executable", lambda ctx_, s_: None)   # what the session writes is XE-4131's rule
-    monkeypatch.setattr(sessions, "submit", submit)
+    monkeypatch.setattr(sessions, "attempt", attempt)
+    monkeypatch.setattr(sessions, "settle", settle)
     # two signatures on the block, one of them from a key rotated out: two of two is not met, at any site
     await sessions.sign(ctx, None, s, k1.pub_key_hex, sig(k1), "member:a")
     assert len(s.block_signatures) == 2 and not submitted
+    # a signature kept and not sent is checked against the pause a last time once the log head is held (XE-4126)
+    assert order == ["pause?", "pause?", "session.block_signed", "pause?"]
     assert not sessions.signatures_met(s, ks) and not sessions.ready_to_submit(s, ks)
     assert await sessions._moved_under(ctx, s) == "session.keyset_moved"
     # the second live signature is the one that sends it
@@ -3686,6 +3701,116 @@ def test_every_proof_of_work_search_ends_in_a_nonce_or_a_refusal(monkeypatch):
     js = (ROOT / "dao/static/signer.js").read_text(encoding="utf-8")
     loop = js[js.index("async pow("):js.index("body(payload")]
     assert "Date.now() - started > POW_DEADLINE_MS" in loop and "throw new Error" in loop
+
+
+# ---- XE-14157: what is returned as a keyset has its keys and its threshold ---------------------------------
+
+async def test_the_treasury_row_shows_a_keyset_or_says_there_is_none():
+    """`keyset_of` passed an object with no keys through as the keyset of an account that is not multisig,
+    and the records page read `keys` off it: Jinja found `dict.keys`, and the page was a 500. The client
+    returns a keyset or None, the service keeps only that shape, and the row says which."""
+    from dao.services import records
+    from dao.ui import templates
+    text = (ROOT / "dao/templates/records.html").read_text(encoding="utf-8")
+    row = next(line for line in text.splitlines() if line.startswith("{% for name, t in treasury.items() %}"))
+    tmpl = templates.env.from_string(row)
+    k1, k2, addr, answer = "ab" * 32, "cd" * 32, "e" * 64, {}
+
+    async def balances(account):
+        return {"XE": 5_000_000}
+
+    async def keyset_of(account):
+        return answer["ks"]
+    ctx = SimpleNamespace(config=SimpleNamespace(accounts={"treasury": addr, "dao": addr, "fee": ""}),
+                          chain=SimpleNamespace(balances=balances, keyset_of=keyset_of))
+    none = "none: not a multisig account"
+    for ks, says in (({"keys": [k1.upper(), k2], "threshold": 2, "address": "x"}, "2 of 2"), (None, none),
+                     # and whatever else a client might hand over is not shown as a keyset either
+                     ({"address": "x"}, none), ({}, none), ({"keys": "abcd", "threshold": 1}, none)):
+        answer["ks"] = ks
+        t = await records._treasury(ctx)
+        shaped = t["treasury"]["keyset"]
+        assert shaped is None or (set(shaped) == {"keys", "threshold"} and isinstance(shaped["keys"], list)), ks
+        html = tmpl.render(treasury=t)
+        assert says in html and html.count(none) == (0 if says == "2 of 2" else 1), (ks, html)
+    # an account that could not be read says that, and not that it has no keyset
+    from xe.client import XeError
+
+    async def down(account):
+        raise XeError(503, "busy")
+    ctx.chain.keyset_of = down
+    html = tmpl.render(treasury=await records._treasury(ctx))
+    assert "could not be read from the node" in html and none not in html
+    # and the balances that were read are still shown beside it
+    assert "XE<br>" in html and "busy" not in html
+
+
+# ---- XE-3877: what is shown of an open session is what its gates count -------------------------------------
+
+def test_what_is_shown_of_an_open_session_is_what_its_gates_count():
+    """`to_dict`, the members' page and the session events gave everything a session held over the threshold
+    it was created under; the gates count the keys in the keyset now against the threshold now. After a
+    rotation the page read "2/2" on a session held at one of two. One count (`sessions.counted`)."""
+    import inspect
+
+    from dao import ui
+    from dao.api import members
+    from dao.services import records, sessions
+
+    def sess(status, approvals, signatures):
+        return SimpleNamespace(
+            id="s1", kind="parameter", title="T", status=status, ops=[], ops_digest="d" * 64, required_approvals=2,
+            approvals=[{"public_key": k, "seat": k, "timestamp": 1} for k in approvals],
+            block={"index": 1, "prev_hash": "0" * 64, "timestamp": 0, "hash": "h" * 64}, block_hash="h" * 64,
+            block_signatures=[{"public_key": k, "signature": "s"} for k in signatures], rebuilds=0,
+            submitted_index=None, submitted_hash="", error="", resolution_id="", not_before=None, created_at=None)
+    same = {"keys": ["k1", "gone"], "threshold": 2}
+    rotated = {"keys": ["k1", "k3"], "threshold": 2}        # `gone` left the keyset after it approved and signed
+    raised = {"keys": ["k1", "gone", "k3"], "threshold": 3}
+    for status in sessions.OPEN:
+        s = sess(status, ["k1", "gone"], ["k1", "gone"])
+        for ks in (same, rotated, raised):
+            d = sessions.to_dict(s, ks)
+            assert d["counted"] and d["required_approvals"] == ks["threshold"]
+            # what a reader adds up answers the gates' question as the gates answer it
+            assert (len(d["approvals"]) >= d["required_approvals"]) == sessions.approvals_met(s, ks), ks
+            assert (len(d["block_signatures"]) >= d["required_approvals"]) == sessions.signatures_met(s, ks), ks
+            assert [a["public_key"] for a in d["approvals"]] == [x["public_key"] for x in sessions.counted(s.approvals, ks)]
+        assert sessions.approvals_met(s, same) and not sessions.approvals_met(s, rotated) and not sessions.approvals_met(s, raised)
+        d = sessions.to_dict(s, rotated)
+        assert len(d["approvals"]) == 1 and d["block_signatures"] == ["k1"] and d["set_aside"] == ["gone"]
+        assert "set_aside" not in sessions.to_dict(s, same)
+        # a keyset that could not be read: nothing is counted and nothing is said to be
+        for unread in (None, {"error": "the node did not answer", "keys": [], "threshold": 0}):
+            d = sessions.to_dict(s, unread)
+            assert d["counted"] is False and d["required_approvals"] is None and len(d["approvals"]) == 2 and "set_aside" not in d
+    # one that has ended shows what it holds and the number it was made under: a record, not counted again
+    for status in ("submitted", "failed", "cancelled"):
+        d = sessions.to_dict(sess(status, ["k1", "gone"], ["k1", "gone"]), rotated)
+        assert d["counted"] is False and d["required_approvals"] == 2 and len(d["approvals"]) == 2
+        assert d["block_signatures"] == ["k1", "gone"] and "set_aside" not in d
+
+    # the figure in each session event and in the health check is that count
+    for f, figure in ((sessions.approve, '"approvals": len(counted(s.approvals, ks))'),
+                      (sessions.rebuild, '"approvals": len(counted(s.approvals, ks))'),
+                      (sessions.sign, '"signatures": len(counted(s.block_signatures, ks))')):
+        assert figure in inspect.getsource(f), f.__name__
+    assert "sessions.counted(s.block_signatures, ks_now)" in inspect.getsource(records.health)
+    # no caller shows a session without saying against which keyset, and the page prints `to_dict`'s figures
+    assert inspect.signature(sessions.to_dict).parameters["ks"].default is inspect.Parameter.empty
+    for mod in (members, records, ui):
+        assert "to_dict(s)" not in inspect.getsource(mod) and '"sess_dict": sessions.to_dict' not in inspect.getsource(mod), mod.__name__
+    page = (ROOT / "dao/templates/members.html").read_text(encoding="utf-8")
+    for raw in ("s.approvals|length", "s.block_signatures|length", "s.required_approvals"):
+        assert raw not in page, raw
+    assert "d.approvals|length" in page and "d.block_signatures|length" in page and "d.set_aside" in page
+    # the keyset a route counts against is asked for with nothing held: after the commit, or after `release`
+    for route in (members.approve_session, members.rebuild_session, members.sign_session_block, members.cancel_session):
+        src = inspect.getsource(route)
+        assert src.index("await db.commit()") < src.index("_shown(ctx, s)"), route.__name__
+    for route in (members.get_session, members.list_sessions):
+        src = inspect.getsource(route)
+        assert src.index("await release(db)") < src.index("public_keyset(ctx)" if route is members.list_sessions else "_shown(ctx, s)")
 
 
 # ---- XE-14195: what a node says in refusing is for the server's log, and for nothing a caller is given -------

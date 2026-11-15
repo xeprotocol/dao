@@ -68,11 +68,21 @@ async def withdraw_resolution(request: Request, res_id: str, req: SignedRequest,
 
 # ---- signing sessions (state chain) -----------------------------------------------------------
 
+async def _shown(ctx, s) -> dict:
+    """A session as these routes return it: counted against the keyset as it is now (`sessions.to_dict`).
+    The keyset is the read the public pages share. Every caller asks once its transaction is over (the
+    commit of what it wrote, or `release` for a read): the node is not waited on with the log or a
+    connection held (XE-14181, XE-4318)."""
+    return sessions.to_dict(s, await records.public_keyset(ctx))
+
+
 @router.get("/sessions")
-async def list_sessions(db: Db, status: str | None = None, offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=200)):
+async def list_sessions(ctx: Ctx, db: Db, status: str | None = None, offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=200)):
     rows = await sessions.list_sessions(db, status, limit=limit, offset=offset)
-    return {"sessions": [sessions.to_dict(s) for s in rows], "total": await sessions.count_sessions(db, status),
-            "offset": offset, "limit": limit}
+    total = await sessions.count_sessions(db, status)
+    await release(db)
+    ks = await records.public_keyset(ctx)
+    return {"sessions": [sessions.to_dict(s, ks) for s in rows], "total": total, "offset": offset, "limit": limit}
 
 
 @router.get("/sessions/{sid}")
@@ -83,8 +93,8 @@ async def get_session(request: Request, sid: str, ctx: Ctx, db: Db):
         raise HTTPException(405, "Method Not Allowed", headers={"Allow": "POST"})
     enforce_ip(request, NODE_READ)   # `stale` asks the node for its tip
     s = await sessions.get(db, sid)
-    d = sessions.to_dict(s)
     await release(db)   # nothing below reads the database, and the node is not waited on with a connection held (XE-4318)
+    d = await _shown(ctx, s)
     d["stale"] = await sessions.is_stale(ctx, s)
     return d
 
@@ -117,7 +127,7 @@ async def approve_session(request: Request, sid: str, req: SignedRequest, ctx: C
     s = await sessions.get(db, sid, lock=True)
     await sessions.approve(ctx, db, s, v)
     await db.commit()
-    return sessions.to_dict(s)
+    return await _shown(ctx, s)
 
 
 @router.post("/sessions/{sid}/rebuild")
@@ -128,7 +138,7 @@ async def rebuild_session(request: Request, sid: str, req: SignedRequest, ctx: C
     s = await sessions.get(db, sid, lock=True)
     await sessions.rebuild_if_stale(ctx, db, s, actor=v.actor)
     await db.commit()
-    return sessions.to_dict(s)
+    return await _shown(ctx, s)
 
 
 @router.post("/sessions/{sid}/sign", status_code=201)
@@ -141,7 +151,7 @@ async def sign_session_block(request: Request, sid: str, req: SignedRequest, ctx
         raise HTTPException(409, "block hash has changed (tip moved); fetch the session again and re-sign")
     await sessions.sign(ctx, db, s, v.pub_key, field_text(v.payload, "block_signature"), v.actor)
     await db.commit()
-    return sessions.to_dict(s)
+    return await _shown(ctx, s)
 
 
 @router.post("/sessions/{sid}/cancel")
@@ -150,7 +160,7 @@ async def cancel_session(request: Request, sid: str, req: SignedRequest, ctx: Ct
     s = await sessions.get(db, sid, lock=True)
     await sessions.cancel(ctx, db, s, v, clean_text(v.payload.get("reason"), "reason", max_len=2000, required=False))
     await db.commit()
-    return sessions.to_dict(s)
+    return await _shown(ctx, s)
 
 
 # ---- pause ------------------------------------------------------------------------------------

@@ -282,7 +282,11 @@ async def rederive_open(ctx: Context, db: AsyncSession) -> int:
 
     Each proposal is one step, as in `close_due`: held in a savepoint and named by a hash read before the
     step, so that whatever fails under it, the database included, undoes that proposal's rows, leaves the
-    session usable, and is logged without asking the session for anything (XE-3724)."""
+    session usable, and is logged without asking the session for anything (XE-3724).
+
+    And each proposal that wrote is committed before the next is read. Its entries took the log head,
+    and the next proposal's rows are read from the node account by account: in one transaction the pass
+    after a rule change held every writer in the service out for as long as that took (XE-14181)."""
     n = 0
     until = time.monotonic() + REDERIVE_UNSETTLED_S
     open_ = (await db.execute(select(Proposal).where(Proposal.status == "open"))).scalars().all()
@@ -297,6 +301,7 @@ async def rederive_open(ctx: Context, db: AsyncSession) -> int:
         except Exception:   # this proposal's rows, not the node: the proposals behind it are not held up
             log.exception("proposal %s: re-deriving its stale votes raised", h[:12])
             continue
+        await db.commit()
         if node_error is not None:
             log.warning("proposal %s: could not re-derive stale votes: %s", h[:12], node_error)
             break
@@ -418,13 +423,22 @@ def shown_tally(pr: Proposal, votes: list[Vote], ctx: Context | None = None) -> 
 
 
 async def close_due(ctx: Context, db: AsyncSession) -> list[Proposal]:
-    """Worker: close proposals whose window has ended; record result; queue the fee action."""
+    """Worker: close proposals whose window has ended; record result; queue the fee action.
+
+    One proposal is one transaction: its row is taken, it is closed, and the close is committed before
+    the next proposal is looked at. A close writes to the log, and the next proposal's stale votes are
+    read from the node first: with every due proposal in one transaction, the second was read with the
+    log head held from the first, and every writer in the service waited on the node (XE-14181). The row
+    is taken here, not for the whole pass, and only if it is still open and due, so a pass that finds it
+    held or already closed by another leaves it."""
     now = time.time_ns()
-    due = list((await db.execute(locked(select(Proposal).where(Proposal.status == "open", Proposal.closes_at <= now),
-                                        skip_locked=True))).scalars().all())
+    due = select(Proposal).where(Proposal.status == "open", Proposal.closes_at <= now)
+    hashes = list((await db.execute(due.with_only_columns(Proposal.hash).order_by(Proposal.closes_at, Proposal.hash))).scalars().all())
     closed = []
-    for pr in due:
-        h = pr.hash
+    for h in hashes:
+        pr = (await db.execute(locked(due.where(Proposal.hash == h), skip_locked=True))).scalar_one_or_none()
+        if pr is None:
+            continue
         try:
             async with db.begin_nested():   # one proposal's close is one step: what it wrote goes with it if it fails
                 await _close(ctx, db, pr)
@@ -434,6 +448,7 @@ async def close_due(ctx: Context, db: AsyncSession) -> list[Proposal]:
         except Exception:   # this proposal stays open and is tried again; the ones behind it still close
             log.exception("proposal %s: closing it raised", h[:12])
             continue
+        await db.commit()
         closed.append(pr)
     return closed
 

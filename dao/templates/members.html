@@ -53,8 +53,10 @@
 <div class="card" id="s-{{ s.id }}" style="margin-top:12px">
   <div class="row"><b>{{ s.title }}</b> <span class="pill">{{ s.kind }}</span> <span class="pill">{{ s.status }}</span> <span class="mute small">{{ s.id }}</span></div>
   <details><summary>ops · digest {{ s.ops_digest|short(16) }}</summary><pre>{{ s.ops|tojson(indent=1) }}</pre></details>
-  <p class="small">Approvals {{ s.approvals|length }}/{{ s.required_approvals }}{% if s.approvals %}: {% for a in d.approvals %}{{ a.seat or a.public_key|short(10) }}{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}
-  {% if s.status == 'signing' %}· Block #{{ s.block.index }} on <code>{{ s.block.prev_hash|short(12) }}</code>, hash <code>{{ s.block_hash }}</code>, signatures {{ s.block_signatures|length }}/{{ s.required_approvals }}, rebuilds {{ s.rebuilds }}{% endif %}
+  {# an open session's figures are the ones the gate counts, against the keyset now; `d` holds them (XE-3877) #}
+  <p class="small">Approvals {{ d.approvals|length }}{% if d.required_approvals is not none %}/{{ d.required_approvals }}{% else %} held, not counted: the keyset could not be read{% endif %}{% if d.approvals %}: {% for a in d.approvals %}{{ a.seat or a.public_key|short(10) }}{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}
+  {% if d.set_aside %}· set aside, from keys no longer in the keyset: {% for k in d.set_aside %}{{ k|short(10) }}{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}
+  {% if s.status == 'signing' %}· Block #{{ s.block.index }} on <code>{{ s.block.prev_hash|short(12) }}</code>, hash <code>{{ s.block_hash }}</code>, signatures {{ d.block_signatures|length }}{% if d.required_approvals is not none %}/{{ d.required_approvals }}{% endif %}, rebuilds {{ s.rebuilds }}{% endif %}
   {% if s.status == 'submitted' %}· <b>Written</b> at state-chain #{{ s.submitted_index }} <code>{{ s.submitted_hash|short(16) }}</code>{% endif %}
   {% if s.error %}· <span class="err">{{ s.error }}</span>{% endif %}
   {% if s.not_before %}· not before {{ s.not_before|ns }}{% endif %}</p>

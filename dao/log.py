@@ -121,6 +121,14 @@ class EventLog:
                 pass
         return ev
 
+    @staticmethod
+    async def hold(db: AsyncSession) -> None:
+        """Take the head's lock as an append does, until the caller's transaction ends, and write nothing.
+        For a caller whose next read has to be in the log's order: whatever begins with an append (a
+        pause does) has either committed before this returns, and is read, or waits until the caller is
+        done. As with an append, nothing waits on the node after it."""
+        (await db.execute(locked(select(LogHead).where(LogHead.id == 1)))).scalar_one()
+
     _nothing_to_seal = False
 
     async def seal_legacy(self, db: AsyncSession) -> Event | None:

@@ -1154,7 +1154,7 @@ async def test_signing_session_short_of_live_approvals_returns_to_approving(db):
     await sessions.rebuild(ctx, db, s)
     assert s.status == "approving" and s.block is None and s.block_hash == "" and s.block_signatures == []
     ev = (await db.execute(select(Event).where(Event.kind == "session.reapproval_needed"))).scalars().one()
-    assert ev.payload["live_approvals"] == 1 and ev.payload["required"] == 2
+    assert ev.payload["approvals"] == 1 and ev.payload["held"] == 2 and ev.payload["required"] == 2
     # an approving session short of approvals is still refused, as before
     with pytest.raises(HTTPException) as e:
         await sessions.rebuild(ctx, db, s)
@@ -2494,10 +2494,10 @@ async def test_a_passed_resolution_stays_passed_and_a_failed_step_stops_nothing_
     await db.commit()
     real_open, real_owed = resolutions.open_session, resolutions._owed
 
-    async def not_this_one(ctx_, db_, r):
+    async def not_this_one(ctx_, db_, r, ks=None):
         if r.id == "r4":
             raise HTTPException(400, "not this one")
-        return await real_open(ctx_, db_, r)
+        return await real_open(ctx_, db_, r, ks=ks)
 
     async def unwritable(ctx_, db_, rid, kind, error):
         await db_.execute(text("SELECT 1/0"))   # the database refuses a statement, and the transaction with it
@@ -3703,3 +3703,533 @@ async def test_a_node_that_does_not_answer_ends_the_settle_pass_and_a_refusal_of
     assert await fees.settle_due(ctx, db) == 0 and len(asked) == 1
     assert sorted(await errors()) == ["RuntimeError", "TimeoutError"]
     assert chain.submits == []
+
+
+# ---- XE-14127: the anchor register names the block the chain holds under the number ----------------------
+
+async def test_the_anchor_register_names_the_block_the_chain_holds_whichever_is_recorded_first(db):
+    """The rule: where two sessions wrote `dao.anchor.<n>` and both blocks reached the chain, the register
+    row for n names the later block, since that is what the chain holds under the key. Asserted for each
+    order the two can be recorded in, and for each order they can stand on the chain."""
+    import json
+    ctx = _ctx()
+
+    def anchor(sid, n, status, index, mark):
+        value = json.dumps({"event_index": 0, "head_hash": mark * 64, "n": n})
+        return SigningSession(id=sid, kind="anchor", title="A", ops=[{"action": "set", "key": f"dao.anchor.{n}", "value": value}],
+                              ops_digest="f" * 64, status=status, approvals=[], required_approvals=2,
+                              block={"index": index, "prev_hash": "0" * 64, "timestamp": 0, "hash": mark * 64},
+                              block_hash=mark * 64, block_signatures=[], rebuilds=0, not_before=None)
+    # n, where the ended session's block stands, where its successor's does, which of the two is recorded first
+    cases = [(1, 3, 5, "ended"), (2, 3, 5, "successor"), (3, 9, 5, "ended"), (4, 9, 5, "successor")]
+    for n, ended_at, successor_at, first in cases:
+        # the first session to take the number ended and lost its row; the next took the number and holds the row
+        a, b = anchor(f"a{n}", n, "cancelled", ended_at, "a"), anchor(f"b{n}", n, "signing", successor_at, "b")
+        db.add_all([a, b, Anchor(n=n, event_index=0, head_hash="b" * 64, session_id=b.id)])
+        await db.flush()
+        for s in ((a, b) if first == "ended" else (b, a)):
+            await sessions._submitted(ctx, db, s)
+            await db.flush()
+        row = (await db.execute(select(Anchor).where(Anchor.n == n))).scalar_one()
+        held = a if ended_at > successor_at else b
+        assert (row.session_id, row.statechain_index, row.statechain_hash, row.head_hash) == \
+            (held.id, held.submitted_index, held.block_hash, held.block_hash), (n, first)
+    # the log carries every one of them, whichever the register names
+    assert len((await db.execute(select(Event).where(Event.kind == "session.submitted"))).scalars().all()) == 2 * len(cases)
+
+
+# ---- XE-14215: every ended session that holds a block is looked at, however many there are ---------------
+
+async def test_every_ended_session_holding_a_block_is_looked_at_in_turn(db, monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from dao import worker as worker_mod
+    ctx = _ctx()
+    total = sessions.ENDED_WATCH_MAX + 5
+    for i in range(total):
+        db.add(SigningSession(id=f"w{i:03d}", kind="parameter", title="P", ops=[{"action": "set", "key": "dao.t", "value": "1"}],
+                              ops_digest="f" * 64, status="failed" if i % 2 else "cancelled", approvals=[], required_approvals=2,
+                              block={"index": 100 + i, "prev_hash": "0" * 64, "timestamp": 0, "hash": f"{i:064x}"},
+                              block_hash=f"{i:064x}", block_signatures=[], rebuilds=0, not_before=None))
+    await db.commit()
+    first = await sessions.ended_holding_a_block(db)
+    second = await sessions.ended_holding_a_block(db, len(first))
+    assert len(first) == sessions.ENDED_WATCH_MAX and len(second) == 5 and not set(first) & set(second)
+    assert await sessions.ended_holding_a_block(db, total) == []
+    await db.commit()
+    # the blocks of the ones on the second page land: the page no pass used to reach
+    for sid in second:
+        i = int(sid[1:])
+        ctx.chain.state_blocks[100 + i] = {"index": 100 + i, "hash": f"{i:064x}"}
+    sm = async_sessionmaker(db.bind, expire_on_commit=False)
+
+    @asynccontextmanager
+    async def fake_session():
+        async with sm() as s:
+            yield s
+    monkeypatch.setattr(worker_mod, "session", fake_session)
+    w = worker_mod.Worker(ctx)
+
+    async def submitted():
+        rows = (await db.execute(select(SigningSession.id).where(SigningSession.status == "submitted"))).scalars().all()
+        await db.commit()
+        return set(rows)
+    await w.job_sessions()
+    assert await submitted() == set(), "the first pass looked at the newest page, where nothing has landed"
+    await w.job_sessions()
+    assert await submitted() == set(second), "and the next pass at the page behind it"
+    # after a short page the next pass starts from the top again, and finds nothing new to record
+    await w.job_sessions()
+    assert await submitted() == set(second)
+    assert len(await sessions.ended_holding_a_block(db)) == sessions.ENDED_WATCH_MAX
+
+
+# ---- XE-14446: a health check names the oldest aging sessions and counts the rest ------------------------
+
+async def test_a_health_check_names_the_oldest_aging_sessions_and_counts_them_all(db):
+    from datetime import datetime, timedelta, timezone
+
+    from dao.services import records
+    ctx, _state = _health_ctx()
+    await ctx.events.append(db, "x", "harness", {}, public=True)
+    await db.commit()
+    total = records.AGING_SHOWN + 7
+    for i in range(total):
+        db.add(SigningSession(id=f"g{i:03d}", kind="parameter", title="R", ops=[{"action": "set", "key": "dao.t", "value": "1"}],
+                              ops_digest="b" * 64, status="approving", approvals=[], required_approvals=2, block=None,
+                              block_hash="", block_signatures=[], rebuilds=0,
+                              created_at=datetime.now(timezone.utc) - timedelta(days=2, minutes=i)))
+    await db.flush()
+    d = await _check(ctx, db)
+    assert d["sessions_aging_total"] == total and len(d["sessions_aging"]) == records.AGING_SHOWN
+    assert [s["id"] for s in d["sessions_aging"]] == [f"g{i:03d}" for i in range(total - 1, total - 1 - records.AGING_SHOWN, -1)], \
+        "the oldest of them, oldest first"
+    row = (await db.execute(select(HealthCheck).order_by(HealthCheck.ts.desc()).limit(1))).scalar_one()
+    assert len(row.detail["sessions_aging"]) == records.AGING_SHOWN, "and the stored check is the same size however many wait"
+
+
+# ---- XE-14509: a rebuild that is refused leaves the submit owed, and takes nothing back -------------------
+
+async def test_a_rebuild_that_is_refused_leaves_the_submit_owed_and_takes_nothing_back(db, monkeypatch):
+    ctx = _ctx()
+
+    async def refuse(blk):
+        raise XeError(400, "the request was refused as invalid")
+    ctx.chain.submit_statechain_block = refuse
+    ctx.chain.statechain_tip = lambda: _tip_at(9)   # the chain moved under the block: its parent is not the tip
+    s = await _signing(db, "m1", index=3, n=1)
+    await db.commit()
+    asked = []
+
+    def executable_once(ctx_, s_):
+        # as approved when the submit begins; by the time the rebuild asks, a seat has changed its key
+        asked.append(s_.id)
+        if len(asked) > 1:
+            raise HTTPException(409, "this session can no longer be executed as approved: a seat changed its key")
+    monkeypatch.setattr(sessions, "require_executable", executable_once)
+    out = await sessions.submit(ctx, db, s)   # nothing escapes: a 409 from here took the signature back with it
+    await db.commit()
+    assert asked == ["m1", "m1"]
+    assert out.status == "signing" and len(out.block_signatures) == 2 and out.block_hash == "h" * 64
+    assert "rebuild" in out.error and "a seat changed its key" in out.error
+    kinds = [e.kind for e in (await db.execute(select(Event).where(Event.ref == "session:m1").order_by(Event.index))).scalars().all()]
+    assert kinds == ["session.tip_moved", "session.submit_deferred"], "the chain moving is on the record, and the submit is owed"
+    assert (await db.execute(select(Anchor).where(Anchor.session_id == "m1"))).scalar_one_or_none() is not None
+
+
+# ---- XE-4126: of a pause and the opening of a record session, one is first --------------------------------
+
+async def test_of_a_pause_and_the_opening_of_a_record_session_one_is_first(db):
+    import asyncio
+
+    from dao.models import PauseRecord
+    from dao.services import pause, records
+    ctx = _ctx()
+    ctx.settings = SimpleNamespace(public_base_url="http://dao")
+    ctx.config.members = [_member("founder-a"), _member("founder-b")]
+    ctx.config.pause = {"grounds": ["g"]}
+    ctx.config.registry, ctx.config.charter_hash = {}, "c" * 64
+    await ctx.events.append(db, "x", "harness", {}, public=True)
+    await db.commit()
+    sm = async_sessionmaker(db.bind, expire_on_commit=False)
+
+    async def start_pause():
+        v = _v(payload={"ground": "g", "determination": "d" * 20})
+        v.seat = _member("founder-a")
+        async with sm() as other:
+            r = await pause.start(ctx, other, v)
+            await other.commit()
+            return r.status
+
+    async def lapse():
+        for r in (await db.execute(select(PauseRecord).where(PauseRecord.status == "active"))).scalars().all():
+            r.expires_at = time.time_ns() - 1
+        await db.commit()
+
+    async def keyset_while_a_pause_begins():
+        assert await start_pause() == "active"
+        return {"keys": ["k1", "k2", "k3"], "threshold": 2}
+    plain = ctx.chain.dao_keyset
+    openers = {"anchor": lambda: records.open_anchor_session(ctx, db),
+               "registry": lambda: records.open_registry_session(ctx, db, actor="seat:founder-a")}
+    for kind, open_ in openers.items():
+        # the pause begins while the open waits on the node for the keyset: the open is second, and refused
+        ctx.chain.dao_keyset = keyset_while_a_pause_begins
+        with pytest.raises(HTTPException) as e:
+            await open_()
+        assert e.value.status_code == 409 and "paused" in e.value.detail, kind
+        await db.rollback()
+        assert await sessions.open_sessions(db, kind=kind) == [], kind
+        await lapse()
+        # the open is first: the pause waits for it, and the session is one from before the pause
+        ctx.chain.dao_keyset = plain
+        first = await open_()
+        task = asyncio.create_task(start_pause())
+        await asyncio.sleep(0.3)
+        assert not task.done(), f"a pause waits for the {kind} session being opened"
+        await db.commit()
+        assert await task == "active"
+        assert [s.id for s in await sessions.open_sessions(db, kind=kind)] == [first["id"]], kind
+        await lapse()
+
+
+async def test_a_pause_that_begins_while_a_build_or_a_signature_waits_on_the_node_stops_it(db):
+    """The same rule for the two acts on a session that wait on the node after asking about the pause:
+    `look` (every build and rebuild) and `sign`. The pause is asked again once the node has answered."""
+    from dao.models import PauseRecord
+    from dao.services import pause
+    ctx = _ctx()
+    ctx.settings = SimpleNamespace(public_base_url="http://dao")
+    ctx.config.members = [_member("founder-a"), _member("founder-b")]
+    ctx.config.pause = {"grounds": ["g"]}
+    await ctx.events.append(db, "x", "harness", {}, public=True)
+    s = await _signing(db, "q1", index=3)
+    await db.commit()
+    sm = async_sessionmaker(db.bind, expire_on_commit=False)
+
+    async def keyset_while_a_pause_begins():
+        v = _v(payload={"ground": "g", "determination": "d" * 20})
+        v.seat = _member("founder-a")
+        async with sm() as other:
+            await pause.start(ctx, other, v)
+            await other.commit()
+        return {"keys": ["k1", "k2", "k3"], "threshold": 2}
+    ctx.chain.dao_keyset = keyset_while_a_pause_begins
+    ctx.chain.statechain_tip = lambda: _tip_at(9)
+    acts = {"a build": lambda: sessions.look(ctx, db, s),
+            "a rebuild": lambda: sessions.rebuild(ctx, db, s),
+            "a signature": lambda: sessions.sign(ctx, db, s, "k3", "00" * 64, "seat:founder-a")}
+    for what, act in acts.items():
+        with pytest.raises(HTTPException) as e:
+            await act()
+        assert e.value.status_code == 409 and e.value.detail.startswith("paused"), what
+        await db.rollback()
+        await db.refresh(s)
+        assert s.status == "signing" and s.block_hash == "h" * 64 and len(s.block_signatures) == 2, what
+        for r in (await db.execute(select(PauseRecord).where(PauseRecord.status == "active"))).scalars().all():
+            r.expires_at = time.time_ns() - 1
+        await db.commit()
+
+    # And a pause that begins once the node has answered, before the build has the log head: the pause is
+    # asked a last time with the head held, which a pause takes to begin, so the two are in the log's order.
+    async def keyset():
+        return {"keys": ["k1", "k2", "k3"], "threshold": 2}
+    ctx.chain.dao_keyset = keyset
+    seen = await sessions.look(ctx, db, s)
+    assert seen.build
+    await keyset_while_a_pause_begins()
+    with pytest.raises(HTTPException) as e:
+        await sessions.rebuild(ctx, db, s, seen=seen)
+    assert e.value.status_code == 409 and e.value.detail.startswith("paused")
+    await db.rollback()
+    await db.refresh(s)
+    assert s.status == "signing" and s.block_hash == "h" * 64 and len(s.block_signatures) == 2
+
+
+async def test_a_paused_pass_records_a_block_the_chain_holds_and_builds_and_submits_nothing(db, monkeypatch):
+    """Recording what the chain holds is not an act on the chain: under a pause the worker's pass still
+    records a signing session whose block landed, with its anchor row, and neither rebuilds a stale
+    block nor makes a submit that is owed."""
+    from contextlib import asynccontextmanager
+
+    from dao import worker as worker_mod
+    from dao.services import pause
+    ctx = _ctx()
+    ctx.settings = SimpleNamespace(public_base_url="http://dao")
+    ctx.config.members = [_member("founder-a"), _member("founder-b")]
+    ctx.config.pause = {"grounds": ["g"]}
+    await ctx.events.append(db, "x", "harness", {}, public=True)
+    landed = await _signing(db, "pl", index=3, n=1)   # its block is on the chain; the node's answer was lost
+    owed = await _signing(db, "po", index=4, n=2)     # holds its signatures; the chain does not hold its block
+    ctx.chain.state_blocks[3] = {"index": 3, "hash": "h" * 64}
+    v = _v(payload={"ground": "g", "determination": "d" * 20})
+    v.seat = _member("founder-a")
+    await pause.start(ctx, db, v)
+    await db.commit()
+    acted = []
+
+    async def submit(blk):
+        acted.append("submit")
+
+    async def tip():
+        acted.append("tip")
+        return await _tip_at(9)
+    ctx.chain.submit_statechain_block, ctx.chain.statechain_tip = submit, tip
+    sm = async_sessionmaker(db.bind, expire_on_commit=False)
+
+    @asynccontextmanager
+    async def fake_session():
+        async with sm() as s:
+            yield s
+    monkeypatch.setattr(worker_mod, "session", fake_session)
+    await worker_mod.Worker(ctx).job_sessions()
+    await db.refresh(landed)
+    await db.refresh(owed)
+    assert landed.status == "submitted" and landed.submitted_index == 3
+    assert owed.status == "signing" and len(owed.block_signatures) == 2 and owed.block_hash == "h" * 64
+    assert acted == [], "nothing was built and nothing was sent"
+    rows = {a.session_id: a.statechain_index for a in (await db.execute(select(Anchor))).scalars().all()}
+    assert rows == {"pl": 3, "po": None}
+
+
+# ---- XE-14181: the node is asked nothing while the log head is held ---------------------------------------
+
+def _head_watch(ctx):
+    """Watch `ctx` for a call to the node made while the log head is held. An append takes the head and
+    the end of the transaction lets it go; every call to the fake chain in between is written to
+    `under`. The calls are still made, so a test goes on and says everything it found."""
+    from contextlib import contextmanager
+
+    from sqlalchemy import event
+    from sqlalchemy.orm import Session
+
+    @contextmanager
+    def watching():
+        watch = SimpleNamespace(held=False, under=[], calls=[])
+        chain, append = ctx.chain, ctx.events.append
+
+        class Watched:
+            def __getattr__(self, name):
+                v = getattr(chain, name)
+                if not callable(v):
+                    return v
+
+                def call(*a, **kw):
+                    watch.calls.append(name)
+                    if watch.held:
+                        watch.under.append(name)
+                    return v(*a, **kw)
+                return call
+
+        async def appending(db_, *a, **kw):
+            watch.held = True
+            return await append(db_, *a, **kw)
+
+        def ended(session_, transaction):
+            if transaction.parent is None:   # the transaction itself, not a savepoint inside it
+                watch.held = False
+        ctx.chain, ctx.events.append = Watched(), appending
+        event.listen(Session, "after_transaction_end", ended)
+        try:
+            yield watch
+        finally:
+            event.remove(Session, "after_transaction_end", ended)
+            ctx.chain, ctx.events.append = chain, append
+    return watching()
+
+
+async def test_the_node_is_asked_nothing_while_the_log_head_is_held(db, monkeypatch):
+    """The rule: an append takes the log head until its transaction ends, and every writer in the service
+    appends, so nothing waits on the node between an append and the commit after it. What a write needs
+    of the node is read first. Asserted by watching every node call made by each path that both asks the
+    node and writes to the log: resolutions, sessions from creation to the chain, record sessions, the
+    worker's passes over sessions, resolutions and proposals, and the health check."""
+    from contextlib import asynccontextmanager
+
+    from dao import worker as worker_mod
+    from dao.services import records, resolutions
+    ctx, _state = _health_ctx()
+    ctx.settings.public_base_url = "http://dao"
+    ctx.config.members = [_member("founder-a"), _member("founder-b")]
+    ctx.config.windows = {}
+    kps = [KeyPair.generate() for _ in range(3)]
+    keys = [kp.pub_key_hex for kp in kps]
+    chain = ctx.chain
+    tip = {"index": 4, "hash": "4" * 64, "timestamp": 0}
+    node = {"submit": "take"}
+
+    async def keyset():
+        return {"keys": list(keys), "threshold": 2}
+
+    async def at_tip():
+        return dict(tip)
+
+    async def submit(blk):
+        if node["submit"] == "down":
+            raise XeError(503, "the node failed")
+        if node["submit"] == "refuse":
+            raise XeError(400, "the request was refused as invalid")
+        chain.state_blocks[blk.index] = {"index": blk.index, "hash": blk.hash}
+        tip.update(index=blk.index, hash=blk.hash)
+
+    def another_block_lands():
+        tip.update(index=tip["index"] + 1, hash=f"{tip['index'] + 1:064x}")
+        chain.state_blocks[tip["index"]] = {"index": tip["index"], "hash": tip["hash"]}
+    chain.dao_keyset, chain.statechain_tip, chain.submit_statechain_block = keyset, at_tip, submit
+    sm = async_sessionmaker(db.bind, expire_on_commit=False)
+
+    @asynccontextmanager
+    async def fake_session():
+        async with sm() as s:
+            yield s
+    monkeypatch.setattr(worker_mod, "session", fake_session)
+    w = worker_mod.Worker(ctx)
+
+    def member(r, seat):
+        v = _v(payload={"resolution_id": r.id, "body_hash": resolutions.body_hash(r), "decision": "for"})
+        v.seat = _member(seat)
+        return v
+
+    def seat(name="founder-a"):
+        v = _v()
+        v.seat = _member(name)
+        return v
+
+    def approval(s, kp):
+        return Verified(account=AUTHOR, pub_key=kp.pub_key_hex, payload={"session_id": s.id, "ops_digest": s.ops_digest},
+                        timestamp=time.time_ns(), signature=os.urandom(64).hex())
+
+    def signature(s, kp):
+        return kp.sign(bytes.fromhex(s.block_hash)).hex()
+
+    with _head_watch(ctx) as watch:
+        async def step(what, act, asks=True):
+            """One request or one pass, and the commit that ends it."""
+            before = len(watch.calls)
+            out = await act()
+            await db.commit()
+            assert watch.under == [], f"{what}: the node was asked for {watch.under} with the log head held"
+            assert not watch.held, what
+            if asks:
+                assert len(watch.calls) > before, f"{what}: the node was not asked at all, so nothing was tested"
+            return out
+
+        async def passed(n):
+            """A resolution with ops, signed by both members: the second signature passes it and opens its session."""
+            r = Resolution(id=f"r{n}", number=n, title="t", body="b", matter="parameter", proposed_by="founder-a", status="open",
+                           signatures=[], ops=[{"action": "set", "key": f"dao.x{n}", "value": "1"}])
+            db.add(r)
+            await db.commit()
+            await step("a signature on a resolution", lambda: resolutions.decide(ctx, db, r, member(r, "founder-a"), "for"), asks=False)
+            await step("the signature that passes a resolution", lambda: resolutions.decide(ctx, db, r, member(r, "founder-b"), "for"))
+            assert r.status == "passed" and r.session_id
+            return await sessions.get(db, r.session_id)
+
+        async def approved(s):
+            await step("an approval", lambda: sessions.approve(ctx, db, s, approval(s, kps[0])))
+            await step("the approval that builds the block", lambda: sessions.approve(ctx, db, s, approval(s, kps[1])))
+            assert s.status == "signing" and s.block["prev_hash"] == tip["hash"]
+            return s
+
+        async def sign(s, kp, what="a signature"):
+            await step(what, lambda: sessions.sign(ctx, db, s, kp.pub_key_hex, signature(s, kp), "seat:founder-a"))
+
+        # a session from its resolution to the chain
+        s1 = await approved(await passed(1))
+        await sign(s1, kps[0])
+        await sign(s1, kps[1], "the signature that submits the block")
+        assert s1.status == "submitted" and s1.submitted_index == 5
+
+        # a submit refused because the chain moved under the block: the rebuild reads the chain first
+        s2 = await approved(await passed(2))
+        await sign(s2, kps[0])
+        another_block_lands()
+        node["submit"] = "refuse"
+        await sign(s2, kps[1], "the signature whose submit finds the chain moved")
+        assert s2.status == "signing" and s2.block["prev_hash"] == tip["hash"] and s2.block_signatures == []
+
+        # the worker's pass over a signing session whose block went stale with a signature on it
+        await sign(s2, kps[0])
+        another_block_lands()
+        await step("the worker's pass over a stale session", w.job_sessions)
+        await db.refresh(s2)
+        assert s2.status == "signing" and s2.block["prev_hash"] == tip["hash"] and s2.block_signatures == []
+        moved = (await db.execute(select(Event).where(Event.kind == "session.tip_moved", Event.ref == f"session:{s2.id}")
+                                  .order_by(Event.index.desc()).limit(1))).scalar_one()
+        assert (moved.payload["had_signatures"], moved.payload["held"]) == (1, 1), "what the gates counted, and what was held"
+        await db.commit()
+
+        # a submit the node did not answer, and the worker's pass that makes it again
+        node["submit"] = "down"
+        await sign(s2, kps[0])
+        await sign(s2, kps[1], "the signature whose submit is not answered")
+        assert s2.status == "signing" and len(s2.block_signatures) == 2 and s2.error
+        node["submit"] = "take"
+        await step("the worker's pass over a submit that is owed", w.job_sessions)
+        await db.refresh(s2)
+        assert s2.status == "submitted"
+
+        # ending a session that holds a block: by a withdrawal, and by a cancel
+        s3 = await approved(await passed(3))
+        rw = Resolution(id="rw", number=90, title="t", body="b", matter="note", ops=[], proposed_by="founder-a", status="open",
+                        session_id=s3.id)
+        db.add(rw)
+        await db.commit()
+        await step("a withdrawal that ends a session holding a block", lambda: resolutions.withdraw(ctx, db, rw, seat()))
+        assert rw.status == "withdrawn" and s3.status == "cancelled"
+        s4 = await approved(await passed(4))
+        await step("a cancel of a session holding a block", lambda: sessions.cancel(ctx, db, s4, seat(), "not needed"))
+        assert s4.status == "cancelled"
+
+        # an ended session whose block landed after all
+        chain.state_blocks[s4.block["index"]] = {"index": s4.block["index"], "hash": s4.block_hash}
+        await step("the worker's pass over ended sessions", w.job_sessions)
+        await db.refresh(s4)
+        assert s4.status == "submitted"
+
+        # a record session
+        await step("the opening of an anchor session", lambda: records.open_anchor_session(ctx, db))
+
+        # the worker's passes: sessions owed to resolutions (the keyset asked for once, before the first is
+        # written), approved sessions to promote, proposals to close and tallies to re-derive
+        db.add_all([Resolution(id=f"o{n}", number=20 + n, title="t", body="b", matter="parameter", proposed_by="founder-a",
+                               status="passed", signatures=[], ops=[{"action": "set", "key": f"dao.o{n}", "value": "1"}])
+                    for n in (1, 2)])
+        await db.commit()
+        before = len(watch.calls)
+        assert await step("the pass over resolutions owed a session", lambda: resolutions.open_deferred_sessions(ctx, db)) == 2
+        assert watch.calls[before:] == ["dao_keyset"]
+        owed = [x for x in await sessions.open_sessions(db) if x.resolution_id]
+        assert len(owed) == 2
+        for s in owed:   # approved by two keys, and waiting for the pass that builds their blocks
+            s.approvals = [{"public_key": k, "signature": "s", "timestamp": 1, "seat": ""} for k in keys[:2]]
+        await db.commit()
+        await step("the worker's pass that builds approved sessions", lambda: w._promote(db))
+        for s in owed:
+            await db.refresh(s)
+        assert [s.status for s in owed] == ["signing", "signing"]
+
+        now = time.time_ns()
+
+        def proposal(mark, closes_at):
+            """An open proposal with one vote whose weight was derived under no snapshot: a stale row."""
+            pr = Proposal(hash=mark * 64, title="t", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64,
+                          author_signature="s", author_timestamp=now, fee_block_hash=mark * 64, status="open", opened_at=now - D,
+                          closes_at=closes_at, rules=ctx.config.pinned_rules(), analysis=[])
+            vote = Vote(proposal_hash=pr.hash, account=f"voter-{mark}", pub_key="p" * 64, choice="for", reason="", timestamp=now,
+                        signature=os.urandom(8).hex(), weight=1, participating=True, is_agent=False,
+                        eligibility={"snapshot": {}, "not_participating_because": []})
+            return [pr, vote]
+        db.add_all(proposal("1", now - 2) + proposal("2", now - 1))
+        await db.commit()
+        closed = await step("the pass that closes due proposals", lambda: portal.close_due(ctx, db))
+        assert len(closed) == 2
+        db.add_all(proposal("3", now + D) + proposal("5", now + D))
+        await db.commit()
+        assert await step("the pass that re-derives open tallies", lambda: portal.rederive_open(ctx, db)) == 2
+        rederived = (await db.execute(select(Event).where(Event.kind == "vote.rederived"))).scalars().all()
+        assert len(rederived) == 4, "each of the four rows changed, and its entry took the head before the next proposal was read"
+
+        # the health check, which reads the node leg by leg and records what it found
+        EventLog._verify_cache = None
+        await step("a health check", lambda: records.health_pass(ctx, db))

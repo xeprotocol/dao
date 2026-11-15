@@ -130,6 +130,10 @@ async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, dec
     live, set_aside = live_signatures(ctx, r.signatures)
     fors = sum(1 for s in live if s["decision"] == "for")
     againsts = sum(1 for s in live if s["decision"] == "against")
+    # A signature that passes a resolution with ops opens its session, and a session is opened against the
+    # live keyset. The node is asked for it here, before anything is written to the log
+    # (`sessions.look`); if it does not answer, the session is owed, as below.
+    ks = await sessions.read_keyset(ctx) if fors >= needed and r.ops else None
     await ctx.events.append(db, "resolution.signed", v.actor, {
         "resolution_id": r.id, "decision": decision, "for": fors, "against": againsts, "needed": needed, "rule": rule,
         **({"set_aside": set_aside} if set_aside else {}),
@@ -151,7 +155,7 @@ async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, dec
             # it is (XE-2030).
             try:
                 async with db.begin_nested():
-                    await open_session(ctx, db, r)
+                    await open_session(ctx, db, r, ks=ks)
             except XeError as e:
                 await _owed(ctx, db, r.id, "resolution.session_deferred", str(e)[:300])
     elif againsts > n_members - needed:
@@ -164,18 +168,19 @@ async def decide(ctx: Context, db: AsyncSession, r: Resolution, v: Verified, dec
     return r
 
 
-async def open_session(ctx: Context, db: AsyncSession, r: Resolution) -> None:
-    """Open the execution session a passed resolution with ops is owed."""
+async def open_session(ctx: Context, db: AsyncSession, r: Resolution, ks: dict | Exception | None = None) -> None:
+    """Open the execution session a passed resolution with ops is owed. `ks` is the live keyset where the
+    caller has read it, or what reading it raised (`sessions.create`)."""
     kind = session_kind(r.matter)
     w = ctx.config.windows
     timelock_h = int(w.get("upgrade_timelock_hours", 0) or 0) if w.get("upgrade_timelock_status") == "active" else 0
     not_before = time.time_ns() + timelock_h * 3600 * 1_000_000_000 if timelock_h else None
     s = await sessions.create(ctx, db, kind=kind, title=f"R{r.number}: {r.title}", ops=r.ops, actor="harness",
-                              resolution_id=r.id, not_before=not_before)
+                              resolution_id=r.id, not_before=not_before, ks=ks)
     r.session_id = s.id
 
 
-async def open_owed_session(ctx: Context, db: AsyncSession, r: Resolution) -> bool:
+async def open_owed_session(ctx: Context, db: AsyncSession, r: Resolution, ks: dict | Exception | None = None) -> bool:
     """Worker: open the session an already passed resolution is owed, if it can be opened now. The
     resolution is passed and stays passed: opening its session is a separate act, and nothing that act can
     raise undoes the pass or stops the pass over the resolutions behind it. The node not answering
@@ -185,11 +190,14 @@ async def open_owed_session(ctx: Context, db: AsyncSession, r: Resolution) -> bo
     else that stops it is recorded as refused in the same way, because "nothing" means nothing.
     Everything the attempt wrote is undone with it (a savepoint), so a failure leaves no half-made session.
     The resolution is named by an id read before the attempt: a row the savepoint undid is not read again
-    to say what failed (XE-3724)."""
+    to say what failed (XE-3724).
+
+    `ks` is the live keyset as the pass over the owed resolutions read it, once, before it wrote anything,
+    or what that read raised (`open_deferred_sessions`)."""
     rid = r.id
     try:
         async with db.begin_nested():
-            await open_session(ctx, db, r)
+            await open_session(ctx, db, r, ks=ks)
         return True
     except XeError as e:
         kind, error = "resolution.session_deferred", str(e)[:300]
@@ -220,10 +228,14 @@ async def open_deferred_sessions(ctx: Context, db: AsyncSession) -> int:
                .order_by(Resolution.number.asc()), skip_locked=True)
     n = 0
     owed = (await db.execute(q)).scalars().all()
+    # The live keyset every one of these sessions is opened against, asked for once and before the first
+    # of them writes to the log: asked inside the loop, the second resolution's question went to the node
+    # with the head held by what the first had just recorded (XE-14181).
+    ks = await sessions.read_keyset(ctx) if any(r.ops for r in owed) else None
     for r, rid, has_ops in [(r, r.id, bool(r.ops)) for r in owed]:
         try:
             async with db.begin_nested():
-                opened = has_ops and await open_owed_session(ctx, db, r)
+                opened = has_ops and await open_owed_session(ctx, db, r, ks)
         except Exception:
             log.exception("resolution %s: recording what its session is owed raised", rid)
             continue
@@ -239,13 +251,16 @@ async def withdraw(ctx: Context, db: AsyncSession, r: Resolution, v: Verified) -
     # Rows first, then the log head, as everywhere (`sessions.cancel`, `decide`, `inbox._lock_answered`): the
     # session row is taken before the first append, not after it (XE-12010).
     s = await sessions.get(db, r.session_id, lock=True) if r.session_id else None
+    # A passing vote that raced this withdrawal may have opened the execution session already; it goes
+    # with the resolution, so nothing the record calls withdrawn stays executable (XE-0672). Whether its
+    # block is on the chain is asked now, before the withdrawal is written to the log (`sessions.look`).
+    ending = s is not None and s.status in sessions.OPEN
+    on_chain = ending and bool(s.block) and await sessions.landed(ctx, s)
     r.status = "withdrawn"
     r.decided_at = datetime.now(timezone.utc)
     await ctx.events.append(db, "resolution.withdrawn", v.actor, {"resolution_id": r.id}, ref=f"resolution:{r.id}")
-    if s is not None and s.status in sessions.OPEN:
-        # A passing vote that raced this withdrawal may have opened the execution session already; it goes
-        # with the resolution, so nothing the record calls withdrawn stays executable (XE-0672).
-        await sessions.cancel(ctx, db, s, v, "resolution withdrawn")
+    if ending:
+        await sessions.cancel(ctx, db, s, v, "resolution withdrawn", on_chain=on_chain)
     return r
 
 

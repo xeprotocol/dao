@@ -25,11 +25,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import signatures
 from ..auth import Verified
 from ..context import Context
-from ..db import locked
+from ..db import locked, serialize
 from ..models import PauseRecord
 from ..text import clean_text, field_text
 
 H = 3600 * 1_000_000_000
+# What the opening of a record session is serialised on, by kind (`records._sole_open`), and what `start`
+# takes so that a pause and such an opening are one before the other.
+RECORD_SESSION_LOCKS = {"anchor": "session.open.anchor", "registry": "session.open.registry"}
 D = 24 * H
 
 
@@ -47,7 +50,10 @@ def require_in_force(r: PauseRecord) -> None:
 
 
 async def active(db: AsyncSession) -> PauseRecord | None:
-    rows = (await db.execute(select(PauseRecord).where(PauseRecord.status == "active"))).scalars().all()
+    # As the database holds them now: a session that read a pause before it was extended still held the
+    # row with its first expiry, and judged the pause by that for as long as the session lived.
+    q = select(PauseRecord).where(PauseRecord.status == "active").execution_options(populate_existing=True)
+    rows = (await db.execute(q)).scalars().all()
     for r in rows:
         if in_force(r):
             return r
@@ -82,6 +88,11 @@ async def start(ctx: Context, db: AsyncSession, v: Verified) -> PauseRecord:
         raise HTTPException(400, f"ground must be one of {cfg.get('grounds', [])}")
     if len(text) < 20:
         raise HTTPException(400, "a written determination is required")
+    # A record session being opened at this moment is either before the pause or refused by it: the two
+    # take the same lock, and the open asks whether a pause is in force once it holds it (XE-4126). The
+    # open does not wait on the node while it holds the lock, so neither does this.
+    for lock in RECORD_SESSION_LOCKS.values():
+        await serialize(db, lock)
     await expire_lapsed(ctx, db)
     await db.flush()
     now = time.time_ns()

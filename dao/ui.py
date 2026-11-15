@@ -275,5 +275,5 @@ async def members_page(request: Request):
         **common, "cfg": c.config, "resolutions": res, "sessions": sess, "messages": msgs,
         "closed": closed, "closed_total": closed_total, "keyset": ks, "reserved": sorted(resolutions.RESERVED_MATTERS),
         "ordinary": sorted(resolutions.ORDINARY_MATTERS),
-        "res_dict": lambda r: resolutions.to_dict(r, c.config), "sess_dict": sessions.to_dict,
+        "res_dict": lambda r: resolutions.to_dict(r, c.config), "sess_dict": lambda s: sessions.to_dict(s, ks),
     })

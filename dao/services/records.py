@@ -20,7 +20,7 @@ from ..db import serialize
 from ..faults import reason, worded
 from ..log import EventLog, log_key
 from ..models import Anchor, Event, HealthCheck, SigningSession, TreasurySnapshot
-from . import sessions
+from . import pause, sessions
 
 log = logging.getLogger("dao.records")
 
@@ -92,7 +92,7 @@ async def public_keyset(ctx: Context) -> dict:
         try:
             return await ctx.chain.dao_keyset()
         except XeError as e:
-            return {"error": str(e), "keys": [], "threshold": 0}
+            return {"error": reason(e), "keys": [], "threshold": 0}
     return await _shared("keyset", read)
 
 
@@ -106,7 +106,7 @@ async def onchain_registry(ctx: Context) -> dict:
         try:
             return {"value": await ctx.chain.statechain_key("dao.registry")}
         except XeError as e:
-            return {"error": str(e)}
+            return {"error": reason(e)}
     return await _shared("registry", read)
 
 
@@ -122,18 +122,28 @@ async def _sole_open(db: AsyncSession, kind: str) -> None:
     chain over a `prev_anchor` that never was (XE-2439). The rule is asked here, under a lock, by the one
     function per kind that opens such a session, so the worker's job and the members' route both inherit
     it; the first version asked it in the job alone. Sessions opened by a resolution are not record
-    sessions and are not limited."""
-    await serialize(db, f"session.open.{kind}")
+    sessions and are not limited.
+
+    The pause is asked here too, for the same reason and under the same lock: while one is in force no
+    record session is opened (`pause`). It was asked by each caller as it began, and the open then waited
+    on the node for the keyset, so a pause that started during that wait was followed by a new session
+    all the same (XE-4126). `pause.start` takes this lock, so of a pause and an open at the same moment
+    one is first: the open that is first is a session from before the pause, and the one that is second
+    is refused. Nothing after this waits on the node: the keyset is read before it."""
+    await serialize(db, pause.RECORD_SESSION_LOCKS[kind])
+    if await pause.is_paused(db):
+        raise HTTPException(409, f"paused: no {kind} session is opened while a pause is active")
     pending = await sessions.open_sessions(db, kind=kind)
     if pending:
         raise HTTPException(409, f"{kind} session {pending[0].id} is still open; it is finished or cancelled before another is opened")
 
 
 async def open_registry_session(ctx: Context, db: AsyncSession, actor: str) -> dict:
+    ks = await sessions.read_keyset(ctx)   # the one wait on the node, before the lock and the pause check
     await _sole_open(db, "registry")
     ops = [{"action": "set", "key": "dao.registry", "value": registry_value(ctx)}]
-    s = await sessions.create(ctx, db, kind="registry", title="Write dao.registry", ops=ops, actor=actor)
-    return sessions.to_dict(s)
+    s = await sessions.create(ctx, db, kind="registry", title="Write dao.registry", ops=ops, actor=actor, ks=ks)
+    return sessions.to_dict(s, ks)
 
 
 # ---- anchors ----------------------------------------------------------------------------------
@@ -149,6 +159,7 @@ async def latest_anchor(db: AsyncSession, *, written: bool = False) -> Anchor | 
 
 
 async def open_anchor_session(ctx: Context, db: AsyncSession, actor: str = "harness") -> dict:
+    ks = await sessions.read_keyset(ctx)   # the one wait on the node, before the lock and the pause check
     await _sole_open(db, "anchor")   # one at a time: the second of two opens waits, then is refused
     head = await EventLog.head(db)
     last = await latest_anchor(db)
@@ -157,9 +168,9 @@ async def open_anchor_session(ctx: Context, db: AsyncSession, actor: str = "harn
              "prev_anchor": (last.head_hash if last else ""), "log": f"{ctx.settings.public_base_url}/v1/log"}
     ops = [{"action": "set", "key": f"dao.anchor.{n}", "value": value}]
     s = await sessions.create(ctx, db, kind="anchor", title=f"Anchor {n}: log head {head.hash[:12]} at index {head.index}",
-                              ops=ops, actor=actor)
+                              ops=ops, actor=actor, ks=ks)
     db.add(Anchor(n=n, event_index=head.index, head_hash=head.hash, session_id=s.id))
-    return sessions.to_dict(s)
+    return sessions.to_dict(s, ks)
 
 
 async def count_anchors(db: AsyncSession) -> int:
@@ -192,10 +203,19 @@ async def _treasury(ctx: Context) -> dict:
             continue
         try:
             bals = await ctx.chain.balances(addr)
-            ks = await ctx.chain.keyset_of(addr) if name == "treasury" else None
-            out[name] = {"address": addr, "balances": bals, "keyset": ks}
         except XeError as e:
-            out[name] = {"address": addr, "balances": {}, "error": str(e)}
+            out[name] = {"address": addr, "balances": {}, "error": reason(e)}
+            continue
+        out[name] = {"address": addr, "balances": bals, "keyset": None}
+        if name != "treasury":
+            continue
+        try:
+            # a keyset (keys and threshold) or None, never another object: the page counts its keys (XE-14157)
+            out[name]["keyset"] = _keyset_shape(await ctx.chain.keyset_of(addr))
+        except XeError as e:
+            # The balances were read and are shown. A keyset that could not be read is said to be that:
+            # it is not "none", and it does not take the balances with it.
+            out[name]["keyset_error"] = reason(e)
     return out
 
 
@@ -210,6 +230,7 @@ async def snapshot_treasury(ctx: Context, db: AsyncSession) -> TreasurySnapshot:
 
 TIP_STALE_S = 6 * 3600        # a tip older than this means the state chain is not advancing
 SESSION_AGING_S = 24 * 3600   # a session approving/signing for longer than this is reported
+AGING_SHOWN = 20              # of them, oldest first; the check says how many there are in all
 ANCHOR_OVERDUE_S = 14 * 86400  # weekly anchor; twice the cadence without one degrades
 STALE_CHECKS = 3               # /v1/health is stale (and not ok) after this many missed cadences
 WINDOW_30D_NS = 30 * 86400 * 1_000_000_000
@@ -268,7 +289,7 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
     try:   # chain reachable
         ready, body = await ctx.chain.ready()
         detail["node_ready"] = ready
-        detail["node"] = body if isinstance(body, dict) else {"body": str(body)[:200]}
+        detail["node"] = body   # the status code and the node's flags and counts; none of its text (XE-14223)
         ok = ok and bool(ready)
     except Exception as e:
         detail["node_ready"] = False
@@ -284,6 +305,16 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
             ok = False
     except Exception as e:
         detail["statechain_error"] = _fault("statechain", e)
+
+    # Every leg that asks the node comes before the first that can write to the log (the keyset leg, when
+    # the keyset has changed): the directory was asked last, after that entry, with the log held shut
+    # for as long as the node took to answer (XE-14181).
+    dao_addr = ctx.signer.address("dao") if ctx.signer.has("dao") else ""
+    if dao_addr:   # directory
+        try:
+            detail["directory_registered"] = (await ctx.chain.directory(dao_addr)) is not None
+        except Exception as e:
+            detail["directory_error"] = _fault("directory", e)
 
     # A leg that reads or writes the database does it under a savepoint: a statement that fails there
     # fails that leg, and the legs behind it and the record of the check itself still have a transaction
@@ -338,20 +369,23 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
     try:   # pending signatures aging
         cutoff = datetime.fromtimestamp((now - SESSION_AGING_S * 1_000_000_000) / 1e9, tz=timezone.utc)
         async with db.begin_nested():
-            aging = (await db.execute(select(SigningSession).where(SigningSession.status.in_(("approving", "signing")),
-                                                                   SigningSession.created_at < cutoff))).scalars().all()
+            waiting = (SigningSession.status.in_(("approving", "signing")), SigningSession.created_at < cutoff)
+            aging = (await db.execute(select(SigningSession).where(*waiting).order_by(
+                SigningSession.created_at.asc(), SigningSession.id.asc()).limit(AGING_SHOWN))).scalars().all()
+            aging_total = (await db.execute(select(func.count()).select_from(SigningSession).where(*waiting))).scalar_one()
+        # The oldest few and how many there are. Every one of them was a row in every health check, and a
+        # degraded check is an entry on the public log: a hundred sessions left open made each check, each
+        # log entry and each read of /v1/health that much larger for as long as they stayed (XE-14446).
+        # Counted as the gate counts them, against the keyset this check read above; where that read
+        # failed (it is `keyset_error`, and the check is not ok for it) the figures are what is held (XE-3877).
+        ks_now = detail.get("keyset")
         detail["sessions_aging"] = [{"id": s.id, "kind": s.kind, "status": s.status,
-                                     "signatures": len(s.block_signatures or []), "required": s.required_approvals}
+                                     "signatures": len(sessions.counted(s.block_signatures, ks_now) if ks_now else s.block_signatures or []),
+                                     "required": ks_now["threshold"] if ks_now else s.required_approvals}
                                     for s in aging]
+        detail["sessions_aging_total"] = aging_total
     except Exception as e:
         detail["sessions_error"] = _fault("sessions", e)
-
-    dao_addr = ctx.signer.address("dao") if ctx.signer.has("dao") else ""
-    if dao_addr:   # directory
-        try:
-            detail["directory_registered"] = (await ctx.chain.directory(dao_addr)) is not None
-        except Exception as e:
-            detail["directory_error"] = _fault("directory", e)
 
     errors = sorted(k for k in detail if k.endswith("_error"))
     if errors:

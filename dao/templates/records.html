@@ -46,7 +46,7 @@
 
 <h2>{{ legal.treasury_label }}</h2>
 <table><tr><th>Account</th><th>Address</th><th>Balances</th><th>Keyset</th></tr>
-{% for name, t in treasury.items() %}<tr><td>{{ name }}</td><td><code>{{ t.address or "not configured" }}</code></td><td class="small">{% if t.error %}<span class="mute">could not be read from the node: {{ t.error }}</span>{% endif %}{% for a, v in t.balances.items() %}{{ v|xe }} {{ a }}<br>{% endfor %}</td><td class="small">{% if t.keyset %}{{ t.keyset.threshold }} of {{ t.keyset['keys']|length }}{% endif %}</td></tr>{% endfor %}</table>
+{% for name, t in treasury.items() %}<tr><td>{{ name }}</td><td><code>{{ t.address or "not configured" }}</code></td><td class="small">{% if t.error %}<span class="mute">could not be read from the node: {{ t.error }}</span>{% endif %}{% for a, v in t.balances.items() %}{{ v|xe }} {{ a }}<br>{% endfor %}</td><td class="small">{% if t.keyset %}{{ t.keyset.threshold }} of {{ t.keyset['keys']|length }}{% elif t.keyset_error %}<span class="mute">could not be read from the node: {{ t.keyset_error }}</span>{% elif name == 'treasury' and t.address and not t.error %}<span class="mute">none: not a multisig account</span>{% endif %}</td></tr>{% endfor %}</table>
 <p class="small mute">The harness holds no treasury key. Movements are member actions, recorded here after the fact.</p>
 
 <h2>Anchors</h2>

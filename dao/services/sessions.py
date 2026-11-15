@@ -17,6 +17,7 @@ import logging
 import re
 import secrets
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
@@ -187,13 +188,29 @@ async def live_keyset(ctx: Context) -> dict:
     return {"keys": [k.lower() for k in ks["keys"]], "threshold": ks["threshold"]}
 
 
+async def read_keyset(ctx: Context) -> dict | Exception:
+    """The live keyset for `create(ks=...)`, read ahead of a write to the log: the keyset, or what the
+    read raised, for `create` to raise in its turn."""
+    try:
+        return await live_keyset(ctx)
+    except Exception as e:
+        return e
+
+
 async def create(ctx: Context, db: AsyncSession, *, kind: str, title: str, ops: list[dict], actor: str,
-                 resolution_id: str = "", not_before: int | None = None) -> SigningSession:
+                 resolution_id: str = "", not_before: int | None = None,
+                 ks: dict | Exception | None = None) -> SigningSession:
+    """`ks` is the live keyset where the caller has read it already (`read_keyset`), or what reading it
+    raised. A caller that has written to the log in this transaction has: the node is not asked with the
+    log held (`look`). What the read raised is raised here, where the read used to be, so a session whose
+    ops are refused is refused for that whether or not the node answered."""
     if kind not in KINDS:
         raise HTTPException(400, f"unknown session kind {kind!r}")
     ops = normalise_ops(ops)
     check_ops(kind, ops, seat_keys_of(ctx.config))
-    ks = await live_keyset(ctx)
+    if isinstance(ks, Exception):
+        raise ks
+    ks = ks or await live_keyset(ctx)
     s = SigningSession(id=secrets.token_hex(8), kind=kind, title=title, ops=ops, ops_digest=ops_digest(ops),
                        status="approving", approvals=[], required_approvals=ks["threshold"], block=None,
                        block_hash="", block_signatures=[], rebuilds=0, resolution_id=resolution_id,
@@ -245,19 +262,26 @@ async def open_sessions(db: AsyncSession, kind: str | None = None) -> list[Signi
     return list((await db.execute(q)).scalars().all())
 
 
+def counted(given: list[dict] | None, ks: dict) -> list[dict]:
+    """Of a session's approvals, or of its block's signatures, the ones from keys that are in the keyset
+    now. The one count: the two gates below take it, and so does everything that says how many a session
+    has (its events, `to_dict`, the health check), so no figure shown for an open session is one the
+    gates do not use (XE-3877)."""
+    live = {k.lower() for k in ks["keys"]}
+    return [x for x in (given or []) if x["public_key"] in live]
+
+
 def approvals_met(s: SigningSession, ks: dict) -> bool:
     """Enough approvals from keys that are in the keyset now. A key rotated out takes its approval with it,
     and a raised threshold applies to sessions already open; the figure stored at creation is a record."""
-    live = {k.lower() for k in ks["keys"]}
-    return sum(1 for a in s.approvals if a["public_key"] in live) >= int(ks["threshold"])
+    return len(counted(s.approvals, ks)) >= int(ks["threshold"])
 
 
 def signatures_met(s: SigningSession, ks: dict) -> bool:
     """The same count on the block's signatures: enough of them from keys that are in the keyset now. Every
     place that asks whether the block can go to the chain asks this, so a signature from a key rotated out
     since it was given is counted nowhere (XE-2713)."""
-    live = {k.lower() for k in ks["keys"]}
-    return sum(1 for x in s.block_signatures if x["public_key"] in live) >= int(ks["threshold"])
+    return len(counted(s.block_signatures, ks)) >= int(ks["threshold"])
 
 
 async def approve(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified) -> SigningSession:
@@ -274,16 +298,25 @@ async def approve(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified
         raise HTTPException(409, "already approved by this key")
     s.approvals = [*s.approvals, {"public_key": v.pub_key, "signature": v.signature, "timestamp": v.timestamp,
                                   "seat": v.seat.id if v.seat else ""}]
-    await ctx.events.append(db, "session.approved", v.actor, {
-        "session_id": s.id, "ops_digest": s.ops_digest, "approvals": len(s.approvals), "required": ks["threshold"],
-    }, ref=f"session:{s.id}")
-    if approvals_met(s, ks):
-        now = time.time_ns()
-        if (s.not_before and now < s.not_before) or await pause.is_paused(db):
-            # timelock or pause: stay in approving; the worker's timer job promotes it when clear
-            return s
+    # With the approvals met the block is built now, unless a timelock or a pause holds it in approving
+    # (the worker's timer job promotes it when clear). What the build needs of the chain is read here,
+    # before the approval is written to the log (`look`).
+    building = approvals_met(s, ks) and not (s.not_before and time.time_ns() < s.not_before) \
+        and not await pause.is_paused(db)
+    seen, not_built = None, None
+    if building:
         try:
-            await rebuild(ctx, db, s, actor="harness")
+            seen = await look(ctx, db, s)
+        except Exception as e:
+            not_built = e
+    await ctx.events.append(db, "session.approved", v.actor, {
+        "session_id": s.id, "ops_digest": s.ops_digest, "approvals": len(counted(s.approvals, ks)), "required": ks["threshold"],
+    }, ref=f"session:{s.id}")
+    if building:
+        try:
+            if not_built is not None:
+                raise not_built
+            await rebuild(ctx, db, s, actor="harness", seen=seen)
         except Exception as e:
             # The approval is on the record, and building the block is a second step that does not take it
             # back, whatever stopped it: the node not answering (XE-1713), a pause that began since it was
@@ -304,29 +337,39 @@ def require_timelock_run(s: SigningSession) -> None:
         raise HTTPException(409, f"the upgrade timelock on this session runs for another {left // 3600}h {left % 3600 // 60}m")
 
 
-async def rebuild(ctx: Context, db: AsyncSession, s: SigningSession, actor: str = "harness") -> SigningSession:
-    """Build (or re-build) the block at the live tip. Resets block signatures. Only an approved session,
-    counted against the keyset as it is now, and not before the timelock has run."""
-    if s.status not in ("approving", "signing"):
+@dataclass(frozen=True)
+class Seen:
+    """What `look` found: the session's block is on the chain (`landed`), or its approvals no longer meet
+    the live keyset `ks` (`build` false), or it is to be built on `tip` (None for a chain with no block)."""
+    landed: bool = False
+    ks: dict | None = None
+    tip: dict | None = None
+    build: bool = False
+
+
+async def look(ctx: Context, db: AsyncSession, s: SigningSession) -> Seen:
+    """Everything a build asks, of the session and of the chain, and nothing written. Raises what refuses
+    the build: a session that has ended, a timelock still running, a pause, ops the seats no longer meet,
+    approvals short of the live keyset, a node that does not answer.
+
+    This is the half of `rebuild` that waits on the node, apart from the half that writes, so that a
+    caller with something to put on the log first can ask before it writes. An append takes the log head
+    and holds it until the transaction ends, and every writer in the service appends: a build that
+    followed an append in the same transaction had each of them waiting on the node, a minute a call
+    and several calls in a row when it was slow (XE-14181). So the order everywhere is look, then
+    write, and `rebuild(seen=...)` builds from what was seen."""
+    if s.status not in OPEN:
         raise HTTPException(409, f"session is {s.status}")
     if s.status == "signing" and await landed(ctx, s):
         # The tip moved because this block is the tip: rebuilding would write the same ops twice (XE-1511).
-        return await _submitted(ctx, db, s)
+        return Seen(landed=True)
     require_timelock_run(s)
     await require_unpaused(db)
     require_executable(ctx, s)
     ks = await live_keyset(ctx)
     if not approvals_met(s, ks):
         if s.status == "signing":
-            # The keyset moved under a session that was already approved (a rotation landed first): the
-            # approvals it holds no longer meet the live threshold. It goes back to approving rather than
-            # sitting in signing with a block nobody may sign; the new keys approve and it proceeds (XE-0988).
-            s.block, s.block_hash, s.block_signatures, s.status = None, "", [], "approving"
-            await ctx.events.append(db, "session.reapproval_needed", actor, {
-                "session_id": s.id, "ops_digest": s.ops_digest, "approvals": len(s.approvals), "required": ks["threshold"],
-                "live_approvals": sum(1 for a in s.approvals if a["public_key"] in ks["keys"]),
-            }, ref=f"session:{s.id}")
-            return s
+            return Seen(ks=ks)
         raise HTTPException(409, "the session does not hold enough approvals from the live keyset")
     try:
         tip = await ctx.chain.statechain_tip()
@@ -335,7 +378,39 @@ async def rebuild(ctx: Context, db: AsyncSession, s: SigningSession, actor: str 
             tip = None
         else:
             raise
-    blk = build_block(tip, _ops_from_json(s.ops), time.time_ns())
+    # Asked again, now that nothing more waits on the node: the reads above can take a minute each, and a
+    # pause that began during them was followed by a block built all the same (XE-4126, for a build).
+    await require_unpaused(db)
+    return Seen(ks=ks, tip=tip, build=True)
+
+
+async def rebuild(ctx: Context, db: AsyncSession, s: SigningSession, actor: str = "harness",
+                  seen: Seen | None = None) -> SigningSession:
+    """Build (or re-build) the block at the live tip. Resets block signatures. Only an approved session,
+    counted against the keyset as it is now, and not before the timelock has run (`look`, which a caller
+    that has already written to the log in this transaction runs first and passes in as `seen`)."""
+    seen = seen or await look(ctx, db, s)
+    if seen.landed:
+        return await _submitted(ctx, db, s)
+    if not seen.build:
+        # The keyset moved under a session that was already approved (a rotation landed first): the
+        # approvals it holds no longer meet the live threshold. It goes back to approving rather than
+        # sitting in signing with a block nobody may sign; the new keys approve and it proceeds (XE-0988).
+        ks = seen.ks
+        s.block, s.block_hash, s.block_signatures, s.status = None, "", [], "approving"
+        await ctx.events.append(db, "session.reapproval_needed", actor, {
+            "session_id": s.id, "ops_digest": s.ops_digest, "approvals": len(counted(s.approvals, ks)),
+            "held": len(s.approvals), "required": ks["threshold"],
+        }, ref=f"session:{s.id}")
+        return s
+    # The pause is asked a last time with the log head held. `look` asked after its waits on the node,
+    # but a caller that then waits its turn at the head (any append) was still building on that answer
+    # when it got there, and a pause that had begun in between was followed on the log by a block built.
+    # A pause begins with an append: holding the head, it has either begun and is read here, or it
+    # begins after this block is built (XE-4126).
+    await EventLog.hold(db)
+    await require_unpaused(db)
+    blk = build_block(seen.tip, _ops_from_json(s.ops), time.time_ns())
     s.block = {"index": blk.index, "prev_hash": blk.prev_hash, "timestamp": blk.timestamp, "hash": blk.hash}
     s.block_hash = blk.hash
     s.block_signatures = []
@@ -366,6 +441,7 @@ async def sign(ctx: Context, db: AsyncSession, s: SigningSession, pub_key: str, 
     require_executable(ctx, s)
     pub_key = pub_key.lower()
     ks = await live_keyset(ctx)
+    await require_unpaused(db)   # again, after the wait on the node (`look`)
     if pub_key not in ks["keys"]:
         raise HTTPException(403, "this key is not in the live sys.dao_keyset")
     try:
@@ -375,11 +451,21 @@ async def sign(ctx: Context, db: AsyncSession, s: SigningSession, pub_key: str, 
     if any(x["public_key"] == pub_key for x in s.block_signatures):
         raise HTTPException(409, "already signed by this key")
     s.block_signatures = [*s.block_signatures, {"public_key": pub_key, "signature": signature.lower()}]
+    # The block goes to the node before the signature is written to the log, and the two are recorded
+    # together once the node has answered (`look`). If the process stops in between, the session is still
+    # `signing` with its block, and the worker's pass finds the block on the chain and records it.
+    out = await attempt(ctx, db, s) if signatures_met(s, ks) else None
     await ctx.events.append(db, "session.block_signed", actor, {
-        "session_id": s.id, "block_hash": s.block_hash, "signatures": len(s.block_signatures), "required": ks["threshold"],
+        "session_id": s.id, "block_hash": s.block_hash, "signatures": len(counted(s.block_signatures, ks)),
+        "required": ks["threshold"],
     }, ref=f"session:{s.id}")
-    if signatures_met(s, ks):
-        await submit(ctx, db, s)
+    if out is None:
+        # A signature that is kept and not yet submitted: asked once more with the log head held, as a
+        # build is (`rebuild`), so none is recorded after a pause began while this waited for the head.
+        # One that met the threshold was offered above, where `attempt` asked right before the submit.
+        await require_unpaused(db)
+    else:
+        await settle(ctx, db, s, out)
     return s
 
 
@@ -421,6 +507,8 @@ async def _submitted(ctx: Context, db: AsyncSession, s: SigningSession) -> Signi
     s.submitted_index = int(s.block["index"])
     s.submitted_hash = s.block_hash
     if s.kind == "anchor":
+        # Before the append: the row, then the log head, the order every writer takes them in (`_ended`
+        # holds the row while it waits for the head; XE-12010).
         await _anchor_written(db, s)
     await ctx.events.append(db, "session.submitted", "harness", {
         "session_id": s.id, "kind": s.kind, "index": s.submitted_index, "hash": s.submitted_hash, "ops": s.ops,
@@ -433,18 +521,31 @@ async def _anchor_written(db: AsyncSession, s: SigningSession) -> None:
     """The register row for an anchor session whose block is on the chain. A session that ended first took
     its row with it (`_ended`); if its block landed after all, the row is written again from the op, which
     is the anchor (XE-4148). Should a later session have taken the number in between, the row goes to
-    whichever block the chain holds: a row that names a block on the chain stands and the log carries this
-    one, and a row still waiting on its session is this block's now, since the number is written and what
-    the register says of it is what was written (XE-6256)."""
-    a = (await db.execute(select(Anchor).where(Anchor.session_id == s.id))).scalar_one_or_none()
+    whichever block the chain holds: a row still waiting on its session is this block's now, since the
+    number is written and what the register says of it is what was written (XE-6256).
+
+    Where both blocks reach the chain, what the chain holds under `dao.anchor.<n>` is what the later of
+    them wrote: a set replaces what was set before it. So the row names the block with the higher index,
+    whichever of the two is recorded first. The row once stood as soon as it named any block, which kept
+    the first to be recorded, and when that was the earlier block the register named an anchor the chain
+    no longer held (XE-14127). The log carries both.
+
+    The row is read locked and as the database holds it now (`locked`): two blocks for one number
+    recorded at the same moment each read the row unwritten, and the one that committed second set it,
+    whichever block that was. Now the second waits for the row and reads what the first left. Where the
+    number has no row for either to wait on, both add one and the second is refused by the key on `n`;
+    its transaction fails, and the worker's next pass records it against the row that is there."""
+    a = (await db.execute(locked(select(Anchor).where(Anchor.session_id == s.id)))).scalar_one_or_none()
+    if a is not None and a.statechain_index is not None and a.statechain_index >= s.submitted_index:
+        return
     if a is None:
         try:
             value = json.loads(s.ops[0]["value"])
             n, event_index, head_hash = int(value["n"]), int(value["event_index"]), str(value["head_hash"])
         except (KeyError, IndexError, TypeError, ValueError):
             return
-        a = (await db.execute(select(Anchor).where(Anchor.n == n))).scalar_one_or_none()
-        if a is not None and a.statechain_index is not None:
+        a = (await db.execute(locked(select(Anchor).where(Anchor.n == n)))).scalar_one_or_none()
+        if a is not None and a.statechain_index is not None and a.statechain_index >= s.submitted_index:
             return
         if a is None:
             a = Anchor(n=n, event_index=event_index, head_hash=head_hash, session_id=s.id)
@@ -459,14 +560,31 @@ ENDED_WATCH_DAYS = 7
 ENDED_WATCH_MAX = 50
 
 
-async def ended_holding_a_block(db: AsyncSession) -> list[str]:
+async def ended_holding_a_block(db: AsyncSession, offset: int = 0) -> list[str]:
     """Sessions that ended `failed` or `cancelled` with a block built, recently enough that the block could
-    still land: the newest `ENDED_WATCH_MAX` of the last `ENDED_WATCH_DAYS` days."""
+    still land: those of the last `ENDED_WATCH_DAYS` days, newest first, `ENDED_WATCH_MAX` at a time from
+    `offset`. A pass looks at one such page, and the worker moves the offset on each pass and starts over
+    after a short page, so every session in the window is looked at within a few rounds (one that ends or
+    is recorded shifts the pages under the offset by a place, and the next round has it). Without the offset a pass
+    took the newest fifty every time: an ended session's `updated_at` does not change, so the fifty-first
+    was looked at by no pass, and its block landing was never recorded (XE-14215)."""
     since = datetime.now(timezone.utc) - timedelta(days=ENDED_WATCH_DAYS)
     q = (select(SigningSession.id).where(SigningSession.status.in_(("failed", "cancelled")),
                                          SigningSession.block_hash != "", SigningSession.updated_at >= since)
-         .order_by(SigningSession.updated_at.desc(), SigningSession.id.desc()).limit(ENDED_WATCH_MAX))
+         .order_by(SigningSession.updated_at.desc(), SigningSession.id.desc()).offset(offset).limit(ENDED_WATCH_MAX))
     return list((await db.execute(q)).scalars().all())
+
+
+async def reconcile_signing(ctx: Context, db: AsyncSession, s: SigningSession) -> bool:
+    """The same for a session still `signing` whose block the chain holds (its submit was accepted and
+    could not be confirmed, or the signed block was sent by another route). The worker's pass asks this
+    of each signing session while a pause is in force, when it neither rebuilds nor submits: recording
+    what the chain holds is not an act on the chain, and a pause that stopped it left a written anchor
+    called unwritten for as long as the pause ran. True if it was recorded."""
+    if s.status != "signing" or not await landed(ctx, s):
+        return False
+    await _submitted(ctx, db, s)
+    return True
 
 
 async def reconcile_ended(ctx: Context, db: AsyncSession, s: SigningSession) -> bool:
@@ -484,6 +602,20 @@ def ready_to_submit(s: SigningSession, ks: dict) -> bool:
     return s.status == "signing" and bool(s.block) and signatures_met(s, ks)
 
 
+@dataclass(frozen=True)
+class Outcome:
+    """How a submit came out, as the chain says, with everything needed to record it already read.
+    `kind` is `submitted` (the chain holds the block), `deferred` (still owed, for `error`), `moved` (the
+    chain moved under the block: `moved` names how, `seen` is what to rebuild on, or `error` why it cannot
+    be rebuilt yet) or `failed` (the node refused the block itself). `refusal` is the node's refusal as
+    the client words it."""
+    kind: str
+    error: str = ""
+    refusal: str = ""
+    moved: str = ""
+    seen: Seen | None = None
+
+
 async def submit(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSession:
     """Submit the signed block. What happened to it is what the chain says, never what the node answered:
     the session is `submitted` when the chain holds the block at its index, whether the node said yes
@@ -491,7 +623,14 @@ async def submit(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSe
     was applied, XE-1511). A node failure never escapes and never, on its own, ends the session: only a
     refusal from a node that answered, on a chain that neither holds the block nor has moved under it,
     sets `failed`. Everything else leaves the session `signing` with the error on record, and the worker
-    submits it again (XE-1677, XE-1689, XE-1817)."""
+    submits it again (XE-1677, XE-1689, XE-1817).
+
+    In two halves, as a build is (`look`): `attempt` is everything that waits on the node and writes
+    nothing, `settle` records what came of it."""
+    return await settle(ctx, db, s, await attempt(ctx, db, s))
+
+
+async def attempt(ctx: Context, db: AsyncSession, s: SigningSession) -> Outcome:
     require_timelock_run(s)
     await require_unpaused(db)
     require_executable(ctx, s)
@@ -502,10 +641,10 @@ async def submit(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSe
         return await _refused(ctx, db, s, e)
     try:
         if await landed(ctx, s):
-            return await _submitted(ctx, db, s)
+            return Outcome("submitted")
     except XeError as read_err:
-        return await _deferred(ctx, db, s, f"submit accepted; could not confirm against the chain: {read_err}")
-    return await _deferred(ctx, db, s, "submit accepted, but the chain does not hold the block at its index yet")
+        return Outcome("deferred", f"submit accepted; could not confirm against the chain: {read_err}")
+    return Outcome("deferred", "submit accepted, but the chain does not hold the block at its index yet")
 
 
 async def _moved_under(ctx: Context, s: SigningSession) -> str | None:
@@ -520,34 +659,53 @@ async def _moved_under(ctx: Context, s: SigningSession) -> str | None:
     return None
 
 
-async def _refused(ctx: Context, db: AsyncSession, s: SigningSession, e: XeError) -> SigningSession:
+async def _refused(ctx: Context, db: AsyncSession, s: SigningSession, e: XeError) -> Outcome:
     # Before believing a refusal, ask the chain. If the block is there, it was accepted.
     try:
         if await landed(ctx, s):
-            return await _submitted(ctx, db, s)
+            return Outcome("submitted")
         # 429, 5xx, no answer: the node said nothing about the block.
         moved = None if e.transient else await _moved_under(ctx, s)
     except XeError as read_err:
-        return await _deferred(ctx, db, s, f"submit: {e}; could not confirm against the chain: {read_err}")
+        return Outcome("deferred", f"submit: {e}; could not confirm against the chain: {read_err}")
     if e.transient:
-        return await _deferred(ctx, db, s, f"submit: {e}")
+        return Outcome("deferred", f"submit: {e}")
     if moved:
         # The chain moved under the block (its tip, or the keyset it is checked against): rebuild on what is
-        # live. A rotation that leaves the approvals short sends it back to approving (XE-0988).
-        await ctx.events.append(db, moved, "harness", {"session_id": s.id, "error": str(e), "block_hash": s.block_hash},
-                                ref=f"session:{s.id}")
+        # live. A rotation that leaves the approvals short sends it back to approving (XE-0988). What stops
+        # the rebuild is recorded as the reason the submit is still owed, whichever kind it is: the node
+        # not answering, or a refusal of the build (a pause that began since the signature was taken, ops
+        # the seats no longer meet). The second kind used to escape from here as a 409, and took the
+        # signature that had just been counted, and the record that the chain had moved, back with it
+        # (XE-14509).
         try:
-            await rebuild(ctx, db, s)
+            return Outcome("moved", refusal=str(e), moved=moved, seen=await look(ctx, db, s))
         except XeError as build_err:
-            return await _deferred(ctx, db, s, f"submit: {e}; rebuild: {build_err}")
-        return s
+            return Outcome("moved", f"submit: {e}; rebuild: {build_err}", refusal=str(e), moved=moved)
+        except HTTPException as build_err:
+            return Outcome("moved", f"submit: {e}; rebuild: {build_err.detail}", refusal=str(e), moved=moved)
     # The node answered and refused; the chain does not hold the block, its tip is the block's parent and
     # its keyset is met by the block's signatures. The refusal is about the block, and building the same
-    # ops again would draw it again: the session ends, with the node's words on the record.
+    # ops again would draw it again: the session ends, with the refusal on the record.
+    return Outcome("failed", refusal=str(e))
+
+
+async def settle(ctx: Context, db: AsyncSession, s: SigningSession, out: Outcome) -> SigningSession:
+    """Record what `attempt` found. Nothing here waits on the node."""
+    if out.kind == "submitted":
+        return await _submitted(ctx, db, s)
+    if out.kind == "deferred":
+        return await _deferred(ctx, db, s, out.error)
+    if out.kind == "moved":
+        await ctx.events.append(db, out.moved, "harness", {"session_id": s.id, "error": out.refusal, "block_hash": s.block_hash},
+                                ref=f"session:{s.id}")
+        if out.seen is None:
+            return await _deferred(ctx, db, s, out.error)
+        return await rebuild(ctx, db, s, seen=out.seen)
     s.status = "failed"
-    s.error = str(e)
+    s.error = out.refusal
     await _ended(db, s)
-    await ctx.events.append(db, "session.failed", "harness", {"session_id": s.id, "error": str(e)}, ref=f"session:{s.id}")
+    await ctx.events.append(db, "session.failed", "harness", {"session_id": s.id, "error": out.refusal}, ref=f"session:{s.id}")
     return s
 
 
@@ -562,16 +720,18 @@ async def _deferred(ctx: Context, db: AsyncSession, s: SigningSession, error: st
     return s
 
 
-async def cancel(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified, reason: str) -> SigningSession:
+async def cancel(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified, reason: str,
+                 on_chain: bool | None = None) -> SigningSession:
     """A member ends a session. One that holds a block is first checked against the chain: a block that
     landed is recorded as submitted, not cancelled, whatever the node said at the time (XE-1843, as for
     rebuild and submit). If the chain cannot be read the cancel waits (502). The answer carries the
-    session as it now stands."""
+    session as it now stands. `on_chain` is that check's answer where the caller has asked already,
+    which one that has written to the log in this transaction has (`look`)."""
     if s.status not in OPEN:
         # Ended is ended: a session that was submitted, failed or cancelled is not ended a second time, and
         # the reason on its row (the node's refusal, for a failed one) is not written over (XE-6873).
         raise HTTPException(409, f"session is {s.status}")
-    if s.block and await landed(ctx, s):
+    if s.block and (await landed(ctx, s) if on_chain is None else on_chain):
         return await _submitted(ctx, db, s)
     s.status = "cancelled"
     s.error = reason
@@ -587,14 +747,33 @@ async def _ended(db: AsyncSession, s: SigningSession) -> None:
         await db.execute(delete(Anchor).where(Anchor.session_id == s.id))
 
 
-def to_dict(s: SigningSession, public: bool = True) -> dict:
-    d = {
+def to_dict(s: SigningSession, ks: dict | None) -> dict:
+    """A session still open shows the approvals and the block signatures that count now beside the number
+    needed now, and names the keys whose approval or signature is set aside, so what a reader adds up is
+    what `approvals_met` and `signatures_met` add up (XE-3877; the rule `resolutions.to_dict` keeps). It
+    showed everything it held over the threshold it was created under: after a rotation, "2/2" on a
+    session the gate held at one of two.
+
+    `ks` is the live keyset. Where it could not be read (None, or the `{"error": ...}` that
+    `records.public_keyset` returns) nothing can be counted and nothing is said to be: the session shows
+    what it holds, `required_approvals` is None and `counted` is False. A session that has ended shows
+    what it holds and the number it was created under, which are a record and are not counted again."""
+    readable = isinstance(ks, dict) and not ks.get("error")
+    now = s.status in OPEN and readable
+    held_a, held_s = s.approvals or [], s.block_signatures or []
+    approvals, signatures = (counted(held_a, ks), counted(held_s, ks)) if now else (held_a, held_s)
+    set_aside = sorted({x["public_key"] for x in [*held_a, *held_s]} - {x["public_key"] for x in [*approvals, *signatures]})
+    if now:
+        required = int(ks["threshold"])
+    else:
+        required = None if s.status in OPEN else s.required_approvals
+    return {
         "id": s.id, "kind": s.kind, "title": s.title, "status": s.status, "ops": s.ops, "ops_digest": s.ops_digest,
-        "approvals": [{"public_key": a["public_key"], "seat": a.get("seat", ""), "timestamp": a.get("timestamp")} for a in s.approvals],
-        "required_approvals": s.required_approvals, "block": s.block, "block_hash": s.block_hash,
-        "block_signatures": [x["public_key"] for x in s.block_signatures], "rebuilds": s.rebuilds,
+        "approvals": [{"public_key": a["public_key"], "seat": a.get("seat", ""), "timestamp": a.get("timestamp")} for a in approvals],
+        "required_approvals": required, "counted": now, **({"set_aside": set_aside} if set_aside else {}),
+        "block": s.block, "block_hash": s.block_hash,
+        "block_signatures": [x["public_key"] for x in signatures], "rebuilds": s.rebuilds,
         "submitted_index": s.submitted_index, "submitted_hash": s.submitted_hash, "error": s.error,
         "resolution_id": s.resolution_id, "not_before": s.not_before,
         "created_at": s.created_at.isoformat() if s.created_at else None,
     }
-    return d

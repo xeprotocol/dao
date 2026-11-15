@@ -224,10 +224,11 @@ class Worker:
         is not yet on the chain (its submit was deferred by a node that did not answer, XE-1677/XE-1689)
         is submitted again. A session that ended without its block on the chain is looked up there while
         the block could still land, and recorded submitted if it has (XE-4148): that is a record catching
-        up with the chain, not an act on it, so a pause does not stop it."""
+        up with the chain, not an act on it, so a pause does not stop it, for an ended session or for one
+        still signing (`sessions.reconcile_signing`)."""
         async with session() as db:
             paused = await pause.is_paused(db)
-            ids = [] if paused else await self._session_ids(db, "signing")
+            ids = await self._session_ids(db, "signing")
             await db.commit()
             ks = None
             for sid in ids:
@@ -236,18 +237,27 @@ class Worker:
                     await db.rollback()
                     continue
                 try:
-                    stale = await sessions.is_stale(self.ctx, s)
-                    if not s.block_signatures and stale:
-                        await sessions.rebuild(self.ctx, db, s)
-                    elif s.block_signatures and stale:
-                        # partial signatures over a stale block cannot be submitted; reset and say so. Unless
-                        # the tip moved because this block is the tip (its submit was deferred and it has
-                        # landed since): nothing moved under the session, and `rebuild` records it submitted.
-                        if not await sessions.landed(self.ctx, s):
+                    if paused:
+                        # nothing is built or submitted; a block the chain already holds is recorded
+                        await sessions.reconcile_signing(self.ctx, db, s)
+                    elif await sessions.is_stale(self.ctx, s):
+                        # What a rebuild needs of the chain is read before anything is written
+                        # (`sessions.look`), and what refuses the rebuild (a pause begun since this pass
+                        # started, ops the seats no longer meet) is raised there, with nothing staged for
+                        # the rollback below to take back and write again on the next pass (XE-14509).
+                        seen = await sessions.look(self.ctx, db, s)
+                        if s.block_signatures and not seen.landed:
+                            # partial signatures over a stale block cannot be submitted; reset and say so.
+                            # Unless the tip moved because this block is the tip (its submit was deferred
+                            # and it has landed since): nothing moved under the session, and `rebuild`
+                            # records it submitted.
                             await self.ctx.events.append(db, "session.tip_moved", "harness", {
-                                "session_id": s.id, "block_hash": s.block_hash, "had_signatures": len(s.block_signatures),
+                                "session_id": s.id, "block_hash": s.block_hash,
+                                # what the gates counted, and beside it what was held (XE-3877)
+                                "had_signatures": len(sessions.counted(s.block_signatures, seen.ks)),
+                                "held": len(s.block_signatures),
                             }, ref=f"session:{s.id}")
-                        await sessions.rebuild(self.ctx, db, s)
+                        await sessions.rebuild(self.ctx, db, s, seen=seen)
                     else:
                         ks = ks or await sessions.live_keyset(self.ctx)
                         if sessions.ready_to_submit(s, ks):
@@ -255,8 +265,12 @@ class Worker:
                     await db.commit()
                 except Exception as e:
                     await db.rollback()
-                    log.warning("session %s: %s", sid, e)
-            ended = await sessions.ended_holding_a_block(db)
+                    log.warning("session %s: %s", sid, e.detail if isinstance(e, HTTPException) else e)
+            # One page of the ended sessions a pass, the next page on the next pass, and from the top again
+            # after a short one: every one of them is looked at in turn (XE-14215).
+            offset = getattr(self, "_ended_offset", 0)
+            ended = await sessions.ended_holding_a_block(db, offset)
+            self._ended_offset = offset + len(ended) if len(ended) == sessions.ENDED_WATCH_MAX else 0
             await db.commit()
             for sid in ended:
                 s = await self._take(db, sid, "failed", "cancelled")
@@ -311,6 +325,8 @@ class Worker:
             except HTTPException as e:
                 if e.status_code != 409:
                     raise
+                if await pause.is_paused(db):
+                    return   # a pause began while this ran: nothing was opened and the run is not marked (XE-4126)
                 # The members already have an anchor session to sign, so this week's is that one. The run is
                 # marked: asking again every tick until it is signed would change nothing. If it is cancelled
                 # instead, a member opens the next by hand or the job does in a week; health shows the age.
