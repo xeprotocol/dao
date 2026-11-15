@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 
@@ -25,6 +26,7 @@ from ..worker_schedule import next_runs
 from .deps import Ctx, Db
 
 router = APIRouter(prefix="/v1", tags=["public"])
+log = logging.getLogger("dao.api")
 
 
 @router.get("")
@@ -369,7 +371,9 @@ async def ready(ctx: Ctx, db: Db):
     try:
         await EventLog.head(db)
     except Exception as e:
-        raise HTTPException(503, f"database not ready: {e}")
+        # what failed goes to the server's log; a caller is told that it did and nothing of how (XE-6983)
+        log.warning("ready: the database read failed: %s: %s", type(e).__name__, e)
+        raise HTTPException(503, "database not ready") from e
     return {"ready": True, "network_id": ctx.node.network_id}
 
 

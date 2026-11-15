@@ -22,6 +22,7 @@ from .. import signatures
 from ..auth import Verified
 from ..context import Context
 from ..db import locked, serialize
+from ..faults import reason
 from ..log import EventLog
 from ..models import Proposal, Resolution
 from ..text import clean_text, field_text

@@ -278,7 +278,7 @@ class XeClient:
         try:
             content = body.encode("utf-8")
         except ValueError as e:   # an unpaired surrogate: never sent, and only an XeError leaves the client (XE-4592)
-            raise XeError(UNREACHABLE, f"request could not be built: {type(e).__name__}: {str(e)[:200]}") from e
+            raise XeError(UNREACHABLE, f"request could not be built: {type(e).__name__}") from e
         return self._unwrap(await self._send("POST", path, content=content, headers={"Content-Type": "application/json"}))
 
     async def _send(self, method: str, path: str, *, max_bytes: int | None = None, deadline_s: float | None = None,
@@ -303,11 +303,13 @@ class XeClient:
                             raise XeError(UNREACHABLE, f"response exceeds {limit} bytes")
                     return _Reply(r.status_code, bytes(body))
         except _TRANSPORT as e:   # connect, read, write, pool timeouts, transport failures, a URL that cannot be sent
-            raise XeError(UNREACHABLE, f"{type(e).__name__}: {str(e)[:200]}") from e
+            # its kind and no more: the library's own words carry the address it dialled, and this message
+            # is stored on rows and written to the log the public reads (XE-6983). The cause keeps them.
+            raise XeError(UNREACHABLE, type(e).__name__) from e
         except TimeoutError as e:
             raise XeError(UNREACHABLE, f"no complete response within {deadline:.0f}s") from e
         except (ValueError, TypeError) as e:   # a body httpx will not encode (NaN, an unpaired surrogate): never sent
-            raise XeError(UNREACHABLE, f"request could not be built: {type(e).__name__}: {str(e)[:200]}") from e
+            raise XeError(UNREACHABLE, f"request could not be built: {type(e).__name__}") from e
 
     @staticmethod
     def _unwrap(r: _Reply) -> Any:

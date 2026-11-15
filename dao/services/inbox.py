@@ -29,6 +29,7 @@ from xe.pow import WORKER_POW_DEADLINE_S
 from ..auth import Verified, require_pow
 from ..context import Context
 from ..db import locked
+from ..faults import reason
 from ..log import EventLog
 from ..models import InboxMessage, OutboxMessage
 from ..text import clean_text, field_text, has_bad_control, scrub
@@ -257,7 +258,7 @@ async def _offer(ctx: Context, db: AsyncSession, o: OutboxMessage) -> bool:
     try:
         await ctx.chain.chat_send(o.envelope)
     except Exception as e:
-        o.error = str(e)[:500]
+        o.error = reason(e, 500)
         log.warning("outbox %s: send of %s raised; outcome unknown: %s", o.id, str(o.envelope.get("id"))[:12], e)
         await db.commit()
         return False

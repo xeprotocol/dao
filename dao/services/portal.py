@@ -67,7 +67,7 @@ async def _verify_fee(ctx: Context, db: AsyncSession, fee_block_hash: str, autho
     except XeError as e:
         if e.status == 404:
             raise HTTPException(400, "fee block not found on the chain yet; wait for it to be seen and retry") from e
-        raise HTTPException(502, f"node error reading fee block: {e}") from e
+        raise   # the application's one answer to a node failure: logged there, and a fixed 502 to the caller (XE-6983)
     if b.get("type") != "send":
         raise HTTPException(400, "fee block must be a send")
     if b.get("asset") != "XE":

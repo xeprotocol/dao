@@ -22,6 +22,7 @@ from xe.directory import new_registration
 from .auth import purge_seen_signatures
 from .context import Context, build_context, set_context
 from .db import locked, only_one, session
+from .faults import reason
 from .log import EventLog
 from .models import SigningSession
 from .services import fees, inbox, pause, portal, records, resolutions, sessions
@@ -97,10 +98,11 @@ class Worker:
                 if before.get("ok") is not True:   # the first there has been, or the first after a spell of failures
                     await ctx.events.append(db, "directory.registered", "harness", {"after_failures": int(before.get("failures") or 0)}, public=False)
             except Exception as e:
-                log.warning("directory register failed: %s", e)
-                before = await mark_failed(db, "directory", {"ok": False, "error": str(e)[:300]}, every_s, DIRECTORY_RETRY_S)
+                log.warning("directory register failed: %s: %s", type(e).__name__, e)
+                await db.rollback()   # whatever failed, the database included, the failure is still marked (XE-3724)
+                before = await mark_failed(db, "directory", {"ok": False, "error": reason(e)}, every_s, DIRECTORY_RETRY_S)
                 if before.get("ok") is not False:
-                    await ctx.events.append(db, "directory.register_failed", "harness", {"error": str(e)[:300]}, public=False)
+                    await ctx.events.append(db, "directory.register_failed", "harness", {"error": reason(e)}, public=False)
             await db.commit()
 
     @staticmethod

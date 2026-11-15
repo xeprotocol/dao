@@ -31,6 +31,7 @@ from ..auth import Verified
 from ..canonical import canonical_json, sha256_hex
 from ..context import Context
 from ..db import locked
+from ..faults import reason
 from ..log import EventLog
 from ..models import Anchor, SigningSession
 from . import pause
@@ -135,6 +136,8 @@ def normalise_ops(ops) -> list[dict]:
             op.validate()
         except StateChainError as e:
             raise HTTPException(400, f"ops are malformed: {e}") from e
+        except (TypeError, ValueError) as e:   # not ours to quote: the interpreter's words about the caller's value
+            raise HTTPException(400, "ops are malformed") from e
         d = {"action": op.action, "key": op.key}
         if op.action == "set":
             d["value"] = op.value
@@ -287,7 +290,7 @@ async def approve(ctx: Context, db: AsyncSession, s: SigningSession, v: Verified
             # read above, anything else. The worker's timer pass builds the block when it can be built.
             log.warning("session %s: approved, block not built: %s", s.id, e)
             await ctx.events.append(db, "session.build_deferred", "harness",
-                                    {"session_id": s.id, "error": (getattr(e, "detail", None) or str(e))[:300]},
+                                    {"session_id": s.id, "error": reason(e)},
                                     ref=f"session:{s.id}")
     return s
 

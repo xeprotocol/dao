@@ -47,6 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import chainops
 from ..context import Context
+from ..faults import reason
 from ..log import EventLog
 from ..models import FeeLedger, Proposal
 from ..signer import SignerError

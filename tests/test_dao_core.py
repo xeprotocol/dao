@@ -2621,6 +2621,108 @@ async def test_a_declared_length_is_a_bounded_number_or_the_request_is_refused()
         assert await answer(fits) == (None, True), fits
 
 
+# ---- XE-6983: a failure's own text goes to the server's log, and a response says only that it failed -------
+
+async def test_no_response_carries_the_text_of_a_failure_the_service_did_not_write(monkeypatch, caplog):
+    import ast
+    from fastapi import HTTPException
+    from dao.api import public
+    from dao.services import portal, records
+    from xe.client import XeError
+    secret = "connection to server at 10.0.0.5, port 5432 failed: SELECT index FROM log_head"
+
+    # the sites: a raise of an HTTP error may quote an exception only where the handler names errors whose
+    # text this code wrote (a refused signature, a refused keyset or op), never a node's or the database's
+    own = {"KeyError_", "StateChainError", "HTTPException"}
+    for path in sorted((ROOT / "dao").rglob("*.py")):
+        for h in ast.walk(ast.parse(path.read_text())):
+            if not (isinstance(h, ast.ExceptHandler) and h.name):
+                continue
+            caught = {ast.unparse(t).split(".")[-1] for t in (h.type.elts if isinstance(h.type, ast.Tuple) else [h.type])}
+            for r in ast.walk(h):
+                if isinstance(r, ast.Raise) and isinstance(r.exc, ast.Call) and "HTTPException" in ast.unparse(r.exc.func):
+                    quoted = any(isinstance(n, ast.Name) and n.id == h.name
+                                 for a in [*r.exc.args, *(k.value for k in r.exc.keywords)] for n in ast.walk(a))
+                    assert not quoted or caught <= own, f"{path.name}:{r.lineno} answers with the text of {sorted(caught)}"
+
+    # readiness: the database's words are logged and not returned
+    async def down(db):
+        raise RuntimeError(secret)
+    monkeypatch.setattr(public.EventLog, "head", staticmethod(down))
+    with caplog.at_level("WARNING"), pytest.raises(HTTPException) as e:
+        await public.ready(SimpleNamespace(node=SimpleNamespace(network_id="n")), None)
+    assert (e.value.status_code, e.value.detail) == (503, "database not ready") and secret in caplog.text
+
+    # the fee check: a node failure that is not "no such block" leaves as the node error the application
+    # answers with one fixed line, not as a response this function words from it
+    class Db:
+        async def execute(self, *a, **k):
+            return SimpleNamespace(first=lambda: None)
+
+    class Chain:
+        async def block(self, h):
+            raise XeError(500, secret)
+    ctx = SimpleNamespace(config=SimpleNamespace(accounts={"fee": "xe_fee"}), chain=Chain())
+    with pytest.raises(XeError):
+        await portal._verify_fee(ctx, Db(), "ab" * 32, "xe_author", 1)
+
+    # what is kept where a reader sees it (a row a route returns, an entry on the log, the health record):
+    # the words of a failure this code or the protocol package worded, and of anything else only its kind
+    from dao import faults
+    from dao.signer import SignerError
+    from xe.statechain import StateChainError
+    for ours in (XeError(503, "node is syncing"), StateChainError("keyset needs at least one key"), SignerError("no fee key"),
+                 HTTPException(409, "held by a seat")):
+        assert faults.worded(ours) and faults.reason(ours) == (ours.detail if isinstance(ours, HTTPException) else str(ours))
+
+    class Driver(ValueError):
+        pass
+    for theirs in (RuntimeError(secret), ValueError(secret), KeyError(secret), Driver(secret), OSError(secret)):
+        assert not faults.worded(theirs) and faults.reason(theirs) == type(theirs).__name__
+    assert faults.reason(XeError(400, "x" * 900)) == str(XeError(400, "x" * 900))[:300] and len(faults.reason(XeError(400, "x" * 900), 500)) == 500
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert records._fault("log", RuntimeError(secret)) == "RuntimeError" and secret in caplog.text
+    assert records._fault("node", XeError(503, "node is syncing")) == str(XeError(503, "node is syncing"))
+    src = (ROOT / "dao/services/records.py").read_text()
+    assert src.count('_error"] = _fault(') == 7 and '_error"] = str(e)' not in src
+
+    # the sites, again: under a handler that catches everything, the exception's own text goes to a log
+    # call and nowhere else (not onto a row, into an entry, or into a response)
+    for path in sorted([*(ROOT / "dao").rglob("*.py"), *(ROOT / "xe").rglob("*.py")]):
+        tree = ast.parse(path.read_text())
+        parent = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+        for h in ast.walk(tree):
+            if not (isinstance(h, ast.ExceptHandler) and h.name):
+                continue
+            caught = {ast.unparse(t).split(".")[-1] for t in (h.type.elts if isinstance(h.type, ast.Tuple) else [h.type])}
+            if not caught & {"Exception", "BaseException"}:
+                continue
+            for n in ast.walk(h):
+                if not (isinstance(n, ast.Name) and n.id == h.name):
+                    continue
+                use = parent[n]
+                if not (isinstance(use, ast.FormattedValue) or (isinstance(use, ast.Call) and ast.unparse(use.func) in ("str", "repr"))):
+                    continue
+                logged, at = False, use
+                while at is not h and not logged:
+                    logged = isinstance(at, ast.Call) and ast.unparse(at.func).split(".")[0] in ("log", "logging")
+                    at = parent[at]
+                assert logged, f"{path.name}:{n.lineno} keeps the text of whatever was raised"
+
+    # a transport failure is the node client's to word, and it words its kind: the library's own message
+    # carries the address it dialled
+    import httpx
+
+    def refuse(request):
+        raise httpx.ConnectError(secret)
+    c = _node(refuse)
+    with pytest.raises(XeError) as e:
+        await c.statechain_tip()
+    assert str(e.value) == "node unreachable: ConnectError" and e.value.transient
+    await c.aclose()
+
+
 # ---- sweep of XE-3845: the command line takes a difficulty as the inbox publishes it, and nothing looser ---
 
 def test_the_cli_takes_a_difficulty_as_published_and_refuses_what_is_not_one():

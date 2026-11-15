@@ -1626,7 +1626,7 @@ async def test_each_outbox_row_is_committed_as_it_is_sent(db, monkeypatch):
     assert sorted(o.status for o in rows) == ["sending", "sent", "sent"]
     # the send that raised says nothing about delivery: the row keeps its envelope and is not `queued` again
     stuck = next(o for o in rows if o.status == "sending")
-    assert stuck.envelope["id"] and "channel closed" in stuck.error
+    assert stuck.envelope["id"] and stuck.error == "RuntimeError", "its kind: the words of a failure nobody here wrote are not kept where a reader sees them (XE-6983)"
 
 
 # ---- XE-1511: a session whose block is on the chain is submitted, whatever the node said ------------------
@@ -1817,7 +1817,7 @@ async def test_a_members_signature_survives_a_node_that_does_not_answer(db):
     await sessions.approve(ctx, db, s3, v3)
     assert s3.status == "approving" and len(s3.approvals) == 2
     owed = (await db.execute(select(Event).where(Event.kind == "session.build_deferred").order_by(Event.index))).scalars().all()
-    assert [e.payload["session_id"] for e in owed] == ["s2", "s3"] and "a bug in the build" in owed[1].payload["error"]
+    assert [e.payload["session_id"] for e in owed] == ["s2", "s3"] and owed[1].payload["error"] == "KeyError"
     s3.status = "cancelled"
     ctx.chain.statechain_tip = lambda: _tip_at(0)
     await sessions.rebuild(ctx, db, s)          # what the worker's timer pass does

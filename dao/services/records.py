@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from datetime import datetime, timezone
 from fractions import Fraction
@@ -16,9 +17,12 @@ from xe.client import XeError
 
 from ..context import Context
 from ..db import serialize
+from ..faults import reason, worded
 from ..log import EventLog
 from ..models import Anchor, Event, HealthCheck, SigningSession, TreasurySnapshot
 from . import sessions
+
+log = logging.getLogger("dao.records")
 
 
 # ---- dao.registry ---------------------------------------------------------------------------
@@ -230,6 +234,15 @@ async def expected_keyset(db: AsyncSession) -> dict | None:
     return first.detail.get("keyset") if first else None
 
 
+def _fault(leg: str, e: Exception) -> str:
+    """What a failed leg writes into the health record, which anyone can read (`faults.reason`): the text
+    of an exception this code did not word goes to the server's log, and its kind into the record
+    (XE-6983)."""
+    if not worded(e):
+        log.warning("health: the %s leg failed: %s: %s", leg, type(e).__name__, e)
+    return reason(e)
+
+
 async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
     """The 10-minute check (BRIEF §8/§9): chain reachable, tip advancing, keyset unchanged, log consistent,
     signer up, last anchor age, pending signatures aging. Each leg compares what it fetches against the
@@ -248,7 +261,7 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
         ok = ok and bool(ready)
     except Exception as e:
         detail["node_ready"] = False
-        detail["node_error"] = str(e)[:300]
+        detail["node_error"] = _fault("node", e)
 
     try:   # tip advancing
         tip = await ctx.chain.statechain_tip()
@@ -259,7 +272,7 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
             detail["tip_stale"] = True
             ok = False
     except Exception as e:
-        detail["statechain_error"] = str(e)[:300]
+        detail["statechain_error"] = _fault("statechain", e)
 
     try:   # keyset unchanged
         ks = _keyset_shape(await ctx.chain.dao_keyset())
@@ -273,7 +286,7 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
             detail["keyset_unexpected"] = {"live": ks, "expected": expected}
             ok = False
     except Exception as e:
-        detail["keyset_error"] = str(e)[:300]
+        detail["keyset_error"] = _fault("keyset", e)
 
     try:   # log consistent
         head = await EventLog.head(db)
@@ -284,7 +297,7 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
             detail["log_first_error"] = ver.get("first_error")
             ok = False
     except Exception as e:
-        detail["log_error"] = str(e)[:300]
+        detail["log_error"] = _fault("log", e)
 
     detail["signer_keys"] = [k.name for k in ctx.signer.infos()]   # signer up
     if not ctx.signer.has("harness"):
@@ -298,7 +311,7 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
             detail["anchor_overdue"] = True
             ok = False
     except Exception as e:
-        detail["anchor_error"] = str(e)[:300]
+        detail["anchor_error"] = _fault("anchor", e)
 
     try:   # pending signatures aging
         cutoff = datetime.fromtimestamp((now - SESSION_AGING_S * 1_000_000_000) / 1e9, tz=timezone.utc)
@@ -308,14 +321,14 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
                                      "signatures": len(s.block_signatures or []), "required": s.required_approvals}
                                     for s in aging]
     except Exception as e:
-        detail["sessions_error"] = str(e)[:300]
+        detail["sessions_error"] = _fault("sessions", e)
 
     dao_addr = ctx.signer.address("dao") if ctx.signer.has("dao") else ""
     if dao_addr:   # directory
         try:
             detail["directory_registered"] = (await ctx.chain.directory(dao_addr)) is not None
         except Exception as e:
-            detail["directory_error"] = str(e)[:300]
+            detail["directory_error"] = _fault("directory", e)
 
     errors = sorted(k for k in detail if k.endswith("_error"))
     if errors:
