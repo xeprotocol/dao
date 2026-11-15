@@ -63,16 +63,27 @@ def registry_value(ctx: Context) -> dict:
 
 PUBLIC_READ_TTL_S = 10
 _public_reads: dict[str, tuple[float, object]] = {}
+_public_reading: dict[str, asyncio.Future] = {}
 
 
 async def _shared(key: str, read):
-    now = time.monotonic()
+    """One node read per key at a time as well as per interval: the requests that arrive while one is in
+    flight wait for its answer instead of each asking the node (XE-4318). The read belongs to no one
+    request, so a caller that goes away does not take it from the others."""
     hit = _public_reads.get(key)
-    if hit and now - hit[0] < PUBLIC_READ_TTL_S:
+    if hit and time.monotonic() - hit[0] < PUBLIC_READ_TTL_S:
         return hit[1]
-    value = await read()
-    _public_reads[key] = (now, value)
-    return value
+    reading = _public_reading.get(key)
+    if reading is None:
+        async def once():
+            try:
+                value = await read()
+                _public_reads[key] = (time.monotonic(), value)
+                return value
+            finally:
+                _public_reading.pop(key, None)
+        reading = _public_reading[key] = asyncio.ensure_future(once())
+    return await asyncio.shield(reading)
 
 
 async def public_keyset(ctx: Context) -> dict:

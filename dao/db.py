@@ -38,6 +38,15 @@ async def session() -> AsyncIterator[AsyncSession]:
         yield s
 
 
+async def release(db: AsyncSession) -> None:
+    """Hand a reading session's connection back to the pool before a wait on something that is not the
+    database. A session takes a connection at its first query and keeps it until its transaction ends; a
+    request that then waits on the node keeps it for as long as the node takes, and enough of those are
+    the whole pool (XE-4318). The rows already read stay readable (`expire_on_commit=False`), and the next
+    query takes a connection again. Not for a request that has written: its commit is its handler's."""
+    await db.commit()
+
+
 def locked(q, *, skip_locked: bool = False):
     """`q` as a locked read: FOR UPDATE, and the rows as the database holds them now. A session keeps the
     copy of a row it has already loaded (`expire_on_commit=False` keeps it across commits too), and a

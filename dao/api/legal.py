@@ -24,9 +24,12 @@ async def identifier(request: Request, ctx: Ctx, db: Db):
     """The public identifier of the company's governance surface."""
     enforce_ip(request, NODE_READ)
     reg = ctx.config.registry
-    head = await EventLog.head(db)
+    # The node first, the database last: a session takes its connection at its first query and keeps it to
+    # the end of the request, and a request that waits on the node with one in hand holds it for as long
+    # as the node takes. Twenty of those are the pool (XE-4318).
     ks = await records.public_keyset(ctx)
     onchain = await records.onchain_registry(ctx)
+    head = await EventLog.head(db)
     return {
         "entity": reg.get("entity"),
         "jurisdiction": reg.get("jurisdiction"),

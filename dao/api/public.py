@@ -15,7 +15,7 @@ from sse_starlette.sse import EventSourceResponse
 from .. import __version__
 from ..auth import POW_RULE, SignedRequest, accept, addressee, member_action, require_pow, verify_signed
 from ..canonical import DOMAIN_INBOX_HTTP, DOMAIN_MEMBER_ACTION, DOMAIN_PROPOSAL, DOMAIN_VOTE
-from ..db import session
+from ..db import release, session
 from ..log import EventLog, event_to_dict
 from ..ratelimit import INBOX, NODE_READ, PROPOSAL, SNAPSHOT, STREAMS, VOTE, enforce_ip
 from ..services import inbox as inbox_svc
@@ -206,6 +206,7 @@ async def snapshot(request: Request, account: str, ctx: Ctx, db: Db, proposal: s
             snap, reasons = kept.get("snapshot") or {}, kept.get("not_participating_because") or []
             participating, weight = row.participating, row.weight
         else:
+            await release(db)   # the rows are read; the node is not waited on with a pooled connection in hand (XE-4318)
             snap, reasons, participating, weight = await portal.eligibility(ctx, pr, account, is_agent)
     return {"account": account, **snap, "weight": weight, "participating": participating,
             "not_participating_because": reasons}

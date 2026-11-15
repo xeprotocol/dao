@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from ..auth import SignedRequest, member_action, seat_request
 from ..canonical import DOMAIN_OPS_APPROVAL, DOMAIN_RESOLUTION
-from ..db import locked
+from ..db import locked, release
 from ..ratelimit import NODE_READ, enforce_ip
 from ..services import inbox as inbox_svc
 from ..services import pause as pause_svc
@@ -84,6 +84,7 @@ async def get_session(request: Request, sid: str, ctx: Ctx, db: Db):
     enforce_ip(request, NODE_READ)   # `stale` asks the node for its tip
     s = await sessions.get(db, sid)
     d = sessions.to_dict(s)
+    await release(db)   # nothing below reads the database, and the node is not waited on with a connection held (XE-4318)
     d["stale"] = await sessions.is_stale(ctx, s)
     return d
 

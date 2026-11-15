@@ -1541,6 +1541,16 @@ def test_a_schedule_c_whose_seats_share_an_identity_is_refused_at_load(tmp_path)
 
 # ---- XE-2210: the snapshot preview is the vote's derivation ------------------------------------------------
 
+class _Released:
+    """The session a read route is given, as far as the route uses it after its rows are read (XE-4318)."""
+
+    def __init__(self):
+        self.released = 0
+
+    async def commit(self):
+        self.released += 1
+
+
 async def test_the_snapshot_preview_answers_what_the_vote_would(monkeypatch):
     """For every kind of account and any snapshot time, including time zero, the public preview of a
     proposal returns what `portal.eligibility` derives for a vote on it: one function, two callers, given
@@ -1574,29 +1584,29 @@ async def test_the_snapshot_preview_answers_what_the_vote_would(monkeypatch):
         for h, pr in proposals.items():
             n += 1
             request = SimpleNamespace(client=SimpleNamespace(host=f"10.0.0.{n}"))
-            preview = await public.snapshot(request, account.upper(), ctx, None, proposal=h)
+            preview = await public.snapshot(request, account.upper(), ctx, _Released(), proposal=h)
             snap, reasons, participating, weight = await portal.eligibility(ctx, pr, account, account in ctx.config.agent_accounts)
             assert preview == {"account": account, **snap, "weight": weight, "participating": participating,
                                "not_participating_because": reasons}, (account[0], h[-1])
             assert preview["at"] == pr.opened_at - SNAPSHOT_LEAD_NS
     request = SimpleNamespace(client=SimpleNamespace(host="10.0.1.1"))
     at_T, _, at_zero = proposals
-    p = await public.snapshot(request, holder, ctx, None, proposal=at_T)
+    p = await public.snapshot(request, holder, ctx, _Released(), proposal=at_T)
     assert p["balance"] == p["weight"] == 7_000_000 and p["participating"], "the asset that proposal weighs, not today's"
-    assert (await public.snapshot(request, poor, ctx, None, proposal=at_T))["not_participating_because"] == ["balance below the participation minimum at snapshot"]
-    assert (await public.snapshot(request, excluded, ctx, None, proposal=at_T))["weight"] == 0
-    zero = await public.snapshot(request, holder, ctx, None, proposal=at_zero)
+    assert (await public.snapshot(request, poor, ctx, _Released(), proposal=at_T))["not_participating_because"] == ["balance below the participation minimum at snapshot"]
+    assert (await public.snapshot(request, excluded, ctx, _Released(), proposal=at_T))["weight"] == 0
+    zero = await public.snapshot(request, holder, ctx, _Released(), proposal=at_zero)
     assert zero["at"] == 0 and not zero["exists"] and not zero["participating"], "a snapshot at time zero is time zero, not now"
     # with no proposal named: a proposal opened now, under the rules it would pin, at the snapshot it would take
-    now = await public.snapshot(request, holder, ctx, None, proposal=None)
+    now = await public.snapshot(request, holder, ctx, _Released(), proposal=None)
     assert abs(now["at"] - (time.time_ns() - SNAPSHOT_LEAD_NS)) < 60 * 10**9 and now["balance"] == now["weight"] == 1
-    assert (await public.snapshot(request, excluded, ctx, None, proposal=None))["weight"] == 3, "today's rules exclude nobody"
+    assert (await public.snapshot(request, excluded, ctx, _Released(), proposal=None))["weight"] == 3, "today's rules exclude nobody"
     with pytest.raises(HTTPException) as e:
-        await public.snapshot(request, holder, ctx, None, proposal="f" * 64)
+        await public.snapshot(request, holder, ctx, _Released(), proposal="f" * 64)
     assert e.value.status_code == 404
     for bad in ("xyz", "a" * 63, "a" * 65):
         with pytest.raises(HTTPException) as e:
-            await public.snapshot(request, bad, ctx, None, proposal=at_T)
+            await public.snapshot(request, bad, ctx, _Released(), proposal=at_T)
         assert e.value.status_code == 400
 
 
@@ -2555,10 +2565,10 @@ async def test_a_closed_proposal_tells_a_voter_what_the_vote_was_recorded_with(m
 
     def request(n):
         return SimpleNamespace(client=SimpleNamespace(host=f"10.77.0.{n}"))
-    assert await public.snapshot(request(1), voter, ctx, None, proposal=h) == {
+    assert await public.snapshot(request(1), voter, ctx, _Released(), proposal=h) == {
         "account": voter, "snapshot_at": 9, "balance": 5, "weight": 5, "participating": False, "not_participating_because": ["too new"]}
     assert derived == []
-    assert (await public.snapshot(request(2), other, ctx, None, proposal=h))["weight"] == 1 and derived == [other]
+    assert (await public.snapshot(request(2), other, ctx, _Released(), proposal=h))["weight"] == 1 and derived == [other]
     pr.status = "open"
     assert (await public.snapshot(request(3), voter, ctx, _Released(), proposal=h))["weight"] == 1, "an open proposal is derived, as a vote would be"
 
@@ -2789,6 +2799,60 @@ async def test_a_declared_length_is_a_bounded_number_or_the_request_is_refused()
         assert await answer(fits) == (None, True), fits
 
 
+# ---- XE-4318: a public read does not wait on the node with a pooled connection in hand ---------------------
+
+async def test_a_public_read_asks_the_node_without_holding_a_database_connection(monkeypatch):
+    import asyncio
+    import inspect
+
+    from dao.api import legal, public
+    from dao.services import portal, records
+    # the legal identifier: the node first, the database last
+    src = inspect.getsource(legal.identifier)
+    assert max(src.index("records.public_keyset(ctx)"), src.index("records.onchain_registry(ctx)")) < src.index("EventLog.head(db)")
+    # the snapshot preview: the rows, then the connection goes back, then the node
+    order = []
+
+    class Db:
+        async def commit(self):
+            order.append("released")
+    pr = SimpleNamespace(hash="1" * 64, status="open", rules={}, opened_at=10 ** 18)
+
+    async def get(db, h):
+        order.append("rows")
+        return pr
+
+    async def eligibility(ctx_, pr_, account, is_agent):
+        order.append("node")
+        return {}, [], True, 1
+    monkeypatch.setattr(portal, "get", get)
+    monkeypatch.setattr(portal, "eligibility", eligibility)
+    ctx = SimpleNamespace(config=SimpleNamespace(agent_accounts=set()))
+    request = SimpleNamespace(client=SimpleNamespace(host="10.78.0.1"))
+    assert (await public.snapshot(request, "a" * 64, ctx, Db(), proposal="1" * 64))["weight"] == 1
+    assert order == ["rows", "released", "node"]
+    # and the reads every public page shares are one at a time: twenty requests on a slow node are one read,
+    # which the caller that happened to start it does not take away by leaving
+    monkeypatch.setattr(records, "_public_reads", {})
+    monkeypatch.setattr(records, "_public_reading", {})
+    asked, gate, keyset = [], asyncio.Event(), {"keys": [], "threshold": 2}
+
+    async def slow():
+        asked.append(1)
+        await gate.wait()
+        return keyset
+    ctx = SimpleNamespace(chain=SimpleNamespace(dao_keyset=slow))
+    waiting = [asyncio.ensure_future(records.public_keyset(ctx)) for _ in range(20)]
+    for _ in range(3):
+        await asyncio.sleep(0)
+    waiting[0].cancel()
+    gate.set()
+    answers = await asyncio.gather(*waiting, return_exceptions=True)
+    assert len(asked) == 1 and isinstance(answers[0], asyncio.CancelledError) and answers[1:] == [keyset] * 19
+    assert records._public_reading == {}
+    assert await records.public_keyset(ctx) == keyset and len(asked) == 1, "and one per interval, as before"
+
+
 # ---- XE-5883: the chat store is read once the stream is open, so the two overlap ---------------------------
 
 async def test_the_backfill_is_read_after_the_stream_is_open_and_before_anything_from_it():
@@ -2943,6 +3007,17 @@ async def test_no_response_carries_the_text_of_a_failure_the_service_did_not_wri
         await c.statechain_tip()
     assert str(e.value) == "node unreachable: ConnectError" and e.value.transient
     await c.aclose()
+
+
+# ---- sweep of XE-4318: the one unauthenticated read that asks the node on every request --------------------
+
+def test_the_session_read_returns_its_connection_before_it_asks_the_node():
+    import inspect
+
+    from dao.api import members
+    src = inspect.getsource(members.get_session)
+    assert src.index("sessions.get(db, sid)") < src.index("await release(db)") < src.index("sessions.is_stale(ctx, s)")
+    assert "(db" not in src[src.index("await release(db)") + len("await release(db)"):], "and reads nothing after"
 
 
 # ---- sweep of XE-3845: the command line takes a difficulty as the inbox publishes it, and nothing looser ---
