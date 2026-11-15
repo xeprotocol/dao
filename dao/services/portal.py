@@ -186,8 +186,11 @@ async def eligibility_at(ctx: Context, rules: dict, at: int, account: str, is_ag
     try:
         snap = await account_snapshot(ctx.chain, account, at, rules.get("weight_asset", "XE"))
     except XeError as e:
-        if e.transient:
-            raise   # the node may answer next time; the caller decides whether to wait
+        if e.transient or e.status in (401, 403, 407):
+            # The node may answer next time; the caller decides whether to wait. A refusal to authorise
+            # is in that class: it is about who asked (this service, or the proxy it asks through) and
+            # says nothing of the account, and the client words every refusal alike (XE-14195).
+            raise
         # A definite answer that the chain cannot be read for this account (413: past the page bound the
         # harness reads, XE-1189) is the account's answer, not the node's mood: it weighs nothing, and the
         # proposal is not held open for it (XE-1706).

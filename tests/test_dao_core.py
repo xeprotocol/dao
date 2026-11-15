@@ -1285,13 +1285,14 @@ async def test_what_the_client_returns_can_be_kept_and_only_a_2xx_is_an_answer()
         seen.append(request.headers.get("accept-encoding"))
         return httpx.Response(200, headers={"content-encoding": "gzip"}, content=gzip.compress(b'{"balances":{"XE":5}}'))
     reply["v"] = squeezed
-    await refused(lambda: c.balances(a), "gzip")
+    await refused(lambda: c.balances(a), "compressed")
     assert seen == ["identity"]
     got = []
     with pytest.raises(XeError) as e:
         async for item in c.chat_events({"account": a}):
             got.append(item)
-    assert "gzip" in e.value.message and got == []
+    # the name of the encoding is the answerer's text, and is not in the message (XE-14195)
+    assert "compressed" in e.value.message and "gzip" not in e.value.message and got == []
 
     # a value too long to put in a URL fails as the node failing, like everything else
     reply["v"] = b"{}"
@@ -1304,22 +1305,35 @@ async def test_what_the_client_returns_can_be_kept_and_only_a_2xx_is_an_answer()
     for ks in ({"keys": [k1, k2], "threshold": 0}, {"keys": [k1, k2], "threshold": 3}, {"keys": [], "threshold": 0}):
         reply["v"] = json.dumps(ks).encode()
         await refused(c.dao_keyset, "threshold")
-        await refused(lambda: c.keyset_of(a), "threshold")
+        if ks["keys"]:
+            await refused(lambda: c.keyset_of(a), "threshold")
     reply["v"] = json.dumps({"keys": [k1.upper(), k2], "threshold": 2, "address": "x"}).encode()
     assert await c.keyset_of(a) == {"keys": [k1, k2], "threshold": 2, "address": "x"}
-    reply["v"] = b'{"address":"x"}'
-    assert await c.keyset_of(a) == {"address": "x"}, "an account that is not multisig"
+    # an account that is not multisig has no keyset, and reads as None: what is returned as a keyset has
+    # its keys and its threshold, and half of one is refused (XE-14157)
+    # however the node spells "none": the fields left out, null, or the zero values of an empty one
+    for none in (b'{"address":"x"}', b'{}', b'{"address":"x","threshold":null}', b'{"keys":[],"threshold":0}',
+                 b'{"keys":null,"threshold":0}', b'{"address":"x","threshold":0}', b'{"keys":[]}'):
+        reply["v"] = none
+        assert await c.keyset_of(a) is None
+        await refused(c.dao_keyset)   # the DAO's own keyset is never "none"
+    for half, why in ((b'{"keys":["%s"]}' % k1.encode(), "threshold is missing"), (b'{"threshold":1}', "keys is missing"),
+                      (b'{"keys":null,"threshold":1}', "keys")):
+        reply["v"] = half
+        await refused(lambda: c.keyset_of(a), why)
     reply["v"] = json.dumps({"index": 4, "timestamp": 9, "hash": "h" * 10_000}).encode()
     await refused(c.statechain_tip, "hash")
     reply["v"] = json.dumps({"balances": {"XE": 2**63}}).encode()
     await refused(lambda: c.balances(a), "range")
     reply["v"] = json.dumps({"balances": {"XE": 2**63 - 1}}).encode()
     assert await c.balances(a) == {"XE": 2**63 - 1}, "the most a BIGINT column holds"
+    # /ready: the status, and the flags and counts of a short status object; no text from the answer (XE-14223)
     reply["v"] = json.dumps({"status": "ready", "padding": "x" * xc.MAX_READY_BYTES}).encode()
-    ok, body = await c.ready()
-    assert ok and isinstance(body, str) and len(body) <= xc.MAX_ERROR_CHARS
-    reply["v"] = b'{"status":"ready"}'
-    assert await c.ready() == (True, {"status": "ready"})
+    assert await c.ready() == (True, {"http_status": 200})
+    reply["v"] = b'{"status":"ready","synced":true,"peers":4,"lag":2.5,"detail":{"a":1},"big":%d}' % 2**70
+    assert await c.ready() == (True, {"synced": True, "peers": 4, "http_status": 200})
+    reply["v"] = b'{"http_status":204}'
+    assert await c.ready() == (True, {"http_status": 200}), "and the status is the one the answer came with"
     reply["v"] = json.dumps({"challenge": "ab" * xc.MAX_CHALLENGE_CHARS}).encode()
     await refused(c.chat_challenge, "challenge")
     for network in (5, ["x"], {"a": 1}):
@@ -2411,7 +2425,7 @@ async def test_what_the_client_keeps_of_a_keyset_and_a_balance_is_bounded_field_
                              "list": [big], big: 1, "flag": True, "n": 3, "none": None}).encode()
     assert await c.keyset_of(a) == {"keys": [k1, k2], "threshold": 1, "address": "x", "flag": True, "n": 3, "none": None}
     reply["v"] = json.dumps({"address": "x", "note": big, "nested": {"deep": big}}).encode()
-    assert await c.keyset_of(a) == {"address": "x"}, "and for an account that is not multisig"
+    assert await c.keyset_of(a) is None, "an account that is not multisig has no keyset to carry anything"
     reply["v"] = json.dumps({"balances": {f"A{i}": 1 for i in range(xc.MAX_BALANCE_ASSETS)}}).encode()
     assert len(await c.balances(a)) == xc.MAX_BALANCE_ASSETS
     for bad in ({f"A{i}": 1 for i in range(xc.MAX_BALANCE_ASSETS + 1)}, {big: 1}):
@@ -3496,6 +3510,184 @@ def test_every_proof_of_work_search_ends_in_a_nonce_or_a_refusal(monkeypatch):
     assert "Date.now() - started > POW_DEADLINE_MS" in loop and "throw new Error" in loop
 
 
+# ---- XE-14195: what a node says in refusing is for the server's log, and for nothing a caller is given -------
+
+async def test_what_a_node_says_in_refusing_is_logged_and_is_in_nothing_a_caller_is_given(caplog):
+    """The rule, across every call the client has: an answer that is not 2xx becomes an XeError whose text is
+    this module's, worded from the status. What was sent with it (the node's error, or the error page of
+    whatever stands in front of the node) is on `said` and in the server's log, and nowhere a caller
+    stores or publishes: not `str(e)`, not `message`, not `faults.reason`, not what `/ready` returns."""
+    import inspect
+    import logging
+
+    import httpx
+
+    from dao.faults import reason
+    from xe import client as xc
+    secret = "upstream build-7f3a on 10.0.0.12 refused"
+    a, proof = "a" * 64, {"account": "a" * 64, "challenge": "00", "signature": "00", "pub_key": "00"}
+    reply = {}
+    c = _node(lambda request: reply["v"](request))
+    blk, sblk = SimpleNamespace(type="send", to_json=lambda: {}), SimpleNamespace(to_wire=lambda: "{}")
+
+    async def stream():
+        async for _ in c.chat_events(proof):
+            pass
+    calls = {
+        "node": c.node, "chain": lambda: c.chain(a), "full_chain": lambda: c.full_chain(a), "chain_end": lambda: c.chain_end(a),
+        "tip": lambda: c.tip(a), "keyset_of": lambda: c.keyset_of(a), "pending_for": lambda: c.pending_for(a),
+        "balances": lambda: c.balances(a), "block": lambda: c.block("b" * 64), "submit_block": lambda: c.submit_block(blk),
+        "statechain_tip": c.statechain_tip, "statechain_block": lambda: c.statechain_block(1),
+        "statechain_key": lambda: c.statechain_key("dao.x"), "dao_keyset": c.dao_keyset,
+        "submit_statechain_block": lambda: c.submit_statechain_block(sblk), "directory": lambda: c.directory(a),
+        "directory_register": lambda: c.directory_register({}), "chat_challenge": c.chat_challenge,
+        "chat_messages": lambda: c.chat_messages(proof), "chat_send": lambda: c.chat_send({}), "chat_events": stream,
+    }
+    # every call the client has is in the list, so one added later is one this test is asked about
+    have = {n for n, f in vars(xc.XeClient).items()
+            if not n.startswith("_") and (inspect.iscoroutinefunction(f) or inspect.isasyncgenfunction(f))}
+    assert set(calls) == have - {"aclose", "ready"}
+
+    def as_json(status):
+        return httpx.Response(status, json={"error": secret}, extensions={"reason_phrase": secret.encode()})
+
+    def as_page(status):
+        return httpx.Response(status, content=f"<html><h1>Bad gateway</h1>{secret}</html>".encode(),
+                              extensions={"reason_phrase": secret.encode()})
+    caplog.set_level(logging.DEBUG, logger=xc.log.name)
+    for status in (400, 401, 403, 409, 413, 429, 500, 502, 503):
+        for body in (as_json, as_page):
+            reply["v"] = lambda request, s=status, b=body: b(s)
+            for name, call in calls.items():
+                caplog.clear()
+                with pytest.raises(xc.XeError) as e:
+                    await call()
+                err = e.value
+                assert err.status == status, (name, status, str(err))
+                for shown in (str(err), err.message, reason(err), repr(err.args)):
+                    assert secret not in shown and "10.0.0.12" not in shown, (name, status, shown)
+                assert secret in err.said, (name, status)
+                assert any(secret in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records), (name, status)
+    # a 404 is the node's way of saying "not there": worded the same way, and not logged as a fault
+    reply["v"] = lambda request: as_json(404)
+    caplog.clear()
+    with pytest.raises(xc.XeError) as e:
+        await c.block("b" * 64)
+    assert e.value.status == 404 and secret not in str(e.value) and secret in e.value.said
+    assert [r.levelno for r in caplog.records if secret in r.getMessage()] == [logging.DEBUG]
+    # /ready is stored by the health check and returned by the public health route: flags and counts only
+    for status in (200, 503):
+        reply["v"] = lambda request, s=status: httpx.Response(s, json={"status": secret, "error": secret, "synced": False, "peers": 0})
+        ok, said = await c.ready()
+        # and of an answer that is not a 200, nothing but its status: the names of its fields are its text too
+        assert ok is (status == 200) and said == ({"synced": False, "peers": 0, "http_status": 200} if ok else {"http_status": status})
+        reply["v"] = lambda request, s=status: httpx.Response(s, json={f"upstream-10.0.0.12-{secret}": True, "request_id": 88213})
+        ok, said = await c.ready()
+        assert secret not in json.dumps(said) and (ok or said == {"http_status": status})
+        reply["v"] = lambda request, s=status: as_page(s)
+        assert await c.ready() == (status == 200, {"http_status": status})
+    await c.aclose()
+
+
+# ---- XE-14105 / XE-14164 / XE-14180: what is kept of a node's answer is what was asked for, at a bounded size ----
+
+async def test_a_node_answer_is_kept_as_its_named_fields_at_a_bounded_size():
+    """The rule: of an object a node returns, the harness keeps the fields it reads, each an integer, a
+    flag or a string of bounded length, and an answer is read within a bound set for what it is. Asserted
+    over every read that returns an object or a list of them."""
+    import httpx
+
+    from xe import client as xc
+    a, proof = "a" * 64, {"account": "a" * 64, "challenge": "00", "signature": "00", "pub_key": "00"}
+    reply = {}
+    c = _node(lambda request: httpx.Response(200, content=reply["v"]))
+    big = "x" * 50_000
+    extra = {"padding": big, "nested": {"a": [big]}, "list": [1, 2, 3]}
+
+    def kept(v):
+        """Everything in `v` is a bounded scalar: nothing of the padding came through."""
+        if isinstance(v, dict):
+            return all(len(str(k)) <= xc.MAX_FIELD_CHARS and kept(x) for k, x in v.items())
+        if isinstance(v, (list, tuple)):
+            return all(kept(x) for x in v)
+        return v is None or isinstance(v, (bool, int)) or (isinstance(v, str) and len(v) <= xc.MAX_FIELD_CHARS)
+
+    block = {"type": "send", "account": a, "previous": "0", "asset": "XE", "balance": 5, "amount": 1, "timestamp": 2,
+             "hash": "h" * 64, "finalized": True}
+    # each read, with an answer that is what it returns plus fields nobody asked for
+    reads = [
+        (lambda: c.block("h" * 64), {**block, **extra}),
+        (lambda: c.chain(a), {"blocks": [{**block, **extra}], "total": 1, **extra}),
+        (lambda: c.full_chain(a), {"blocks": [{**block, **extra}], "total": 1, **extra}),
+        (lambda: c.chain_end(a), {"blocks": [{**block, **extra}], "total": 1, **extra}),
+        (lambda: c.pending_for(a), {"pending": [{"send_hash": "s" * 64, "amount": 1, "asset": "XE", **extra}], **extra}),
+        (c.statechain_tip, {"index": 4, "timestamp": 9, "hash": "4" * 64, **extra}),
+        (lambda: c.statechain_block(4), {"index": 4, "timestamp": 9, "hash": "4" * 64, "ops": [extra], **extra}),
+        (c.node, {"network_id": "xe-test", "id": "n", "version": "1", "pow_difficulty": "ff", **extra}),
+        (lambda: c.directory(a), {"account": a, "name": "dao", **extra}),
+        (lambda: c.keyset_of(a), {"keys": ["ab" * 32], "threshold": 1, **extra}),
+        (c.dao_keyset, {"keys": ["ab" * 32], "threshold": 1, **extra}),
+        (c.chat_challenge, {"challenge": "ab" * 16, **extra}),
+        (lambda: c.balances(a), {"balances": {"XE": 5}, **extra}),
+    ]
+    for call, answer in reads:
+        reply["v"] = json.dumps(answer).encode()
+        got = await call()
+        assert got and kept(got), got
+        assert big not in json.dumps(got)
+    # a field the harness does read, at a length no such field has, is refused and not cut short
+    for call, answer in ((lambda: c.block("h" * 64), {**block, "hash": big}), (lambda: c.chain(a), {"blocks": [{**block, "memo": big}], "total": 1}),
+                         (lambda: c.pending_for(a), {"pending": [{"send_hash": big, "amount": 1}]}),
+                         (lambda: c.statechain_block(4), {"index": 4, "hash": big}), (c.node, {"network_id": big})):
+        reply["v"] = json.dumps(answer).encode()
+        with pytest.raises(xc.XeError) as e:
+            await call()
+        assert e.value.status == 0 and "longer than" in e.value.message, e.value.message
+
+    # a state value is read within its own bound, not the general one (XE-14164)
+    reply["v"] = json.dumps({"key": "dao.x", "value": "v" * 1000}).encode()
+    assert await c.statechain_key("dao.x") == "v" * 1000
+    reply["v"] = json.dumps({"key": "dao.x", "value": "v" * xc.MAX_STATE_VALUE_BYTES}).encode()
+    with pytest.raises(xc.XeError) as e:
+        await c.statechain_key("dao.x")
+    assert e.value.status == 0 and str(xc.MAX_STATE_VALUE_BYTES) in e.value.message
+    assert xc.MAX_STATE_VALUE_BYTES < xc.MAX_BODY_BYTES
+
+    # an answer of more values than any honest one holds is refused before it is parsed: each empty object
+    # is three bytes on the wire and a Python object in memory
+    reply["v"] = b"[" + b"{}," * xc.MAX_VALUES + b"{}]"
+    assert len(reply["v"]) < xc.MAX_BODY_BYTES
+    for call in (lambda: c.chain(a), lambda: c.pending_for(a), lambda: c.statechain_block(4)):
+        with pytest.raises(xc.XeError) as e:
+            await call()
+        assert e.value.status == 0 and "more than" in e.value.message, e.value.message
+    # and a read whose answer is a short object is not read past the size of one, whatever is sent
+    assert xc.MAX_STATE_VALUE_BYTES <= xc.MAX_SMALL_BYTES < len(reply["v"])
+    small = (c.node, c.ready, c.statechain_tip, c.dao_keyset, c.chat_challenge, lambda: c.keyset_of(a), lambda: c.balances(a),
+             lambda: c.directory(a), lambda: c.block("h" * 64))
+    for call in small:
+        with pytest.raises(xc.XeError) as e:
+            await call()
+        assert e.value.status == 0 and f"exceeds {xc.MAX_SMALL_BYTES}" in e.value.message, e.value.message
+    reply["v"] = json.dumps({"account": a, **{f"field{i}": i for i in range(1000)}}).encode()
+    assert len(await c.directory(a)) == xc.MAX_PLAIN_FIELDS, "and of the fields nobody named, a bounded number are kept"
+
+    # the chat store: as many items as a node keeps for an account, each no longer than an envelope, and
+    # kept only if it is shaped like one (XE-14180)
+    env = {"id": "1", "from": a, "to": a, "message": "hello", "timestamp": 1, "signature": "s", "pub_key": "p", "pow_nonce": 1}
+    reply["v"] = json.dumps([env, {**env, "id": "2", "nested": {"a": 1}}, {}, 5, "x", [env], {**env, "id": "3"}]).encode()
+    assert [m.get("id") for m in await c.chat_messages(proof)] == ["1", None, "3"], "one item that is not an envelope costs that item"
+    reply["v"] = b"[" + b",".join([b"{}"] * (xc.CHAT_STORE_ENVELOPES + 1)) + b"]"
+    with pytest.raises(xc.XeError) as e:
+        await c.chat_messages(proof)
+    assert "more than" in e.value.message
+    reply["v"] = json.dumps([{**env, "message": "m" * (xc.MAX_ENVELOPE_JSON_CHARS + 1)}]).encode()
+    with pytest.raises(xc.XeError) as e:
+        await c.chat_messages(proof)
+    assert "longer than any envelope" in e.value.message
+    await c.aclose()
+
+
 def test_a_registration_and_an_envelope_are_built_only_as_their_verifiers_accept_them():
     """XE-3020 and XE-3108 at the two builders they did not name. A registration signs its timestamp as
     decimal digits, so it is an integer in the field or the encoder refuses; and neither builder signs
@@ -3522,3 +3714,32 @@ def test_a_registration_and_an_envelope_are_built_only_as_their_verifiers_accept
     for kw, says in (({"to": ""}, "recipient is empty"), ({"to": to, "timestamp_ns": 0}, "timestamp is zero")):
         with pytest.raises(ChatError, match=says):
             new_envelope(kp, kw.pop("to"), "x", difficulty=2**64 - 1, deadline_s=0.01, **kw)
+
+
+async def test_a_refusal_to_authorise_is_the_nodes_answer_and_not_the_accounts(monkeypatch):
+    """A definite refusal to read one account's chain is that account's answer and it weighs nothing
+    (XE-1706). A 401, 403 or 407 is not one: it is about who asked, and since every refusal is worded
+    alike (XE-14195) the status is all that tells them apart. It waits, as a node that did not answer."""
+    from dao.services import portal
+    from xe.client import XeError
+    ctx = SimpleNamespace(chain=None)
+    for status, the_accounts in ((413, True), (400, True), (422, True), (401, False), (403, False), (407, False),
+                                 (503, False), (0, False)):
+        async def snapshot(chain, account, at, asset, _status=status):
+            raise XeError(_status, "said by whatever answered")
+        monkeypatch.setattr(portal, "account_snapshot", snapshot)
+        if not the_accounts:
+            with pytest.raises(XeError):
+                await portal.eligibility_at(ctx, {}, 5, "a" * 64, False)
+            continue
+        snap, reasons, participating, weight = await portal.eligibility_at(ctx, {}, 5, "a" * 64, False)
+        assert snap["unreadable"] and not participating and weight == 0, status
+        assert "said by whatever answered" not in json.dumps([snap, reasons]), status
+
+
+async def test_a_reply_is_not_queued_to_a_message_that_names_no_sender():
+    from dao.services import inbox
+    v = SimpleNamespace(payload={"text": "hello"}, actor="seat:founder-a", seat=SimpleNamespace(id="founder-a"))
+    with pytest.raises(HTTPException) as e:
+        await inbox.reply(None, None, SimpleNamespace(from_account=""), v)   # refused before anything is read or written
+    assert e.value.status_code == 409 and "no sender" in e.value.detail

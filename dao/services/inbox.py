@@ -148,6 +148,10 @@ async def queue_reply(ctx: Context, db: AsyncSession, m: InboxMessage, text: str
 
 async def reply(ctx: Context, db: AsyncSession, m: InboxMessage, v: Verified) -> OutboxMessage:
     text = clean_text(v.payload.get("text"), "text", max_len=8000, max_bytes=8000)
+    if not m.from_account:
+        # An envelope stored unverified can name no sender. A reply to it is an envelope to nobody, which
+        # the builder refuses (`xe.chat.new_envelope`): said here, before it is queued to be built.
+        raise HTTPException(409, "this message names no sender; there is nobody to reply to")
     await publish_on_triage(ctx, db, m, v.actor)
     return await queue_reply(ctx, db, m, text, from_seat=v.seat.id)
 
@@ -339,8 +343,9 @@ async def _resolve_sending(ctx: Context, db: AsyncSession) -> int:
                     n += await _offer(ctx, db, o)
             elif held is not None and age > EXPIRED_NS:
                 o.status = "queued"
-                o.error = (f"the node never held the envelope and it is now too old to offer; a new one will be built"
-                           f"{'. The last send said: ' + o.error if o.error else ''}")[:500]
+                # What the last send said is not carried over: this text goes into the log if the reply is
+                # given up, and a row written before XE-14195 holds the node's own words.
+                o.error = "the node never held the envelope and it is now too old to offer; a new one will be built"
             await db.commit()
         except Exception as e:
             await db.rollback()

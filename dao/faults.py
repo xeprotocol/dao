@@ -23,7 +23,9 @@ class Fault(RuntimeError):
 
 # Failures whose message this code or the protocol package wrote: the node's answer as the client words
 # it, a refused key, signature, block, op, keyset or envelope, the signer saying what it does not hold, the
-# log saying it could not be written, and what the service raises as its own (`Fault`).
+# log saying it could not be written, and what the service raises as its own (`Fault`). The client words a
+# refusal from its status; what the node sent with it is on the error as `said`, for the server's log,
+# and is in none of these messages (XE-14195).
 WORDED = (XeError, StateChainError, KeyError_, EncodingError, ChatError, DirectoryError, SignerError, LogError, Fault)
 
 
