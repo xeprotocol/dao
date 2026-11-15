@@ -10,8 +10,10 @@
   <label>Title</label><input type="text" id="title" maxlength="160" required>
   <label>Text <span class="k">(markdown; say what should change and why)</span></label><textarea id="body" required></textarea>
   <label>Exact keys to set <span class="k">(optional JSON list of state-chain ops, e.g. [{"action":"set","key":"dao.example","value":{"x":1}}])</span></label><textarea id="ops" style="min-height:70px" placeholder="leave empty for a text-only proposal"></textarea>
-  <label>Fee block hash <span class="k">(the hash of your {{ rules.fee_micro_xe|xe }} XE send to the fee account)</span></label><input type="text" id="fee" placeholder="64 hex" {% if rules.fee_micro_xe %}required{% endif %}>
+  {% if rules.fee_micro_xe %}
+  <label>Fee block hash <span class="k">(the hash of your {{ rules.fee_micro_xe|xe }} XE send to the fee account)</span></label><input type="text" id="fee" placeholder="64 hex" required>
   <p class="small mute">Pay the fee first with any XE wallet: <code>xe send {{ fee_account }} {{ rules.fee_micro_xe|xe }} --asset XE</code>, then paste the send hash here. The fee is tied to this account and to this proposal; it cannot be reused.</p>
+  {% endif %}
   <div class="row"><button type="submit">Sign and submit</button> <button type="button" class="ghost" id="offline">Show bytes to sign offline</button></div>
   <div id="pmsg" class="msg" hidden></div>
   <pre id="offline_out" hidden></pre>
@@ -22,8 +24,9 @@
 const DOMAIN = "xe-dao/proposal/v1";
 function payload() {
   const opsRaw = $("#ops").value.trim();
-  const p = { title: $("#title").value.trim(), body: $("#body").value.trim(), fee_block_hash: $("#fee").value.trim().toLowerCase() };
-  if (opsRaw) p.ops = JSON.parse(opsRaw);
+  const p = { title: $("#title").value.trim(), body: $("#body").value.trim() };
+  if ($("#fee")) p.fee_block_hash = $("#fee").value.trim().toLowerCase();
+  if (opsRaw) p.ops = XeSigner.parseExact(opsRaw);
   return p;
 }
 $("#pform").addEventListener("submit", async e => {

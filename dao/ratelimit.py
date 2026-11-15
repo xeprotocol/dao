@@ -1,4 +1,4 @@
-"""Token buckets for the public write routes (XE-0032).
+"""Token buckets for the write routes, public and seat (XE-0032, XE-2484).
 
 In-process, keyed by client IP and by signing account; uvicorn runs behind Caddy with --proxy-headers so
 `request.client.host` is the real address. Good enough for one API process; a second layer belongs at the
@@ -8,6 +8,7 @@ set of addresses that ever wrote to us.
 
 from __future__ import annotations
 
+import ipaddress
 import time
 from dataclasses import dataclass
 
@@ -34,6 +35,10 @@ VOTE = RouteClass("vote", Limit(60, 20), Limit(12, 6))
 PROPOSAL = RouteClass("proposal", Limit(10, 5), Limit(2, 2))
 SNAPSHOT = RouteClass("snapshot", Limit(30, 10), Limit(30, 10))   # read, but each one walks a whole account chain on the node
 NODE_READ = RouteClass("node_read", Limit(60, 20), Limit(60, 20))  # a public read that costs a node round trip (XE-0652)
+# A signed request from a seat. The address is charged before the signature is checked, so a stranger's
+# flood of well-formed requests is refused cheaply; the seat is charged once it is known, so one seat's key
+# cannot append without bound either (XE-2484). People act a few times a minute; a member's tooling may burst.
+SEAT = RouteClass("seat", Limit(120, 40), Limit(30, 15))
 
 
 class Buckets:
@@ -68,8 +73,26 @@ class Buckets:
 _buckets = Buckets()
 
 
+def client_key(host: str) -> str:
+    """What a per-client allowance is counted against: the client's network, not the spelling of one
+    address. An IPv4 address is itself; an IPv4-mapped IPv6 address is the IPv4 address it carries; any
+    other IPv6 address is its /64, which is what one subscriber is routed. Keyed on the exact address,
+    one host stepping through its own /64 had a fresh bucket for every request and could hold every
+    stream slot (XE-10452). Anything that is not an address is keyed as given."""
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return host
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.version == 4:
+        return str(ip)
+    return str(ipaddress.IPv6Network((int(ip) >> 64 << 64, 64)))
+
+
 def client_ip(request: Request) -> str:
-    return (request.client.host if request.client else "") or "unknown"
+    """The key every bucket and held-slot count takes for the caller (`client_key`)."""
+    return client_key((request.client.host if request.client else "") or "unknown")
 
 
 def _refuse(wait: float) -> None:

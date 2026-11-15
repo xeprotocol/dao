@@ -551,7 +551,7 @@ async def test_http_inbox_refuses_control_characters_and_requires_pow(db):
 
 
 async def test_http_inbox_stores_a_u64_nonce_and_accepts_real_pow(db):
-    from dao.auth import compute_http_pow
+    from dao.auth import compute_http_pow, pow_target, require_pow
     from dao.canonical import DOMAIN_INBOX_HTTP, digest
     ctx = _ctx()
     # upper half of u64: BIGINT would refuse this
@@ -566,7 +566,9 @@ async def test_http_inbox_stores_a_u64_nonce_and_accepts_real_pow(db):
     payload, ts = {"message": "real pow"}, time.time_ns()
     v = _v(payload=payload, ts=ts)
     v.digest = digest(DOMAIN_INBOX_HTTP, {"payload": payload, "timestamp": ts})
-    v.pow_nonce = compute_http_pow(v.digest, ctx.node.chat_pow_difficulty)
+    v.pub_key = "ab" * 32
+    v.pow_nonce = compute_http_pow(pow_target(v.digest, v.pub_key), ctx.node.chat_pow_difficulty)
+    require_pow(v, ctx.node.chat_pow_difficulty)
     m2 = await inbox.http_submit(ctx, db, v)
     await db.commit()
     assert m2.pow_nonce == v.pow_nonce

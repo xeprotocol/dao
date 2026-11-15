@@ -38,7 +38,7 @@ $("#offline").addEventListener("click", async () => {
   const t = await XeSigner.offlineTarget(DOMAIN, { message: $("#message").value.trim() });
   $("#offline_out").hidden = false;
   $("#offline_out").textContent = "digest:    " + t.digest + "\ntimestamp: " + t.ts + "\ncanonical: " + t.canonical
-    + "\n\nalso needed: pow_nonce, a u64 with sha256(nonce_le8 || digest)[0:8] (big-endian) >= " + POW;
+    + "\n\nalso needed: pow_nonce, a u64 with sha256(nonce_le8 || digest || pub_key)[0:8] (big-endian, pub_key as its 32 bytes) >= " + POW;
 });
 </script>
 {% endblock %}

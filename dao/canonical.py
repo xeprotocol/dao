@@ -22,7 +22,10 @@ DOMAIN_INBOX_HTTP = b"xe-dao/inbox/v1\x00"
 
 
 def canonical_json(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    """The one spelling of a value that is hashed and signed. NaN and Infinity have no spelling in JSON:
+    Python would write its own, which no other implementation reads back, so a value carrying one is
+    refused here (ValueError) rather than given a digest only this code can reproduce (XE-6656)."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")
 
 
 def digest(domain: bytes, value: Any) -> bytes:

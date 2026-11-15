@@ -2,9 +2,14 @@
  *
  * Keys never leave the browser. A 32-byte ed25519 seed (hex) is held in sessionStorage for the tab
  * and imported into WebCrypto as PKCS8. Everything the server accepts is
- *   signature = ed25519( sha256( domain || 0x00 || canonical_json({payload, timestamp}) ) )
+ *   signature = ed25519( sha256( domain || 0x00 || canonical_json({dao, network, payload, timestamp}) ) )
+ * where dao and network say who the signature is for: this deployment's own account and the network it
+ * serves, as the page carries them on <html data-dao data-network> and GET /v1 publishes them under
+ * signing.to. A request signed here is refused by any other deployment.
  * Routes that cost the sender something (the inbox) also want pow_nonce: a u64 such that
- *   sha256( nonce_le8 || signing_digest )[0:8], read big-endian, >= difficulty (from GET /v1/inbox).
+ *   sha256( nonce_le8 || signing_digest || pub_key )[0:8], read big-endian, >= difficulty (from GET /v1/inbox),
+ * pub_key being the signing key's 32 bytes: the work pays for this message from this sender, not for the
+ * same message from any key.
  * with canonical_json = sorted keys, no whitespace, ASCII-escaped, timestamp in nanoseconds.
  *
  * If this browser cannot do Ed25519 in WebCrypto, every form still shows the exact bytes to sign
@@ -14,7 +19,15 @@
   const PKCS8_PREFIX = "302e020100300506032b657004220420";
   const enc = new TextEncoder();
 
-  function hexToBytes(h) { h = h.trim().toLowerCase(); if (h.length % 2) throw new Error("odd hex"); const o = new Uint8Array(h.length / 2); for (let i = 0; i < o.length; i++) o[i] = parseInt(h.substr(i * 2, 2), 16); return o; }
+  // Hex is pairs of 0-9a-f or it is refused. parseInt alone reads "zz" as NaN, which a Uint8Array stores as 0:
+  // a mistyped seed would load as a different key, mostly zeros, and say nothing (XE-3711).
+  function hexToBytes(h) {
+    h = String(h).trim().toLowerCase();
+    if (!/^(?:[0-9a-f]{2})*$/.test(h)) throw new Error("not hex: expected pairs of the characters 0-9 and a-f");
+    const o = new Uint8Array(h.length / 2);
+    for (let i = 0; i < o.length; i++) o[i] = parseInt(h.substr(i * 2, 2), 16);
+    return o;
+  }
   function bytesToHex(b) { return Array.from(b, x => x.toString(16).padStart(2, "0")).join(""); }
   function b64urlToBytes(s) { s = s.replace(/-/g, "+").replace(/_/g, "/"); while (s.length % 4) s += "="; const bin = atob(s); const o = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) o[i] = bin.charCodeAt(i); return o; }
   function concat(...arrs) { let n = 0; for (const a of arrs) n += a.length; const o = new Uint8Array(n); let p = 0; for (const a of arrs) { o.set(a, p); p += a.length; } return o; }
@@ -23,8 +36,14 @@
   function canon(v) {
     if (v === null || v === undefined) return "null";
     if (typeof v === "boolean") return v ? "true" : "false";
-    if (typeof v === "number") { if (!Number.isInteger(v)) throw new Error("floats are not allowed in signed payloads"); return String(v); }
-    if (typeof v === "bigint") return v.toString();
+    if (typeof v === "number") {
+      if (!Number.isInteger(v)) throw new Error("floats are not allowed in signed payloads");
+      // Past 2^53 a JS number is no longer the integer that was typed: JSON.parse has already rounded it, and
+      // signing would put a neighbouring value under the signature (XE-11041). Refused; a request that needs
+      // the range is signed offline, where integers are exact.
+      if (!Number.isSafeInteger(v)) throw new Error("an integer beyond ±(2^53 - 1) cannot be signed from this page exactly; sign it offline (dao sign-request)");
+      return String(v);
+    }
     if (typeof v === "string") return canonStr(v);
     if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
     const keys = Object.keys(v).sort(byCodePoint);
@@ -54,13 +73,39 @@
     return out + '"';
   }
 
+  // JSON a person typed, parsed only if every number in it is one this page signs exactly. JSON.parse
+  // rounds without a word: 1.0000000000000001 becomes 1 and 9007199254740993 its even neighbour, and what
+  // canon is then given is an integer that was never typed (XE-11041). So the text is read for its number
+  // tokens before it is parsed: each is a whole number in plain digits, inside ±(2^53 - 1).
+  function parseExact(text) {
+    let inStr = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inStr) { if (c === "\\") i++; else if (c === '"') inStr = false; continue; }
+      if (c === '"') { inStr = true; continue; }
+      if (c === "-" || (c >= "0" && c <= "9")) {
+        let j = i + 1;
+        while (j < text.length && /[0-9.eE+-]/.test(text[j])) j++;
+        const tok = text.slice(i, j);
+        if (!/^-?(0|[1-9][0-9]*)$/.test(tok) || !Number.isSafeInteger(Number(tok)))
+          throw new Error("a number here is a whole number within ±(2^53 - 1), written in digits; this is not one: " + tok.slice(0, 40));
+        i = j - 1;
+      }
+    }
+    return JSON.parse(text);
+  }
   async function sha256(bytes) { return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)); }
 
   function nowNs() { return (BigInt(Date.now()) * 1000000n).toString(); }
 
+  // What is signed, as canonical JSON: who it is for, what it says, when.
+  function envelope(payload, tsStr) {
+    const to = document.documentElement.dataset;
+    if (!to.dao || !to.network) throw new Error("this page does not say which deployment it is; nothing can be signed for it");
+    return '{"dao":' + canonStr(to.dao) + ',"network":' + canonStr(to.network) + ',"payload":' + canon(payload) + ',"timestamp":' + tsStr + "}";
+  }
   function target(domain, payload, tsStr) {
-    const body = '{"payload":' + canon(payload) + ',"timestamp":' + tsStr + "}";
-    return concat(enc.encode(domain), new Uint8Array([0]), enc.encode(body));
+    return concat(enc.encode(domain), new Uint8Array([0]), enc.encode(envelope(payload, tsStr)));
   }
 
   const Signer = {
@@ -102,12 +147,14 @@
       const sig = await this.signBytes(digest);
       return { ts, digest: bytesToHex(digest), signature: sig };
     },
-    /** Proof of work over the signing digest; returns the nonce as decimal digits (u64, may exceed 2^53). */
-    async pow(digestHex, difficultyHex, onProgress) {
+    /** Proof of work over the signing digest and the signer's public key; returns the nonce as decimal
+     *  digits (u64, may exceed 2^53). */
+    async pow(digestHex, pubHex, difficultyHex, onProgress) {
       const diff = BigInt(difficultyHex);
       if (diff === 0n) return "0";
-      const digest = hexToBytes(digestHex);
-      const buf = new Uint8Array(8 + digest.length); buf.set(digest, 8);
+      const digest = hexToBytes(digestHex), pub = hexToBytes(pubHex);
+      if (pub.length !== 32) throw new Error("proof of work needs the signing public key (64 hex)");
+      const buf = new Uint8Array(8 + digest.length + pub.length); buf.set(digest, 8); buf.set(pub, 8 + digest.length);
       const view = new DataView(buf.buffer);
       let nonce = crypto.getRandomValues(new BigUint64Array(1))[0];
       for (let i = 0; ; i++) {
@@ -123,7 +170,7 @@
       return '{"payload":' + JSON.stringify(payload) + ',"timestamp":' + ts + ',"pub_key":"' + pub_key + '","signature":"' + signature + '"'
         + (pow_nonce != null ? ',"pow_nonce":' + pow_nonce : "") + '}';
     },
-    /** opts.pow: difficulty hex (does proof of work over the digest); opts.onProgress(hashes). */
+    /** opts.pow: difficulty hex (does proof of work over the digest and public key); opts.onProgress(hashes). */
     async post(url, domain, payload, manual, opts) {
       let ts, pub, sig, digest, nonce = null;
       if (manual && manual.signature) {
@@ -136,7 +183,7 @@
       }
       if (opts && opts.pow && nonce == null) {
         if (!digest) digest = bytesToHex(await sha256(target(domain, payload, ts)));
-        nonce = await this.pow(digest, opts.pow, opts.onProgress);
+        nonce = await this.pow(digest, pub, opts.pow, opts.onProgress);
       }
       const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: this.body(payload, ts, pub, sig, nonce) });
       const text = await res.text();
@@ -148,9 +195,9 @@
     async offlineTarget(domain, payload) {
       const ts = nowNs();
       const digest = await sha256(target(domain, payload, ts));
-      return { ts, digest: bytesToHex(digest), canonical: '{"payload":' + canon(payload) + ',"timestamp":' + ts + "}" };
+      return { ts, digest: bytesToHex(digest), canonical: envelope(payload, ts) };
     },
-    hexToBytes, bytesToHex, canon,
+    hexToBytes, bytesToHex, canon, parseExact,
   };
 
   window.XeSigner = Signer;

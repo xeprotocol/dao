@@ -27,33 +27,60 @@ def test_canonical_json_is_sorted_compact_ascii():
 
 
 def test_signed_request_verifies_and_is_domain_bound():
+    from dao.auth import signing_target
     kp = KeyPair.generate()
     payload = {"proposal": "ab" * 32, "choice": "for", "reason": ""}
     ts = time.time_ns()
-    sig = kp.sign_hex(digest(DOMAIN_VOTE, {"payload": payload, "timestamp": ts}))
+    to = {"dao": "d" * 64, "network": "xe-test"}
+    ctx = SimpleNamespace(config=SimpleNamespace(accounts={"dao": to["dao"]}), node=SimpleNamespace(network_id=to["network"]))
+    # one target, and it is the documented one: domain, then who it is for, what it says and when
+    target = digest(DOMAIN_VOTE, {"dao": to["dao"], "network": to["network"], "payload": payload, "timestamp": ts})
+    assert signing_target(DOMAIN_VOTE, to, payload, ts) == target
+    sig = kp.sign_hex(target)
     req = SignedRequest(payload=payload, timestamp=ts, pub_key=kp.pub_key_hex, signature=sig)
-    v = verify_signed(req, DOMAIN_VOTE)
+    v = verify_signed(ctx, req, DOMAIN_VOTE)
     assert v.account == kp.address
-    assert v.digest == digest(DOMAIN_VOTE, {"payload": payload, "timestamp": ts})
+    assert v.digest == target
     # verification is pure: the replay claim lives in the database (test_log_db), so a second check passes here
-    assert verify_signed(req, DOMAIN_VOTE).signature == sig.lower()
+    assert verify_signed(ctx, req, DOMAIN_VOTE).signature == sig.lower()
     # wrong domain fails
     from dao.canonical import DOMAIN_PROPOSAL
     with pytest.raises(HTTPException):
-        verify_signed(SignedRequest(payload=payload, timestamp=ts, pub_key=kp.pub_key_hex, signature=sig), DOMAIN_PROPOSAL)
+        verify_signed(ctx, SignedRequest(payload=payload, timestamp=ts, pub_key=kp.pub_key_hex, signature=sig), DOMAIN_PROPOSAL)
+    # and so does the same request at a deployment with another account or on another network (XE-2068;
+    # every signed route is walked in test_seat_requests)
+    for other in (SimpleNamespace(config=ctx.config, node=SimpleNamespace(network_id="mainnet")),
+                  SimpleNamespace(config=SimpleNamespace(accounts={"dao": "e" * 64}), node=ctx.node)):
+        with pytest.raises(HTTPException) as e:
+            verify_signed(other, req, DOMAIN_VOTE)
+        assert e.value.status_code == 401
 
 
 def test_http_pow_binds_to_digest_and_difficulty():
-    from dao.auth import Verified, compute_http_pow, require_pow, validate_http_pow
-    target = digest(DOMAIN_VOTE, {"payload": {"message": "hi"}, "timestamp": 1})
+    from dao.auth import Verified, compute_http_pow, pow_target, require_pow, validate_http_pow
+    d = digest(DOMAIN_VOTE, {"payload": {"message": "hi"}, "timestamp": 1})
+    pub, other_pub = "11" * 32, "22" * 32
+    target = pow_target(d, pub)
     easy = 0x0100000000000000  # ~1 in 256
     nonce = compute_http_pow(target, easy)
     assert validate_http_pow(target, nonce, easy)
     assert validate_http_pow(target, 0, 0)
-    assert require_pow(Verified("a", "p", {}, 1, "s", digest=target, pow_nonce=nonce), easy) is None
+    assert require_pow(Verified("a", pub, {}, 1, "s", digest=d, pow_nonce=nonce), easy) is None
     with pytest.raises(HTTPException) as e:
-        require_pow(Verified("a", "p", {}, 1, "s", digest=target, pow_nonce=None), easy)
+        require_pow(Verified("a", pub, {}, 1, "s", digest=d, pow_nonce=None), easy)
     assert e.value.status_code == 400 and "pow_nonce" in e.value.detail
+    # The work is the sender's: the digest names the message and any key can sign it, so work found for
+    # one key pays for that key alone (XE-11360). A nonce is taken that is work over the first key's target
+    # and not over the second's (one in 65,536 is both, by luck, and the search starts somewhere random).
+    hard_enough = 0xFFFF000000000000
+    n2 = compute_http_pow(pow_target(d, pub), hard_enough)
+    while validate_http_pow(pow_target(d, other_pub), n2, hard_enough):
+        n2 = compute_http_pow(pow_target(d, pub), hard_enough)
+    require_pow(Verified("a", pub, {}, 1, "s", digest=d, pow_nonce=n2), hard_enough)
+    assert pow_target(d, pub) != pow_target(d, other_pub) and pow_target(d, pub)[:32] == d
+    with pytest.raises(HTTPException) as e:
+        require_pow(Verified("b", other_pub, {}, 1, "s2", digest=d, pow_nonce=n2), hard_enough)
+    assert e.value.status_code == 400
     # the work is bound to the digest: the same nonce over different bytes almost never passes a hard target
     other = digest(DOMAIN_VOTE, {"payload": {"message": "ho"}, "timestamp": 1})
     hard = 0xFFFFFFFF00000000
@@ -156,6 +183,31 @@ def test_browser_signer_sorts_keys_by_code_point_like_python():
     assert out.splitlines() == [canonical_json(v).decode("ascii") for v in vectors]
 
 
+def test_the_page_parses_typed_json_only_when_every_number_in_it_is_exact():
+    """XE-11041. `canon` refuses a float and an integer past 2^53, and JSON.parse had already turned
+    1.0000000000000001 into 1 and 9007199254740993 into its neighbour before canon saw either. What a
+    person types into the ops box is read as text first."""
+    import shutil
+    import subprocess
+    js = (ROOT / "dao/static/signer.js").read_text()
+    for page in ("proposal_new.html", "members.html"):
+        text = (ROOT / "dao/templates" / page).read_text()
+        assert "XeSigner.parseExact(" in text and "JSON.parse(" not in text, page
+    if not shutil.which("node"):
+        pytest.skip("node not available")
+    start, end = js.index("  // Python json.dumps(sort_keys=True"), js.index("  async function sha256(")
+    kept = ['{"a":[1,-2,0]}', '{"s":"1.5e3 \\" 2.0","n":9007199254740991}']
+    refused = ["[1.0]", "[1e2]", "[9007199254740993]", "[1.0000000000000001]", '{"a":-9007199254740992}', "[01]"]
+    script = js[start:end] + """
+for (const t of JSON.parse(process.argv[1])) {
+  let out; try { out = JSON.stringify(parseExact(t)); } catch (e) { out = "refused"; }
+  process.stdout.write(out + "\\n");
+}
+"""
+    out = subprocess.run(["node", "-e", script, json.dumps(kept + refused)], capture_output=True, text=True, check=True).stdout
+    assert out.splitlines() == kept + ["refused"] * len(refused)
+
+
 def test_rate_limit_buckets_refill_and_forget():
     from dao.ratelimit import Buckets, Limit
     b = Buckets(sweep_every_s=10)
@@ -190,8 +242,8 @@ def test_signed_request_rejects_stale_timestamp():
     ts = time.time_ns() - 3600 * 1_000_000_000
     sig = kp.sign_hex(digest(DOMAIN_VOTE, {"payload": {}, "timestamp": ts}))
     with pytest.raises(HTTPException) as e:
-        verify_signed(SignedRequest(payload={}, timestamp=ts, pub_key=kp.pub_key_hex, signature=sig), DOMAIN_VOTE)
-    assert e.value.status_code == 400
+        verify_signed(None, SignedRequest(payload={}, timestamp=ts, pub_key=kp.pub_key_hex, signature=sig), DOMAIN_VOTE)
+    assert e.value.status_code == 400   # the window is checked before anything else is looked at
 
 
 def test_signer_keyfile_roundtrip_and_scopes(tmp_path):
@@ -1596,3 +1648,156 @@ async def test_a_block_signature_from_a_key_no_longer_in_the_keyset_is_counted_n
     # the second live signature is the one that sends it
     await sessions.sign(ctx, None, s, k2.pub_key_hex, sig(k2), "member:b")
     assert submitted == [3] and sessions.ready_to_submit(s, ks) and await sessions._moved_under(ctx, s) is None
+# ---- XE-10452: a per-client allowance is counted against the client's network ------------------------------
+
+def test_a_client_allowance_is_keyed_by_network_not_by_one_address(monkeypatch):
+    from dao import ratelimit
+    from dao.ratelimit import INBOX, Buckets, Held, client_ip, client_key, enforce_ip
+    assert client_key("203.0.113.9") == "203.0.113.9"
+    assert client_key("::ffff:203.0.113.9") == "203.0.113.9", "an IPv4 client over a dual-stack socket is that IPv4 client"
+    assert client_key("2001:db8:1:2::1") == client_key("2001:DB8:1:2:ffff:ffff:ffff:ffff") == "2001:db8:1:2::/64"
+    assert client_key("2001:db8:1:3::1") != client_key("2001:db8:1:2::1")
+    assert client_key("fe80::1%eth0") == "fe80::/64"
+    assert client_key("unknown") == "unknown" and client_key("testclient") == "testclient"
+
+    def req(host):
+        return SimpleNamespace(client=SimpleNamespace(host=host))
+    assert client_ip(req("2001:db8:1:2::9")) == "2001:db8:1:2::/64" and client_ip(SimpleNamespace(client=None)) == "unknown"
+    # both things that are counted per client take that key: the buckets and the held streams
+    monkeypatch.setattr(ratelimit, "_buckets", Buckets())
+    for i in range(INBOX.ip.burst):
+        enforce_ip(req(f"2001:db8:1:2::{i + 1:x}"), INBOX)
+    with pytest.raises(HTTPException) as e:
+        enforce_ip(req("2001:db8:1:2:aaaa::1"), INBOX)
+    assert e.value.status_code == 429
+    enforce_ip(req("2001:db8:1:3::1"), INBOX)       # the next /64 is someone else
+    held = Held("streams", per_ip=2, total=10)
+    first = held.take(req("2001:db8:9::1"))
+    held.take(req("2001:db8:9::2"))
+    with pytest.raises(HTTPException) as e:
+        held.take(req("2001:db8:9::3"))
+    assert e.value.status_code == 429
+    held.release(first)
+    held.take(req("2001:db8:9::4"))
+
+
+# ---- XE-4267: a stream that is behind reads on until it has caught up --------------------------------------
+
+async def test_the_event_stream_reads_a_backlog_without_waiting_between_full_batches(monkeypatch):
+    import asyncio
+
+    from dao import ratelimit
+    from dao.api import public
+    monkeypatch.setattr(ratelimit, "_buckets", ratelimit.Buckets())
+    behind = 2 * public.STREAM_BATCH + 50
+    reads = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def head(s):
+        return SimpleNamespace(index=behind, hash="0" * 64)
+
+    async def since(s, after, limit=200, public_only=True):
+        reads.append((after, limit))
+        return [SimpleNamespace(index=i) for i in range(after + 1, min(after + limit, behind) + 1)]
+
+    async def connected():
+        return False
+    monkeypatch.setattr(public, "session", lambda: Session())
+    monkeypatch.setattr(public.EventLog, "head", staticmethod(head))
+    monkeypatch.setattr(public.EventLog, "since", staticmethod(since))
+    monkeypatch.setattr(public, "event_to_dict", lambda ev: {"index": ev.index})
+    subscribed = []
+    ctx = SimpleNamespace(events=SimpleNamespace(subscribe=subscribed.append, unsubscribe=subscribed.remove))
+    request = SimpleNamespace(headers={"accept": "text/event-stream"}, client=SimpleNamespace(host="203.0.113.7"),
+                              is_disconnected=connected)
+    resp = await public.events_stream(request, ctx, after=0)
+    stream = resp.body_iterator
+
+    async def entries(n):
+        got = []
+        async for item in stream:
+            if item["event"] == "entry":
+                got.append(int(item["id"]))
+            if len(got) == n:
+                return got
+    # the wait for news is three seconds; a reader this far behind is not made to take it between batches
+    got = await asyncio.wait_for(entries(behind), timeout=2)
+    assert got == list(range(1, behind + 1))
+    assert reads == [(0, public.STREAM_BATCH), (public.STREAM_BATCH, public.STREAM_BATCH), (2 * public.STREAM_BATCH, public.STREAM_BATCH)]
+    await stream.aclose()
+    assert subscribed == [] and public.STREAMS._n == 0, "the slot and the subscription go with the stream"
+
+
+# ---- XE-6656 / XE-4124 / XE-5982: what a signed request may carry is settled before anything hashes it -----
+
+def test_a_signed_request_carries_no_float_no_deep_nesting_and_a_u64_nonce():
+    from pydantic import ValidationError
+
+    from dao.auth import MAX_PAYLOAD_DEPTH, payload_fault
+    ok = {"a": [1, "x", None, True, {"b": [2**70, -1]}]}
+    assert payload_fault(ok) is None
+    for bad in ({"a": 1.5}, {"a": [float("nan")]}, {"a": {"b": float("inf")}}, {"a": 1.0}, {"a": [1e21]}):
+        assert payload_fault(bad) == "numbers in a signed payload are integers", bad
+    deep = cur = {}
+    for _ in range(MAX_PAYLOAD_DEPTH - 1):
+        cur["a"] = {}
+        cur = cur["a"]
+    assert payload_fault(deep) is None, "exactly the depth allowed"
+    cur["a"] = [[]]
+    assert "nested deeper" in payload_fault(deep)
+    very = cur = []
+    for _ in range(200_000):      # far past the interpreter's recursion limit: walked, not recursed
+        cur.append([])
+        cur = cur[0]
+    assert "nested deeper" in payload_fault({"a": very})
+    base = {"timestamp": 1, "pub_key": "ab" * 32, "signature": "cd" * 64}
+    for bad in ({"a": 1.5}, {"a": very}, {"a": float("nan")}):
+        with pytest.raises(ValidationError):
+            SignedRequest(payload=bad, **base)
+    assert SignedRequest(payload=ok, **base).payload == ok
+    # the nonce is a u64 or the request is refused: no value is taken modulo 2**64 (XE-5982)
+    for nonce in (0, 1, 2**64 - 1):
+        assert SignedRequest(pow_nonce=nonce, **base).pow_nonce == nonce
+    for nonce in (-1, 2**64, 2**64 + 5, -(2**64) + 5):
+        with pytest.raises(ValidationError):
+            SignedRequest(pow_nonce=nonce, **base)
+    # and the digest itself has no spelling for a non-finite number, whoever calls it
+    for bad in (float("nan"), float("inf"), {"a": [float("-inf")]}):
+        with pytest.raises(ValueError):
+            canonical_json(bad)
+    assert canonical_json({"b": 1, "a": 1.5}) == b'{"a":1.5,"b":1}'
+
+
+# ---- the sibling sweep of 15 November: each rule at the sites the first fixes had not reached ---------------
+
+def test_a_deployment_that_has_not_confirmed_who_it_is_accepts_no_signed_request():
+    """XE-12620 / XE-2068. Until the node has answered with the configured network the addressee's network
+    is empty, and a signature over an empty network (or an empty account) names no deployment: it verified
+    at every deployment in that state. Refused before the signature is looked at, on every signed route,
+    since every one of them comes through `verify_signed`."""
+    from dao.auth import signing_target
+    kp, ts, payload = KeyPair.generate(), time.time_ns(), {"choice": "for"}
+    for to in ({"dao": "d" * 64, "network": ""}, {"dao": "", "network": "xe-test"}, {"dao": "", "network": ""}):
+        sig = kp.sign_hex(signing_target(DOMAIN_VOTE, to, payload, ts))
+        req = SignedRequest(payload=payload, timestamp=ts, pub_key=kp.pub_key_hex, signature=sig)
+        ctx = SimpleNamespace(config=SimpleNamespace(accounts={"dao": to["dao"]}), node=SimpleNamespace(network_id=to["network"]))
+        with pytest.raises(HTTPException) as e:
+            verify_signed(ctx, req, DOMAIN_VOTE)
+        assert e.value.status_code == 503, to
+
+
+def test_what_the_door_refuses_in_a_payload_the_cli_refuses_to_sign_and_the_startup_lint_reads_the_pages():
+    import inspect
+
+    from dao import cli, main
+    src = inspect.getsource(cli.sign_request)
+    assert src.index("payload_fault(p)") < src.index("signing_target("), "XE-6656: refused before it is signed"
+    assert "lint_public_copy(ctx.config, public_template_prose())" in inspect.getsource(main.lifespan), "XE-5986"
+
+

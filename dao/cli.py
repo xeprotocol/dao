@@ -99,18 +99,25 @@ def sign(digest: str = typer.Option(..., help="32-byte hex digest shown by the w
 @app.command("sign-request")
 def sign_request(domain: str = typer.Argument(..., help="e.g. xe-dao/vote/v1"),
                  payload: str = typer.Argument(..., help="JSON payload"),
+                 dao: str = typer.Option(..., "--dao", help="the DAO account the request is for: signing.to.dao at GET /v1"),
+                 network: str = typer.Option(..., "--network", help="the network it serves: signing.to.network at GET /v1"),
                  pow_difficulty: str = typer.Option(None, "--pow", help="hex difficulty from GET /v1/inbox; adds pow_nonce")):
-    """Produce a complete SignedRequest body for curl. The seed is read from XE_SEED, or asked for."""
+    """Produce a complete SignedRequest body for curl, signed for one deployment and refused by any other.
+    The seed is read from XE_SEED, or asked for."""
     import time
-    from .auth import compute_http_pow
-    from .canonical import digest as _digest
+    from .auth import compute_http_pow, payload_fault, pow_target, signing_target
     kp = _seat_key()
     p = json.loads(payload)
+    if not isinstance(p, dict):
+        raise typer.BadParameter("the payload is a JSON object")
+    fault = payload_fault(p)   # what the door refuses is refused here, before it is signed (XE-6656)
+    if fault:
+        raise typer.BadParameter(f"the payload cannot be signed: {fault}")
     ts = time.time_ns()
-    d = _digest(domain.encode() + b"\x00", {"payload": p, "timestamp": ts})
+    d = signing_target(domain.encode() + b"\x00", {"dao": dao.lower(), "network": network}, p, ts)
     out = {"payload": p, "timestamp": ts, "pub_key": kp.pub_key_hex, "signature": kp.sign_hex(d)}
     if pow_difficulty:
-        out["pow_nonce"] = compute_http_pow(d, int(pow_difficulty, 16))
+        out["pow_nonce"] = compute_http_pow(pow_target(d, kp.pub_key_hex), int(pow_difficulty, 16))
     typer.echo(json.dumps(out))
 
 
@@ -140,23 +147,10 @@ def verify_log():
 
 @app.command("copy-lint")
 def copy_lint(config_dir: Path = typer.Option(None)):
-    """Fail if any kill-list phrase appears in the public copy register or public templates."""
-    from .config import lint_public_copy, load_config
+    """Fail if any kill-list phrase appears in the public copy register or a public template."""
+    from .config import lint_public_copy, load_config, public_template_prose
     cfg = load_config(config_dir or _settings().config_dir)
-    tpl_dir = Path(__file__).parent / "templates"
-    public_templates = ["home.html", "proposals.html", "proposal.html", "proposal_new.html", "seats.html", "decisions.html",
-                        "inbox.html", "log.html", "log_entry.html", "base.html"]
-    extra = []
-    for name in public_templates:
-        p = tpl_dir / name
-        if p.exists():
-            # strip Jinja and HTML roughly; lint the prose
-            import re
-            text = re.sub(r"{[{%#].*?[}%#]}", " ", p.read_text(encoding="utf-8"), flags=re.S)
-            text = re.sub(r"<script.*?</script>", " ", text, flags=re.S)
-            text = re.sub(r"<[^>]+>", " ", text)
-            extra.append(text)
-    v = lint_public_copy(cfg, extra)
+    v = lint_public_copy(cfg, public_template_prose())
     if v:
         for line in v:
             typer.echo(f"  {line}")

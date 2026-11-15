@@ -1,15 +1,21 @@
-"""/v1/members/*: the seat holders' actions. Every POST carries a SignedRequest under the member-action
-domain; the seat is resolved from the key, and nothing is written without one. The payload names the thing
-acted on (`bind`): the path routes the request, the signature authorises it. The GETs here are public reads
-of public records (sessions appear on /records and in the log); `whoami` is a key lookup (XE-0652).
+"""/v1/members/*: the seat holders' actions. Every POST carries a SignedRequest and goes through one door,
+`auth.seat_request`: the address is metered, the signature checked, the seat and its right resolved from the
+key, and only then is anything written. The path routes the request; the signature authorises it, so the
+payload names the action (`member_action`) and the thing acted on. A resolution signature and an ops
+approval have domains of their own, and those payloads are checked against the record they sign. The GETs
+here are public reads of public records (sessions appear on /records and in the log); `whoami` is a key
+lookup (XE-0652).
+
+The action names are the API: `tests/test_seat_requests.py` holds the table and walks every route here.
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from ..auth import SignedRequest, bind, require_seat, verify_and_claim
-from ..canonical import DOMAIN_MEMBER_ACTION, DOMAIN_OPS_APPROVAL, DOMAIN_RESOLUTION
+from ..auth import SignedRequest, member_action, seat_request
+from ..canonical import DOMAIN_OPS_APPROVAL, DOMAIN_RESOLUTION
+from ..db import locked
 from ..ratelimit import NODE_READ, enforce_ip
 from ..services import inbox as inbox_svc
 from ..services import pause as pause_svc
@@ -31,8 +37,8 @@ async def whoami(pub_key: str, ctx: Ctx):
 # ---- resolutions ------------------------------------------------------------------------------
 
 @router.post("/resolutions", status_code=201)
-async def propose_resolution(req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
+async def propose_resolution(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
+    v = await member_action(request, db, ctx, req, "propose_resolution")
     if field_text(v.payload, "matter") in resolutions.RESERVED_MATTERS and not v.seat.is_member:
         raise HTTPException(403, "reserved matters are proposed by members")
     r = await resolutions.propose(ctx, db, v)
@@ -41,8 +47,10 @@ async def propose_resolution(req: SignedRequest, ctx: Ctx, db: Db):
 
 
 @router.post("/resolutions/{res_id}/sign", status_code=201)
-async def sign_resolution(res_id: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_RESOLUTION), ctx.config, right=resolutions.SIGN_RIGHT, members_only=True)
+async def sign_resolution(request: Request, res_id: str, req: SignedRequest, ctx: Ctx, db: Db):
+    """payload = {resolution_id, body_hash, decision}; signed under the resolution domain."""
+    v = await seat_request(request, db, ctx, req, DOMAIN_RESOLUTION, right=resolutions.SIGN_RIGHT, members_only=True,
+                           resolution_id=res_id)
     r = await resolutions.get(db, res_id, lock=True)
     await resolutions.decide(ctx, db, r, v, field_text(v.payload, "decision"))
     await db.commit()
@@ -50,9 +58,8 @@ async def sign_resolution(res_id: str, req: SignedRequest, ctx: Ctx, db: Db):
 
 
 @router.post("/resolutions/{res_id}/withdraw")
-async def withdraw_resolution(res_id: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
-    bind(v, resolution_id=res_id)
+async def withdraw_resolution(request: Request, res_id: str, req: SignedRequest, ctx: Ctx, db: Db):
+    v = await member_action(request, db, ctx, req, "withdraw_resolution", resolution_id=res_id)
     r = await resolutions.get(db, res_id, lock=True)
     await resolutions.withdraw(ctx, db, r, v)
     await db.commit()
@@ -70,6 +77,10 @@ async def list_sessions(db: Db, status: str | None = None, offset: int = Query(0
 
 @router.get("/sessions/{sid}")
 async def get_session(request: Request, sid: str, ctx: Ctx, db: Db):
+    if sid in ("registry", "anchor"):
+        # The two paths that open a session take a POST. Read with GET they matched this route as a
+        # session id and answered "not found" for a path that exists (XE-11401).
+        raise HTTPException(405, "Method Not Allowed", headers={"Allow": "POST"})
     enforce_ip(request, NODE_READ)   # `stale` asks the node for its tip
     s = await sessions.get(db, sid)
     d = sessions.to_dict(s)
@@ -78,9 +89,8 @@ async def get_session(request: Request, sid: str, ctx: Ctx, db: Db):
 
 
 @router.post("/sessions/registry", status_code=201)
-async def open_registry(req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, members_only=True)
-    bind(v, action="open_registry_session")
+async def open_registry(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
+    v = await member_action(request, db, ctx, req, "open_registry_session", members_only=True)
     if await pause_svc.is_paused(db):
         raise HTTPException(409, "paused")
     out = await records.open_registry_session(ctx, db, v.actor)
@@ -89,10 +99,9 @@ async def open_registry(req: SignedRequest, ctx: Ctx, db: Db):
 
 
 @router.post("/sessions/anchor", status_code=201)
-async def open_anchor(req: SignedRequest, ctx: Ctx, db: Db):
+async def open_anchor(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
     # Members only, like the registry: an anchor session takes the next number in the register (XE-0483).
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, members_only=True)
-    bind(v, action="open_anchor_session")
+    v = await member_action(request, db, ctx, req, "open_anchor_session", members_only=True)
     if await pause_svc.is_paused(db):
         raise HTTPException(409, "paused")
     out = await records.open_anchor_session(ctx, db, v.actor)
@@ -101,9 +110,9 @@ async def open_anchor(req: SignedRequest, ctx: Ctx, db: Db):
 
 
 @router.post("/sessions/{sid}/approve", status_code=201)
-async def approve_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
+async def approve_session(request: Request, sid: str, req: SignedRequest, ctx: Ctx, db: Db):
     """payload = {session_id, ops_digest}; signed under the ops-approval domain by a keyset key."""
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_OPS_APPROVAL), ctx.config, right=sessions.SIGN_RIGHT)
+    v = await seat_request(request, db, ctx, req, DOMAIN_OPS_APPROVAL, right=sessions.SIGN_RIGHT, session_id=sid)
     s = await sessions.get(db, sid, lock=True)
     await sessions.approve(ctx, db, s, v)
     await db.commit()
@@ -111,11 +120,10 @@ async def approve_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
 
 
 @router.post("/sessions/{sid}/rebuild")
-async def rebuild_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
+async def rebuild_session(request: Request, sid: str, req: SignedRequest, ctx: Ctx, db: Db):
     """Rebuild the block at the live tip. Only when the tip has moved: a rebuild discards every signature
     collected so far, so at an unchanged tip one seat could loop it and stall signing (XE-0882)."""
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right=sessions.SIGN_RIGHT)
-    bind(v, session_id=sid)
+    v = await member_action(request, db, ctx, req, "rebuild_session", right=sessions.SIGN_RIGHT, session_id=sid)
     s = await sessions.get(db, sid, lock=True)
     await sessions.rebuild_if_stale(ctx, db, s, actor=v.actor)
     await db.commit()
@@ -123,11 +131,10 @@ async def rebuild_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
 
 
 @router.post("/sessions/{sid}/sign", status_code=201)
-async def sign_session_block(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
+async def sign_session_block(request: Request, sid: str, req: SignedRequest, ctx: Ctx, db: Db):
     """payload = {block_hash, block_signature}. The outer SignedRequest proves the seat; the inner
     block_signature is the raw ed25519 signature over the block hash bytes that goes on chain."""
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right=sessions.SIGN_RIGHT)
-    bind(v, session_id=sid)
+    v = await member_action(request, db, ctx, req, "sign_session", right=sessions.SIGN_RIGHT, session_id=sid)
     s = await sessions.get(db, sid, lock=True)
     if field_text(v.payload, "block_hash") != s.block_hash:
         raise HTTPException(409, "block hash has changed (tip moved); fetch the session again and re-sign")
@@ -137,9 +144,8 @@ async def sign_session_block(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
 
 
 @router.post("/sessions/{sid}/cancel")
-async def cancel_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, members_only=True)
-    bind(v, session_id=sid)
+async def cancel_session(request: Request, sid: str, req: SignedRequest, ctx: Ctx, db: Db):
+    v = await member_action(request, db, ctx, req, "cancel_session", members_only=True, session_id=sid)
     s = await sessions.get(db, sid, lock=True)
     await sessions.cancel(ctx, db, s, v, clean_text(v.payload.get("reason"), "reason", max_len=2000, required=False))
     await db.commit()
@@ -149,17 +155,16 @@ async def cancel_session(sid: str, req: SignedRequest, ctx: Ctx, db: Db):
 # ---- pause ------------------------------------------------------------------------------------
 
 @router.post("/pause", status_code=201)
-async def start_pause(req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right="pause", members_only=True)
+async def start_pause(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
+    v = await member_action(request, db, ctx, req, "start_pause", right="pause", members_only=True)
     r = await pause_svc.start(ctx, db, v)
     await db.commit()
     return pause_svc.to_dict(ctx, r)
 
 
 @router.post("/pause/{pid}/extend")
-async def extend_pause(pid: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right="pause", members_only=True)
-    bind(v, pause_id=pid)
+async def extend_pause(request: Request, pid: str, req: SignedRequest, ctx: Ctx, db: Db):
+    v = await member_action(request, db, ctx, req, "extend_pause", right="pause", members_only=True, pause_id=pid)
     r = await _pause(db, pid)
     await pause_svc.extend(ctx, db, r, v)
     await db.commit()
@@ -167,9 +172,8 @@ async def extend_pause(pid: str, req: SignedRequest, ctx: Ctx, db: Db):
 
 
 @router.post("/pause/{pid}/lift")
-async def lift_pause(pid: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right="pause", members_only=True)
-    bind(v, pause_id=pid)
+async def lift_pause(request: Request, pid: str, req: SignedRequest, ctx: Ctx, db: Db):
+    v = await member_action(request, db, ctx, req, "lift_pause", right="pause", members_only=True, pause_id=pid)
     r = await _pause(db, pid)
     await pause_svc.lift(ctx, db, r, v)
     await db.commit()
@@ -177,9 +181,8 @@ async def lift_pause(pid: str, req: SignedRequest, ctx: Ctx, db: Db):
 
 
 @router.post("/pause/{pid}/post")
-async def pause_post(pid: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, right="pause", members_only=True)
-    bind(v, pause_id=pid)
+async def pause_post(request: Request, pid: str, req: SignedRequest, ctx: Ctx, db: Db):
+    v = await member_action(request, db, ctx, req, "post_pause", right="pause", members_only=True, pause_id=pid)
     r = await _pause(db, pid)
     await pause_svc.set_post(ctx, db, r, v)
     await db.commit()
@@ -189,7 +192,7 @@ async def pause_post(pid: str, req: SignedRequest, ctx: Ctx, db: Db):
 async def _pause(db, pid: str):
     from sqlalchemy import select
     from ..models import PauseRecord
-    r = (await db.execute(select(PauseRecord).where(PauseRecord.id == pid).with_for_update())).scalar_one_or_none()
+    r = (await db.execute(locked(select(PauseRecord).where(PauseRecord.id == pid)))).scalar_one_or_none()
     if r is None:
         raise HTTPException(404, "pause not found")
     return r
@@ -198,10 +201,10 @@ async def _pause(db, pid: str):
 # ---- inbox handling ---------------------------------------------------------------------------
 
 @router.post("/inbox/untriaged")
-async def inbox_untriaged(req: SignedRequest, ctx: Ctx, db: Db):
+async def inbox_untriaged(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
     """HTTP messages no member has looked at yet. Signed by a seat holder: these are the one part of the
     inbox the public surfaces hold back (XE-0195), so reading them is a seat action like answering them."""
-    bind(require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config), action="list_untriaged")
+    await member_action(request, db, ctx, req, "list_untriaged")
     offset = req.payload.get("offset", 0)
     if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= 2**31:
         raise HTTPException(400, "offset must be a non-negative integer")
@@ -212,10 +215,9 @@ async def inbox_untriaged(req: SignedRequest, ctx: Ctx, db: Db):
 
 
 @router.post("/inbox/{mid}/reply", status_code=201)
-async def inbox_reply(mid: str, req: SignedRequest, ctx: Ctx, db: Db):
+async def inbox_reply(request: Request, mid: str, req: SignedRequest, ctx: Ctx, db: Db):
     # Replying publishes a held message and speaks for the DAO: members only (XE-0635).
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, members_only=True)
-    bind(v, message_id=mid)
+    v = await member_action(request, db, ctx, req, "reply_message", members_only=True, message_id=mid)
     m = await inbox_svc.get(db, mid, lock=True)
     o = await inbox_svc.reply(ctx, db, m, v)
     await db.commit()
@@ -223,9 +225,8 @@ async def inbox_reply(mid: str, req: SignedRequest, ctx: Ctx, db: Db):
 
 
 @router.post("/inbox/{mid}/status")
-async def inbox_status(mid: str, req: SignedRequest, ctx: Ctx, db: Db):
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config, members_only=True)
-    bind(v, message_id=mid)
+async def inbox_status(request: Request, mid: str, req: SignedRequest, ctx: Ctx, db: Db):
+    v = await member_action(request, db, ctx, req, "set_message_status", members_only=True, message_id=mid)
     m = await inbox_svc.get(db, mid, lock=True)
     await inbox_svc.set_status(ctx, db, m, v)
     await db.commit()
@@ -235,9 +236,9 @@ async def inbox_status(mid: str, req: SignedRequest, ctx: Ctx, db: Db):
 # ---- notes ------------------------------------------------------------------------------------
 
 @router.post("/notes", status_code=201)
-async def post_note(req: SignedRequest, ctx: Ctx, db: Db):
+async def post_note(request: Request, req: SignedRequest, ctx: Ctx, db: Db):
     """A signed public note from a seat holder, straight into the log (daily notes, explanations)."""
-    v = require_seat(await verify_and_claim(db, req, DOMAIN_MEMBER_ACTION), ctx.config)
+    v = await member_action(request, db, ctx, req, "post_note")
     text = clean_text(v.payload.get("text"), "text", max_len=20_000)
     title = clean_text(v.payload.get("title"), "title", max_len=160, required=False)
     ev = await ctx.events.append(db, "note", v.actor, {"title": title, "text": text,
