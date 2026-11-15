@@ -52,10 +52,12 @@ class FakeChain:
     async def block(self, h):
         if h not in self.blocks:
             raise XeError(404, "not found")
-        return self.blocks[h]
+        return {"finalized": True, **self.blocks[h]}   # final unless a test says otherwise, as below
 
     async def full_chain(self, account):
-        return self.chains.get(account, [{"timestamp": 0, "asset": "XE", "balance": 5_000_000, "hash": "b" * 64}])
+        # final unless a test says otherwise: a weight rests only on blocks the node holds final (XE-3129)
+        served = self.chains.get(account, [{"timestamp": 0, "asset": "XE", "balance": 5_000_000, "hash": "b" * 64}])
+        return [{"finalized": True, **b} for b in served]
 
     async def dao_keyset(self):
         return {"keys": ["k1", "k2", "k3"], "threshold": 2}
@@ -1128,7 +1130,7 @@ async def test_vote_write_sees_a_close_that_landed_during_the_snapshot_read(db):
             row = await portal.get(other, pr.hash, lock=True)
             row.status = "closed"
             await other.commit()
-        return [{"timestamp": 0, "asset": "XE", "balance": 5_000_000, "hash": "b" * 64}]
+        return [{"timestamp": 0, "asset": "XE", "balance": 5_000_000, "hash": "b" * 64, "finalized": True}]
 
     ctx.chain.full_chain = closing_chain
     with pytest.raises(HTTPException) as e:
@@ -2131,8 +2133,8 @@ async def test_unreadable_chain_weighs_nothing_agent_class_is_live_and_open_tall
                   rules=ctx.config.pinned_rules(), analysis=[])
     db.add(pr)
     at = snapshot_time(pr.opened_at)
-    chains = {"ag": [{"timestamp": at - 1000, "asset": "XE", "balance": 5_000_000, "hash": "g0", "type": "open"}],
-              "ok": [{"timestamp": at - 1000, "asset": "XE", "balance": 1_000_000, "hash": "o0", "type": "open"}]}
+    chains = {"ag": [{"timestamp": at - 1000, "asset": "XE", "balance": 5_000_000, "hash": "g0", "type": "open", "finalized": True}],
+              "ok": [{"timestamp": at - 1000, "asset": "XE", "balance": 1_000_000, "hash": "o0", "type": "open", "finalized": True}]}
 
     async def full_chain(account):
         if account == "big":
@@ -3590,6 +3592,57 @@ async def test_one_items_database_fault_costs_that_item_and_no_other(db, monkeyp
     assert await inbox.flush_outbox(ctx, db) == 1
     assert {o.status for o in await fresh(OutboxMessage)} == {"sent"}
 
+
+# ---- XE-3129: a weight rests only on blocks the node holds final -------------------------------------------
+
+async def test_a_row_from_an_unsettled_snapshot_is_derived_again_until_the_chain_has_settled(db, monkeypatch):
+    from dao.chainops import snapshot_time
+    ctx = _ctx()
+    now = time.time_ns()
+    pr = Proposal(hash="7" * 64, title="t", body="b", ops=None, author_account=AUTHOR, author_pub_key="p" * 64, author_signature="s",
+                  author_timestamp=now, fee_block_hash="7" * 64, status="open", opened_at=now - D, closes_at=now + D,
+                  rules=ctx.config.pinned_rules(), analysis=[])
+    db.add(pr)
+    at = snapshot_time(pr.opened_at)
+    send = {"timestamp": at - 1000, "asset": "XE", "balance": 400_000, "hash": "s0", "type": "send", "finalized": False}
+    ctx.chain.chains["v"] = [{"timestamp": at - 2000, "asset": "XE", "balance": 1_000_000, "hash": "o0", "type": "open"}, send]
+    snap, reasons, participating, weight = await portal.eligibility(ctx, pr, "v", False)
+    assert weight == 1_000_000 and snap["unsettled"] is True and snap["snapshot_block"] == "o0", "what the chain is certain of"
+    db.add(Vote(proposal_hash=pr.hash, account="v", pub_key="p" * 64, choice="for", reason="", timestamp=now,
+                signature=os.urandom(8).hex(), weight=weight, participating=participating, is_agent=False,
+                eligibility={"snapshot": snap, "not_participating_because": reasons}))
+    await db.commit()
+
+    async def rederived():
+        return len((await db.execute(select(Event).where(Event.kind == "vote.rederived"))).scalars().all())
+    # not current while unsettled: left out of the open tally, read again every pass, and nothing is logged
+    # while the answer is the same
+    assert portal.tally(pr, await portal.votes_for(db, pr.hash), ctx)["stale_rows"] == 1
+    assert await portal.rederive_open(ctx, db) == 1 and await portal.rederive_open(ctx, db) == 1 and await rederived() == 0
+    # a pass that has spent its time on unsettled chains leaves the rest for a later one (whoever holds an
+    # account can keep its chain unsettled); the close below has no such limit
+    monkeypatch.setattr(portal, "REDERIVE_UNSETTLED_S", 0.0)
+    assert await portal.rederive_open(ctx, db) == 0
+    monkeypatch.undo()
+    # the send becomes final: the weight is the chain's, the change is on the log, and the row is current
+    send["finalized"] = True
+    assert await portal.rederive_open(ctx, db) == 1 and await rederived() == 1
+    row = await portal.vote_of(db, pr.hash, "v")
+    assert row.weight == 400_000 and row.eligibility["snapshot"]["unsettled"] is False
+    assert await portal.rederive_open(ctx, db) == 0
+    assert portal.tally(pr, await portal.votes_for(db, pr.hash), ctx)["stale_rows"] == 0
+    # and a close does the same for a row still unsettled when the window ends
+    send["finalized"] = False
+    row.eligibility = {**row.eligibility, "snapshot": {**row.eligibility["snapshot"], "unsettled": True}}
+    pr.closes_at = now - 1
+    await db.commit()
+    assert [p.hash for p in await portal.close_due(ctx, db)] == [pr.hash]
+    assert (await portal.vote_of(db, pr.hash, "v")).weight == 1_000_000 and pr.result["weight"]["for"] == 1_000_000
+    assert pr.result["unsettled_rows"] == 1 and pr.result["stale_rows"] == 0, "the published result says what it rests on"
+
+
+
+# ---- sweep of XE-3724: the two passes the first fix did not reach ------------------------------------------
 
 async def test_a_health_leg_the_database_fails_costs_that_leg_and_the_check_is_still_recorded(db, monkeypatch):
     from dao.services import records

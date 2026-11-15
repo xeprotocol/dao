@@ -34,6 +34,7 @@ from . import sessions
 D = 24 * 3600 * 1_000_000_000
 MAX_TITLE = 160
 MAX_BODY = 20_000
+REDERIVE_UNSETTLED_S = 20.0   # what one worker pass spends reading unsettled chains again (`rederive_stale`)
 log = logging.getLogger("dao.portal")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 FINAL = ("adopt", "decline")
@@ -204,20 +205,29 @@ async def eligibility_at(ctx: Context, rules: dict, at: int, account: str, is_ag
     return snap, reasons, not reasons, (0 if excluded else int(snap["balance"]))
 
 
-def is_current(ctx: Context, pr: Proposal, row: Vote) -> bool:
-    """Whether the row's stored weight was derived under the proposal's snapshot as it is now defined, and
-    under the account's present class (an account made or unmade an agent seat since it voted is re-derived
-    too, XE-1724)."""
+def _derived_as_defined(ctx: Context, pr: Proposal, row: Vote) -> bool:
     snap = (row.eligibility or {}).get("snapshot") or {}
     return (snap.get("at") == snapshot_time(pr.opened_at) and snap.get("rule") == SNAPSHOT_RULE
             and bool(row.is_agent) == (row.account in ctx.config.agent_accounts))
+
+
+def unsettled(row: Vote) -> bool:
+    return bool(((getattr(row, "eligibility", None) or {}).get("snapshot") or {}).get("unsettled"))
+
+
+def is_current(ctx: Context, pr: Proposal, row: Vote) -> bool:
+    """Whether the row's stored weight was derived under the proposal's snapshot as it is now defined, and
+    under the account's present class (an account made or unmade an agent seat since it voted is re-derived
+    too, XE-1724). A snapshot of a chain that held a block the node did not yet hold final is not current
+    either: the block has been settled one way or the other since, or will be (XE-3129)."""
+    return _derived_as_defined(ctx, pr, row) and not unsettled(row)
 
 
 async def vote_of(db: AsyncSession, h: str, account: str) -> Vote | None:
     return (await db.execute(select(Vote).where(Vote.proposal_hash == h, Vote.account == account))).scalar_one_or_none()
 
 
-async def rederive_stale(ctx: Context, db: AsyncSession, pr: Proposal) -> list[Vote]:
+async def rederive_stale(ctx: Context, db: AsyncSession, pr: Proposal, until: float | None = None) -> list[Vote]:
     """Rows written under an earlier snapshot time or rule carry a weight the proposal no longer means.
     Each is re-derived from the chain before the tally reads it; the vote itself (choice, signature,
     time) stands. A node error leaves the row as it is and raises, so the close waits for the next pass
@@ -228,10 +238,17 @@ async def rederive_stale(ctx: Context, db: AsyncSession, pr: Proposal) -> list[V
     The rows are written before the first entry is appended. Appending takes the log head, and a vote
     being cast holds its row and then waits for the head: rows written one at a time between entries
     would take the two in the other order, and the node would be asked about each account with the log
-    held shut (XE-12010)."""
-    stale, changed = [], []
+    held shut (XE-12010).
+
+    `until` is the worker's: past that moment (`time.monotonic()`) a row that is stale only because its
+    chain was unsettled is left for a later pass. Whoever holds an account can keep its chain unsettled,
+    and each such row is a whole chain read again; a pass spends a bounded time on them. The close gives
+    no `until`, and reads every one."""
+    stale, changed, node_error = [], [], None
     for row in await votes_for(db, pr.hash):
         if is_current(ctx, pr, row):
+            continue
+        if until is not None and time.monotonic() >= until and _derived_as_defined(ctx, pr, row):
             continue
         is_agent = row.account in ctx.config.agent_accounts
         try:
@@ -264,12 +281,16 @@ async def rederive_open(ctx: Context, db: AsyncSession) -> int:
     step, so that whatever fails under it, the database included, undoes that proposal's rows, leaves the
     session usable, and is logged without asking the session for anything (XE-3724)."""
     n = 0
-    for pr in (await db.execute(select(Proposal).where(Proposal.status == "open"))).scalars().all():
+    until = time.monotonic() + REDERIVE_UNSETTLED_S
+    open_ = (await db.execute(select(Proposal).where(Proposal.status == "open"))).scalars().all()
+    for pr, h in [(pr, pr.hash) for pr in open_]:
+        node_error = None
         try:
-            n += len(await rederive_stale(ctx, db, pr))
-        except XeError as e:   # the rows re-derived before the node failed are kept: each stands on its own
-            log.warning("proposal %s: could not re-derive stale votes: %s", pr.hash[:12], e)
-            break
+            async with db.begin_nested():
+                try:
+                    n += len(await rederive_stale(ctx, db, pr, until))
+                except XeError as e:   # raised after the rows read before it were written: those are kept
+                    node_error = e
         except Exception:   # this proposal's rows, not the node: the proposals behind it are not held up
             log.exception("proposal %s: re-deriving its stale votes raised", h[:12])
             continue
@@ -340,7 +361,9 @@ def tally(pr: Proposal, votes: list[Vote], ctx: Context | None = None) -> dict:
     """The count. With `ctx`, only rows derived under the proposal's current snapshot and class are
     counted and the rest are reported as `stale_rows`: a published figure never includes a weight the
     proposal no longer means (XE-1664); the worker re-derives such rows and the close re-derives them
-    before it tallies, so at close there are none."""
+    before it tallies, so at close there are none. A row whose chain was still unsettled when the close
+    read it is counted at what the chain was certain of, and `unsettled_rows` says how many there were
+    (XE-3129)."""
     rules = pr.rules
     agents = rules.get("agents", {})
     cap = float(agents.get("max_weight_share", 0.01))
@@ -372,7 +395,8 @@ def tally(pr: Proposal, votes: list[Vote], ctx: Context | None = None) -> dict:
     # compared exactly: weights are integers of µXE and the mark is the decimal the schedule wrote (XE-5578)
     passed = quorum_met and decided > 0 and Fraction(counted["for"], decided) > Fraction(str(rules.get("pass_mark_fraction", 0.5)))
     return {
-        "votes": len(votes), "stale_rows": stale, "participating_wallets": participating, "quorum_wallets": quorum, "quorum_met": quorum_met,
+        "votes": len(votes), "stale_rows": stale, "unsettled_rows": sum(1 for v in votes if unsettled(v)),
+        "participating_wallets": participating, "quorum_wallets": quorum, "quorum_met": quorum_met,
         "weight": counted, "weight_human": human, "weight_agent_raw": agent, "agent_scale": round(scale, 6),
         "for_share": (counted["for"] / decided) if decided else 0.0, "pass_mark": pass_mark,
         "outcome": ("passed" if passed else ("failed" if quorum_met else "no_quorum")),

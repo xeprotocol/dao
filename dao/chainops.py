@@ -8,6 +8,7 @@ here can touch the treasury or the keyset.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -262,16 +263,33 @@ async def _build_out(ctx: Context, key_name: str, scope: str, type_: str, amount
 # another asset carries no weight, so its causality is nobody's concern here), largest amount first, so
 # what the cap drops is dust. A voter's material receive is looked up ahead of thirty dust receives, their
 # own or a stranger's, and a flood of foreign-asset dust spends nothing (XE-1548, XE-1589).
+#
+# Fourth, a weight rests only on blocks the node holds final, as a fee does (XE-0034, XE-3129). The walk
+# ends at the first block that is not: that block can still be dropped, and every block after it stands on
+# it. In ordinary running a block dated before the snapshot was final long before anyone could vote, so
+# this decides nothing; when the chain served holds a block that is not final, the figure is what the chain
+# is certain of, and the snapshot says `unsettled`. That is said whatever date the block carries: the place
+# it holds may yet go to another block, and that one can be dated on either side of the snapshot. The
+# source a receive names is held to the same: one that is not final has not happened yet, and its receive
+# is not counted. A row derived from an unsettled snapshot is not
+# current (`portal.is_current`): it is derived again on every pass and at the close, so what is tallied is
+# the chain as final as it was when the proposal closed. Leaving a block out can raise a figure as well as
+# lower it (a send that is not final has not yet left), but never counts one balance twice: the receive
+# of that send is no more final than the send is.
 TIMESTAMP_WINDOW_NS = 3600 * 1_000_000_000
 SNAPSHOT_MARGIN_NS = 5 * 60 * 1_000_000_000
 SNAPSHOT_LEAD_NS = TIMESTAMP_WINDOW_NS + SNAPSHOT_MARGIN_NS
+# The lead in words, for a voter told why an account does not count. Every statement of when the snapshot
+# is taken gives this lead and no rounder one: an account opened sixty-two minutes before a proposal was
+# told the cut-off was an hour, and was not counted (XE-10113).
+SNAPSHOT_LEAD_TEXT = "an hour and five minutes"
 CAUSAL_CHECK_NS = 2 * TIMESTAMP_WINDOW_NS
 MAX_CAUSAL_LOOKUPS = 32
 CAUSAL_LOOKUP_CONCURRENCY = 8
 # Bumped whenever the figure this function derives for the same chain and `at` can change. A vote row
 # stores the result it was derived from; at close, rows derived under another `at` or rule are re-derived
 # before they are tallied (XE-1617).
-SNAPSHOT_RULE = 4
+SNAPSHOT_RULE = 5
 # Block types that raise the asset balance by bringing value from another block, which `source` names.
 ARRIVALS = ("receive", "lease_settle")
 
@@ -285,7 +303,7 @@ def empty_snapshot(at_ns: int, unreadable: str = "") -> dict:
     """The snapshot of an account the chain has nothing for: not there, or (with `unreadable` set) one whose
     chain the harness cannot read on purpose, such as one past the page bound (XE-1706)."""
     d = {"exists": False, "balance": 0, "first_block_ts": None, "snapshot_block": "", "excluded_receives": [],
-         "lookups_capped": False, "at": at_ns, "rule": SNAPSHOT_RULE}
+         "lookups_capped": False, "unsettled": False, "at": at_ns, "rule": SNAPSHOT_RULE}
     if unreadable:
         d["unreadable"] = unreadable
     return d
@@ -301,17 +319,20 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
     the balance (XE-1003). `snapshot_block` is the last counted block. Node reads are bounded and spent
     largest receive first (XE-1460, XE-1548, XE-1589, see above); `lookups_capped` says whether the bound
     was hit. `at` and `rule` record what the figure was derived under, so a stored result can be told
-    from one derived under a different rule (XE-1617).
+    from one derived under a different rule (XE-1617). Only blocks the node holds final are walked;
+    `unsettled` says that the chain served holds one that is not, whatever its date (XE-3129).
     """
     empty = empty_snapshot(at_ns)
     try:
-        blocks = await chain.full_chain(account)
+        served = await chain.full_chain(account)
     except XeError as e:
         if e.status == 404:
             return empty
         raise
+    blocks = list(itertools.takewhile(lambda b: b.get("finalized") is True, served))
+    unsettled = len(blocks) < len(served)
     if not blocks:
-        return empty
+        return {**empty, "unsettled": unsettled}
     first_ts = blocks[0].get("timestamp", 0)
     window: list[tuple[int, str]] = []   # (amount, source) for each windowed receive of our asset
     prev = 0
@@ -356,13 +377,13 @@ async def account_snapshot(chain: XeClient, account: str, at_ns: int, asset: str
         snap = b.get("hash", "")
     return {"exists": first_ts <= at_ns and counted > 0, "balance": max(bal - tainted, 0),
             "first_block_ts": first_ts, "snapshot_block": snap, "excluded_receives": excluded, "lookups_capped": capped,
-            "at": at_ns, "rule": SNAPSHOT_RULE}
+            "unsettled": unsettled, "at": at_ns, "rule": SNAPSHOT_RULE}
 
 
 async def _sends_at_or_before(chain: XeClient, send_hashes: list[str], at_ns: int) -> dict[str, bool]:
-    """For each source block (a send, or the lease a settle pays out): True when it is on the chain and
-    dated at or before `at_ns`. One read per distinct hash, a bounded number in flight; a hash not in the
-    result is not causal."""
+    """For each source block (a send, or the lease a settle pays out): True when it is on the chain, final,
+    and dated at or before `at_ns`. One read per distinct hash, a bounded number in flight; a hash not in
+    the result is not causal."""
     gate = asyncio.Semaphore(CAUSAL_LOOKUP_CONCURRENCY)
 
     async def one(h: str) -> bool:
@@ -375,7 +396,8 @@ async def _sends_at_or_before(chain: XeClient, send_hashes: list[str], at_ns: in
                 if e.status == 404:
                     return False
                 raise
-        return src.get("timestamp", 0) <= at_ns
+        ts = src.get("timestamp")
+        return src.get("finalized") is True and type(ts) is int and ts <= at_ns
 
     found = await asyncio.gather(*(one(h) for h in send_hashes))
     return dict(zip(send_hashes, found))

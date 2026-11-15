@@ -396,14 +396,15 @@ class _Lattice:
         from xe.client import XeError
         if account not in self.chains:
             raise XeError(404, "no such account")
-        return self.chains[account]
+        # final unless a test says otherwise: a weight rests only on blocks the node holds final (XE-3129)
+        return [{"finalized": True, **b} for b in self.chains[account]]
 
     async def block(self, h):
         from xe.client import XeError
         self.lookups += 1
         if h not in self.blocks:
             raise XeError(404, "no such block")
-        return self.blocks[h]
+        return {"finalized": True, **self.blocks[h]}
 
 
 async def test_snapshot_does_not_count_a_receive_whose_send_is_after_it():
@@ -2559,7 +2560,7 @@ async def test_a_closed_proposal_tells_a_voter_what_the_vote_was_recorded_with(m
     assert derived == []
     assert (await public.snapshot(request(2), other, ctx, None, proposal=h))["weight"] == 1 and derived == [other]
     pr.status = "open"
-    assert (await public.snapshot(request(3), voter, ctx, None, proposal=h))["weight"] == 1, "an open proposal is derived, as a vote would be"
+    assert (await public.snapshot(request(3), voter, ctx, _Released(), proposal=h))["weight"] == 1, "an open proposal is derived, as a vote would be"
 
 
 def test_small_rules_of_the_sweep_hold_where_they_are_stated():
@@ -2595,6 +2596,78 @@ def test_small_rules_of_the_sweep_hold_where_they_are_stated():
     assert "path.exists()" not in inspect.getsource(signer_mod._read_keyfile) + inspect.getsource(signer_mod.Signer.init_keyfile)
     src = inspect.getsource(signer_mod._write_keyfile)
     assert src.index("try:") < src.index("path.parent.mkdir(")
+
+
+# ---- XE-3129: a weight rests only on blocks the node holds final -------------------------------------------
+
+async def test_a_snapshot_walks_only_the_blocks_the_node_holds_final():
+    from dao.chainops import SNAPSHOT_RULE, account_snapshot
+    T = 100 * H
+
+    class Served:
+        """A node that serves exactly these blocks, flags and all."""
+
+        def __init__(self, *blocks, source=None):
+            self.served, self.source = list(blocks), {"finalized": True} if source is None else source
+
+        async def full_chain(self, account):
+            return self.served
+
+        async def block(self, h):
+            return {"timestamp": T - 20 * H, **self.source}
+
+    def b(h, balance, ts, type_="receive", **flag):
+        return {"type": type_, "asset": "XE", "balance": balance, "timestamp": ts, "hash": h, "source": "early", **flag}
+    opened = b("o", 1000, T - 10 * H, finalized=True)
+    # every block final: the chain as it stands
+    s = await account_snapshot(Served(opened, b("r", 1500, T - 9 * H, finalized=True)), "a", T)
+    assert (s["balance"], s["snapshot_block"], s["unsettled"], s["exists"], s["rule"]) == (1500, "r", False, True, SNAPSHOT_RULE)
+    # a block that is not final is not counted, whatever stands in the flag's place; a node that serves no
+    # flag has said nothing is final
+    for flag in ({"finalized": False}, {}, {"finalized": None}, {"finalized": "true"}, {"finalized": 1}):
+        s = await account_snapshot(Served(opened, b("r", 1500, T - 9 * H, **flag)), "a", T)
+        assert (s["balance"], s["snapshot_block"], s["unsettled"]) == (1000, "o", True), flag
+    # nothing after it is counted either, final or not: each block stands on the one before
+    s = await account_snapshot(Served(opened, b("s", 0, T - 9 * H, "send", finalized=False), b("r", 700, T - 8 * H, finalized=True)), "a", T)
+    assert (s["balance"], s["snapshot_block"], s["unsettled"]) == (1000, "o", True)
+    # one dated after the snapshot would not have been counted, and the chain is unsettled all the same:
+    # the place it holds may yet go to a block dated before the snapshot
+    s = await account_snapshot(Served(opened, b("s", 0, T + 1, "send", finalized=False)), "a", T)
+    assert (s["balance"], s["unsettled"]) == (1000, True)
+    # a receive counts only if the source it names is final too, whatever stands in the flag's place
+    near = b("r", 1500, T - 1, finalized=True)
+    assert (await account_snapshot(Served(opened, near), "a", T))["balance"] == 1500
+    for flag in ({"finalized": False}, {}, {"finalized": "true"}, {"finalized": True, "timestamp": None}):
+        s = await account_snapshot(Served(opened, near, source=flag), "a", T)
+        assert (s["balance"], s["excluded_receives"], s["unsettled"]) == (1000, ["r"], False), flag
+    # an account with nothing final does not exist yet, and says why it may
+    s = await account_snapshot(Served(b("o", 1000, T - 10 * H, finalized=False)), "a", T)
+    assert (s["exists"], s["balance"], s["first_block_ts"], s["unsettled"], s["rule"]) == (False, 0, None, True, SNAPSHOT_RULE)
+    assert (await account_snapshot(Served(), "a", T))["unsettled"] is False
+
+
+def test_a_row_from_an_unsettled_snapshot_is_not_current_and_every_deciding_read_asks_for_finality():
+    import inspect
+
+    from dao import chainops
+    from dao.chainops import SNAPSHOT_RULE, snapshot_time
+    from dao.services import fees, portal
+    pr = SimpleNamespace(opened_at=10 * H)
+    ctx = SimpleNamespace(config=SimpleNamespace(agent_accounts=set()))
+
+    def row(**snap):
+        return SimpleNamespace(account="a", is_agent=False,
+                               eligibility={"snapshot": {"at": snapshot_time(pr.opened_at), "rule": SNAPSHOT_RULE, **snap}})
+    assert portal.is_current(ctx, pr, row(unsettled=False)) and portal.is_current(ctx, pr, row())
+    assert not portal.is_current(ctx, pr, row(unsettled=True))
+    assert not portal.is_current(ctx, pr, row(rule=SNAPSHOT_RULE - 1)), "rows derived before the rule are derived again"
+    # the chain reads that decide something: a voter's weight, a fee's arrival, a fee's receive, the tip a block is built on
+    # and the source a receive names
+    for reads in (chainops.account_snapshot, chainops._sends_at_or_before, chainops._build_out, fees._FeeChain.receive_of,
+                  portal._verify_fee):
+        assert '"finalized") is' in inspect.getsource(reads), reads.__qualname__
+
+
 # ---- XE-3130: one pass over the pending sends is bounded, and spends its budget where it matters -----------
 
 async def test_a_receive_pass_is_bounded_in_number_and_time_and_dust_waits_behind_a_fee(monkeypatch):
