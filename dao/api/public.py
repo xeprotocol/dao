@@ -269,7 +269,9 @@ async def log_head(ctx: Ctx, db: Db):
 
 @router.get("/log/verify")
 async def log_verify(ctx: Ctx, db: Db):
-    """Replays the chain and checks every event is signed by the harness key published at /v1/log/head."""
+    """Replays the chain and checks every event is signed by the harness key published at /v1/log/head, and
+    that the events written before the v2 envelope are as the `log.v1_sealed` entry recorded them (`legacy`
+    in the answer says how many there are and whether they are sealed)."""
     return await EventLog.verify_cached(db, ctx.signer.public_key("harness") if ctx.signer.has("harness") else "")
 
 

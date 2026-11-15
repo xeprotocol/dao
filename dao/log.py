@@ -5,6 +5,12 @@
   v1: the same without public and ref (rows written before 5 Nov 2026; `events.v` says which)
   event.signature = ed25519(hash_bytes) by the harness key
 
+A v1 row's hash says nothing about its `public` and `ref`, and the hash cannot be rewritten: the chain and
+its anchors stand on it. So the two are bound another way. One v2 event, `log.v1_sealed`, records how many
+v1 rows there are, the index of the last, and a digest over every one's (index, public, ref); `verify()`
+recomputes the digest as it walks and fails a chain whose v1 rows are not as they were sealed (XE-4017).
+The seal is of the rows as they stood when it was written, which is the most any later record can say.
+
 Appends serialise on a row lock over log_head so two writers can never fork the chain, and refuse rather
 than write unsigned when the harness key will not sign (XE-0462). `verify()` replays the whole chain,
 recomputes every hash, and with `expected_signer` checks every signature against the one published key, so
@@ -15,6 +21,7 @@ anyone can check the chain against the state chain.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
@@ -24,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from xe.keys import exact_hex, verify_hex_signature
 
-from .canonical import DOMAIN_EVENT, DOMAIN_EVENT_V2, digest
+from .canonical import DOMAIN_EVENT, DOMAIN_EVENT_V1_SEAL, DOMAIN_EVENT_V2, digest
 from .db import locked
 from .models import Event, LogHead
 from .signer import Signer, SignerError
@@ -45,6 +52,23 @@ def event_hash(index: int, ts: int, kind: str, actor: str, payload: dict, prev_h
         body["public"] = bool(public)
         body["ref"] = ref
     return digest(DOMAIN_EVENT_V2 if v >= 2 else DOMAIN_EVENT, body).hex()
+
+
+SEAL_KIND = "log.v1_sealed"
+
+
+class Seal:
+    """The running digest over the v1 rows, in index order: what the seal records and what a replay checks."""
+
+    def __init__(self) -> None:
+        self.rows, self.through, self._h = 0, -1, hashlib.sha256()
+
+    def add(self, index: int, public: bool, ref: str) -> None:
+        self._h.update(digest(DOMAIN_EVENT_V1_SEAL, {"index": index, "public": bool(public), "ref": ref}))
+        self.rows, self.through = self.rows + 1, index
+
+    def payload(self) -> dict:
+        return {"rows": self.rows, "through": self.through, "digest": self._h.hexdigest()}
 
 
 class LogError(RuntimeError):
@@ -95,6 +119,34 @@ class EventLog:
             except Exception:
                 pass
         return ev
+
+    _nothing_to_seal = False
+
+    async def seal_legacy(self, db: AsyncSession) -> Event | None:
+        """Write the seal over the v1 rows, once: when there are such rows, none is sealed yet and the
+        harness key signs (an unsigned seal would bind nothing). Caller commits.
+
+        Whether there is anything to do is read without a lock, and once the answer is no it stays no for
+        this process: nothing is written under the old envelope any more, so a log that is sealed, or has
+        no v1 row, is not asked again (the second question is a scan of the table). Only a seal about to
+        be written takes the head's lock, and looks again under it, so two processes cannot each find none
+        and write one."""
+        if self._nothing_to_seal or not self.signer.has("harness"):
+            return None
+        sealed = select(Event.index).where(Event.kind == SEAL_KIND).limit(1)
+        if (await db.execute(sealed)).first() is not None \
+                or (await db.execute(select(Event.index).where(Event.v < 2).limit(1))).first() is None:
+            self._nothing_to_seal = True
+            return None
+        await db.execute(locked(select(LogHead).where(LogHead.id == 1)))
+        if (await db.execute(sealed)).first() is not None:
+            self._nothing_to_seal = True
+            return None
+        seal = Seal()
+        for index, public, ref in (await db.execute(
+                select(Event.index, Event.public, Event.ref).where(Event.v < 2).order_by(Event.index.asc()))).all():
+            seal.add(index, public, ref)
+        return await self.append(db, SEAL_KIND, "harness", seal.payload(), public=True)
 
     @staticmethod
     async def head(db: AsyncSession) -> Head:
@@ -181,12 +233,20 @@ class EventLog:
         to that head and no further. The log is appended to while this runs (the replay is many reads and
         each sees what has committed since the last), so a replay of "every row" compared with a head read
         afterwards compared two different moments, and an append that landed in between was reported as
-        tampering (XE-2960). Events past the sampled head are the next verification's."""
+        tampering (XE-2960). Events past the sampled head are the next verification's.
+
+        A v1 row's `public` and `ref` are in no hash, so they are checked against the seal (XE-4017): the
+        digest over the v1 rows is rebuilt on the way and compared with what a `log.v1_sealed` entry
+        recorded, and a v1 row after the seal is refused. While there are v1 rows and no seal yet, the
+        answer says so under `legacy` and is not failed for it: that is the log as it was before the seal
+        existed. The worker writes the seal before its next health check, and that check is not ok while
+        the rows are unsealed (`records.health`), so a seal that is missing does not stay unnoticed."""
         at = await EventLog.head(db)
         prev = ZERO
         expected_index = 0
         count = 0
         last_hash = ZERO
+        seal, sealed = Seal(), False
         async for ev in EventLog.iter_all(db, upto=at.index):
             if ev.index != expected_index:
                 return {"ok": False, "count": count, "first_error": f"gap at index {expected_index}", "head": last_hash}
@@ -195,14 +255,28 @@ class EventLog:
             h = event_hash(ev.index, ev.ts, ev.kind, ev.actor, ev.payload, ev.prev_hash, public=ev.public, ref=ev.ref, v=ev.v)
             if h != ev.hash:
                 return {"ok": False, "count": count, "first_error": f"hash mismatch at {ev.index}", "head": last_hash}
+            if ev.v not in (1, 2):   # the two envelopes there are; any other number is hashed as one of them
+                return {"ok": False, "count": count, "first_error": f"unknown envelope at {ev.index}", "head": last_hash}
             if expected_signer and (not ev.signature or ev.signer != expected_signer):
                 return {"ok": False, "count": count, "first_error": f"event {ev.index} is not signed by the harness key",
                         "head": last_hash}
             if ev.signature:
                 try:
-                    verify_hex_signature(ev.signer, ev.signature, bytes.fromhex(ev.hash))
+                    if ev.signature != ev.signature.lower():   # one spelling of a signature, as it was written
+                        raise ValueError("signature is not in lower case")
+                    verify_hex_signature(ev.signer, ev.signature, exact_hex(ev.hash, 32, "event hash"))
                 except ValueError:
                     return {"ok": False, "count": count, "first_error": f"bad signature at {ev.index}", "head": last_hash}
+            if ev.v < 2:
+                if sealed:
+                    return {"ok": False, "count": count, "first_error": f"v1 event at {ev.index}, after the v1 rows were sealed",
+                            "head": last_hash}
+                seal.add(ev.index, ev.public, ev.ref)
+            elif ev.kind == SEAL_KIND:   # the kind `seal_legacy` looks for; no caller chooses an entry's kind
+                if ev.payload != seal.payload():
+                    return {"ok": False, "count": count, "head": last_hash,
+                            "first_error": f"the v1 events are not as they were sealed at {ev.index}"}
+                sealed = True
             prev = h
             last_hash = h
             expected_index += 1
@@ -216,7 +290,10 @@ class EventLog:
         now = await EventLog.head(db)
         if now.index < at.index or (tail is not None and tail > now.index):
             return {"ok": False, "count": count, "head": last_hash, "first_error": "head row is behind the chain"}
-        return {"ok": True, "count": count, "head": last_hash, "first_error": None}
+        out = {"ok": True, "count": count, "head": last_hash, "first_error": None}
+        if seal.rows:
+            out["legacy"] = {"rows": seal.rows, "sealed": sealed}
+        return out
 
 
 def event_to_dict(ev: Event) -> dict:

@@ -19,5 +19,5 @@
 {# The recipe is the one this entry was hashed under (dao/log.py event_hash): v2 added `public` and `ref` to
    the hashed body and changed the domain. Printing the v1 line for every entry gave a reader a recipe that
    reproduced no entry written since (XE-7744). Every input it names is on this page. #}
-<p class="small mute" id="recipe">{% if e.v >= 2 %}hash = sha256("xe-dao/event/v2\0" || canonical_json({index, ts, kind, actor, payload, prev_hash, public, ref})){% else %}hash = sha256("xe-dao/event/v1\0" || canonical_json({index, ts, kind, actor, payload, prev_hash})){% endif %}, with canonical_json = sorted keys, no whitespace, ASCII-escaped. <a href="/v1/log/{{ e.index }}">JSON</a></p>
+<p class="small mute" id="recipe">{% if e.v >= 2 %}hash = sha256("xe-dao/event/v2\0" || canonical_json({index, ts, kind, actor, payload, prev_hash, public, ref})){% else %}hash = sha256("xe-dao/event/v1\0" || canonical_json({index, ts, kind, actor, payload, prev_hash})); <code>public</code> and <code>ref</code> are not in this entry's hash and are bound by the <code>log.v1_sealed</code> entry, which records a digest over them for every entry of this kind{% endif %}, with canonical_json = sorted keys, no whitespace, ASCII-escaped. <a href="/v1/log/{{ e.index }}">JSON</a></p>
 {% endblock %}

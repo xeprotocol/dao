@@ -2,16 +2,17 @@
 DAO_TEST_DATABASE_URL=postgresql+asyncpg://dao:pw@db:5432/dao_test (a scratch database; it is wiped)."""
 
 import os
+import time
 
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from dao.db import Base
-from dao.log import EventLog
-from dao.models import LogHead
+from dao.log import SEAL_KIND, EventLog, event_hash
+from dao.models import Event, LogHead
 from dao.signer import Signer
-from xe.keys import KeyPair
+from xe.keys import KeyPair, exact_hex
 
 URL = os.environ.get("DAO_TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not URL, reason="DAO_TEST_DATABASE_URL not set")
@@ -175,3 +176,68 @@ async def test_a_head_wound_back_or_ahead_of_its_events_fails(db):
     await db.execute(text("UPDATE log_head SET index = 2, hash = :h"), {"h": evs[2].hash})
     await db.commit()
     assert (await EventLog.verify(db))["ok"]
+
+
+# ---- XE-4017: a v1 event's public and ref are bound by the seal ------------------------------------
+
+async def _append_v1(db, signer, payload, *, public, ref):
+    """An event as it was written before the v2 envelope: hashed without `public` and `ref`, `v` = 1."""
+    head = (await db.execute(select(LogHead).execution_options(populate_existing=True))).scalar_one()
+    index, ts = head.index + 1, time.time_ns()
+    h = event_hash(index, ts, "old", "harness", payload, head.hash, v=1)
+    db.add(Event(index=index, ts=ts, kind="old", actor="harness", payload=payload, prev_hash=head.hash, hash=h,
+                 signer=signer.public_key("harness"),
+                 signature=signer.sign("harness", "event.sign", exact_hex(h, 32, "event hash")), public=public, ref=ref, v=1))
+    head.index, head.hash = index, h
+    await db.flush()
+
+
+async def test_a_v1_events_public_and_ref_are_as_they_were_sealed(db):
+    """Neither field is in a v1 row's hash, so a writer to the table could show a hidden row or repoint one and
+    the replay stayed green. Once the seal is written, each of them on each v1 row is checked by every replay."""
+    signer = _signer()
+    log, key = EventLog(signer), signer.public_key("harness")
+    # a process asks once whether there is anything to seal, so the empty log is asked by one of its own
+    assert await EventLog(signer).seal_legacy(db) is None, "an empty log has nothing to seal"
+    await db.rollback()
+    await _append_v1(db, signer, {"i": 0}, public=False, ref="inbox:1")
+    await _append_v1(db, signer, {"i": 1}, public=True, ref="")
+    await log.append(db, "test", "harness", {"i": 2})
+    await db.commit()
+    res = await EventLog.verify(db, key)
+    assert res["ok"] and res["legacy"] == {"rows": 2, "sealed": False}, "the log as it was before there was a seal"
+
+    seal = await log.seal_legacy(db)
+    await db.commit()
+    assert seal.kind == SEAL_KIND and seal.index == 3 and seal.public and seal.signature
+    assert {k: seal.payload[k] for k in ("rows", "through")} == {"rows": 2, "through": 1}
+    assert await log.seal_legacy(db) is None, "written once"
+    await db.rollback()
+    res = await EventLog.verify(db, key)
+    assert res["ok"] and res["count"] == 4 and res["legacy"] == {"rows": 2, "sealed": True}
+
+    unsealed = "the v1 events are not as they were sealed at 3"
+    for change, back, error in (
+            ("UPDATE events SET public = true WHERE index = 0", "UPDATE events SET public = false WHERE index = 0", unsealed),
+            ("UPDATE events SET ref = 'proposal:x' WHERE index = 0", "UPDATE events SET ref = 'inbox:1' WHERE index = 0", unsealed),
+            ("UPDATE events SET public = false WHERE index = 1", "UPDATE events SET public = true WHERE index = 1", unsealed),
+            ("UPDATE events SET ref = 'inbox:1' WHERE index = 1", "UPDATE events SET ref = '' WHERE index = 1", unsealed),
+            # the envelope a row says it was hashed under
+            ("UPDATE events SET v = 3 WHERE index = 2", "UPDATE events SET v = 2 WHERE index = 2", "unknown envelope at 2"),
+            ("UPDATE events SET v = 2 WHERE index = 0", "UPDATE events SET v = 1 WHERE index = 0", "hash mismatch at 0")):
+        await db.execute(text(change))
+        await db.commit()
+        db.expire_all()   # the replay reads the rows, not this session's copies of them
+        res = await EventLog.verify(db, key)
+        assert not res["ok"] and res["first_error"] == error, change
+        await db.execute(text(back))
+        await db.commit()
+        db.expire_all()
+    assert (await EventLog.verify(db, key))["ok"]
+
+    # nothing is written under the old envelope after the seal: a row that says it was is refused
+    await _append_v1(db, signer, {"i": 4}, public=True, ref="")
+    await db.commit()
+    db.expire_all()
+    assert (await EventLog.verify(db, key))["first_error"] == "v1 event at 4, after the v1 rows were sealed"
+

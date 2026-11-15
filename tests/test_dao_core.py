@@ -3170,3 +3170,106 @@ def test_the_cli_takes_a_difficulty_as_published_and_refuses_what_is_not_one():
         assert r.exit_code != 0 and "pow_nonce" not in r.output, bad
 
 
+# ---- XE-4017: a v1 event's public and ref are in no hash, so a seal binds them ------------------------------
+
+async def test_the_seal_over_the_v1_events_covers_each_ones_index_public_and_ref():
+    """The hash of an event written before the v2 envelope does not cover `public` or `ref`. One sealing entry
+    records a digest over every such row's (index, public, ref), and a replay rebuilds it: any of the three
+    changed on any row, a row dropped, or two rows exchanged, is another digest."""
+    from dao import log as log_mod
+
+    def sealed(rows):
+        seal = log_mod.Seal()
+        for row in rows:
+            seal.add(*row)
+        return seal.payload()
+
+    rows = [(0, False, "inbox:1"), (1, True, ""), (2, True, "proposal:ab")]
+    assert sealed(rows) == sealed(rows) and sealed(rows)["rows"] == 3 and sealed(rows)["through"] == 2
+    others = ([(0, True, "inbox:1"), *rows[1:]], [(0, False, "inbox:2"), *rows[1:]], [rows[1], rows[0], rows[2]], rows[:2],
+              [*rows[:2], (3, True, "proposal:ab")], [*rows[:2], (2, True, "proposal:a"), (3, True, "b")])
+    assert len({sealed(o)["digest"] for o in others} | {sealed(rows)["digest"]}) == len(others) + 1
+    assert sealed([])["rows"] == 0 and sealed([])["through"] == -1
+    # a seal no key signed binds nothing: without the harness key none is written, and nothing is read for it
+    assert await log_mod.EventLog(Signer({}, {})).seal_legacy(None) is None
+
+
+async def test_a_replay_fails_a_v1_event_that_is_not_as_it_was_sealed(monkeypatch):
+    """The rule, at the one place every verification goes through (`/v1/log/verify`, the health check and
+    `dao verify-log` all call it): once the seal is on the log, `public` and `ref` of each v1 event are
+    checked by the replay, as they already were for each v2 event by its hash."""
+    import inspect
+
+    from dao import worker as worker_mod
+    from dao.log import SEAL_KIND, EventLog, Head, Seal
+    from dao.services import records
+
+    kp = KeyPair.generate()
+
+    def chain(rows):
+        evs, prev = [], "0" * 64
+        for i, (kind, payload, public, ref, v) in enumerate(rows):
+            h = event_hash(i, 1, kind, "harness", payload, prev, public=public, ref=ref, v=v)
+            evs.append(SimpleNamespace(index=i, ts=1, kind=kind, actor="harness", payload=payload, prev_hash=prev, hash=h,
+                                       signer=kp.pub_key_hex, signature=kp.sign_hex(bytes.fromhex(h)), public=public,
+                                       ref=ref, v=v))
+            prev = h
+        return evs
+
+    async def replay(evs):
+        async def head(db):
+            return Head(len(evs) - 1, evs[-1].hash)
+
+        async def iter_all(db, batch=1000, upto=None):
+            for ev in evs:
+                yield ev
+
+        class Db:
+            async def execute(self, q):
+                return SimpleNamespace(scalar=lambda: len(evs) - 1)
+
+        monkeypatch.setattr(EventLog, "head", staticmethod(head))
+        monkeypatch.setattr(EventLog, "iter_all", staticmethod(iter_all))
+        return await EventLog.verify(Db(), kp.pub_key_hex)
+
+    old = [("old", {"i": 0}, False, "inbox:1", 1), ("old", {"i": 1}, True, "", 1)]
+    seal = Seal()
+    seal.add(0, False, "inbox:1")
+    seal.add(1, True, "")
+    new = ("test", {}, True, "", 2)
+
+    res = await replay(chain([*old, new]))
+    assert res["ok"] and res["legacy"] == {"rows": 2, "sealed": False}, "the log as it was before there was a seal"
+    assert "legacy" not in await replay(chain([new, new])), "and a log with no v1 event answers as it always did"
+
+    evs = chain([*old, new, (SEAL_KIND, seal.payload(), True, "", 2)])
+    res = await replay(evs)
+    assert res["ok"] and res["count"] == 4 and res["legacy"] == {"rows": 2, "sealed": True}
+    for i, field, value in ((0, "public", True), (0, "ref", "proposal:x"), (1, "public", False), (1, "ref", "inbox:1")):
+        was = getattr(evs[i], field)
+        setattr(evs[i], field, value)
+        res = await replay(evs)
+        assert not res["ok"] and res["first_error"] == "the v1 events are not as they were sealed at 3", (i, field)
+        setattr(evs[i], field, was)
+    assert (await replay(evs))["ok"]
+
+    # the envelope a row says it was hashed under is one of the two there are, and is the one it was
+    for i, v, error in ((2, 3, "unknown envelope at 2"), (0, 0, "unknown envelope at 0"), (0, 2, "hash mismatch at 0"),
+                        (2, 1, "hash mismatch at 2")):
+        was, evs[i].v = evs[i].v, v
+        assert (await replay(evs))["first_error"] == error
+        evs[i].v = was
+    # one spelling of a signature
+    evs[1].signature = evs[1].signature.upper()
+    assert (await replay(evs))["first_error"] == "bad signature at 1"
+    evs[1].signature = evs[1].signature.lower()
+    assert (await replay(evs))["ok"]
+    # nothing is written under the old envelope after the seal: a row that says it was is refused
+    late = chain([*old, new, (SEAL_KIND, seal.payload(), True, "", 2), ("old", {}, True, "", 1)])
+    assert (await replay(late))["first_error"] == "v1 event at 4, after the v1 rows were sealed"
+
+    # the worker writes the seal before each health check, and a check that finds v1 events unsealed is not ok
+    assert "seal_legacy" in inspect.getsource(worker_mod.Worker._seal_legacy_log)
+    job = inspect.getsource(worker_mod.Worker.job_health)
+    assert job.index("_seal_legacy_log()") < job.index("health_pass(")
+    assert '.get("sealed") is False' in inspect.getsource(records.health)

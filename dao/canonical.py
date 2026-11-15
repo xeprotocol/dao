@@ -13,6 +13,7 @@ from typing import Any
 # as a different kind of thing.
 DOMAIN_EVENT = b"xe-dao/event/v1\x00"      # rows written before the v2 envelope; `events.v` says which
 DOMAIN_EVENT_V2 = b"xe-dao/event/v2\x00"   # adds public and ref to the hashed body
+DOMAIN_EVENT_V1_SEAL = b"xe-dao/event/v1-seal\x00"   # one v1 row's index, public and ref, under the seal (XE-4017)
 DOMAIN_PROPOSAL = b"xe-dao/proposal/v1\x00"
 DOMAIN_VOTE = b"xe-dao/vote/v1\x00"
 DOMAIN_MEMBER_ACTION = b"xe-dao/member-action/v1\x00"

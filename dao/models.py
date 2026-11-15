@@ -35,7 +35,8 @@ class U64(TypeDecorator):
 
 class Event(Base):
     """Append-only, hash-chained. v2: hash covers {index, ts, kind, actor, payload, prev_hash, public, ref};
-    v1 rows (before the envelope change) hash the first six only."""
+    v1 rows (before the envelope change) hash the first six only; their `public` and `ref` are bound by the
+    `log.v1_sealed` entry instead (dao/log.py, XE-4017)."""
     __tablename__ = "events"
     index: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     ts: Mapped[int] = mapped_column(BigInteger, nullable=False)              # unix ns

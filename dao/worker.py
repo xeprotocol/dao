@@ -45,11 +45,23 @@ class Worker:
         # down, or outlived a change of difficulty, does not keep what it had at boot (XE-2475). A node
         # that does not answer leaves it as it is.
         await self.ctx.refresh_node()
+        await self._seal_legacy_log()
         async with session() as db:
             d = await records.health_pass(self.ctx, db)
             await self._log_signer_denials(db)
             await mark_run(db, "health", {"ok": d["ok"]}, every_s=records.cadence_s(self.ctx))
             await db.commit()
+
+    async def _seal_legacy_log(self) -> None:
+        """The seal over the log's v1 rows, written once (XE-4017). In a transaction of its own, so the log
+        head is not held locked through the health check's reads of the node; a failure here is this step's
+        and the check still runs."""
+        try:
+            async with session() as db:
+                if await self.ctx.events.seal_legacy(db) is not None:
+                    await db.commit()
+        except Exception as e:
+            log.warning("sealing the log's v1 rows failed: %s: %s", type(e).__name__, e)
 
     async def _log_signer_denials(self, db) -> None:
         """Uses of a company key the signer refused since the last check, onto the log (XE-3974). Like a

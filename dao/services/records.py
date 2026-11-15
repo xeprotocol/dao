@@ -313,6 +313,11 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
         if not ver.get("ok"):
             detail["log_first_error"] = ver.get("first_error")
             ok = False
+        elif (ver.get("legacy") or {}).get("sealed") is False:
+            # v1 events with no seal over them: their `public` and `ref` are checked by nothing (XE-4017).
+            # The worker writes the seal before this check, so this is a seal that could not be written.
+            detail["log_first_error"] = "the v1 events are not sealed"
+            ok = False
     except Exception as e:
         detail["log_error"] = _fault("log", e)
 
