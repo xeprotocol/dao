@@ -2904,9 +2904,6 @@ async def test_an_ended_session_is_not_ended_again_and_follows_the_chain_if_its_
     for s in ended.values():
         assert not await sessions.reconcile_ended(ctx, db, s)
     assert {k: s.status for k, s in ended.items()} == {k: k for k in ended}
-    # a different block at that index is not this session's block
-    ctx.chain.state_blocks[3] = {"index": 3, "hash": "9" * 64}
-    assert not await sessions.reconcile_ended(ctx, db, ended["failed"]) and ended["failed"].status == "failed"
     # the blocks land after all: both are recorded submitted, with what they were, and the anchor rows
     # that went when they ended are written again from the op (XE-4148)
     for s, n in ((ended["failed"], 1), (ended["cancelled"], 2)):
@@ -2931,7 +2928,30 @@ async def test_an_ended_session_is_not_ended_again_and_follows_the_chain_if_its_
     ctx.chain.statechain_block = down
     with pytest.raises(XeError):
         await sessions.reconcile_ended(ctx, db, late)
-    assert late.status == "failed"
+    assert late.status == "failed" and not late.block_displaced
+    del ctx.chain.statechain_block
+    # with nothing at its index the block can still land, and the session is watched however long ago it
+    # ended: the tip it was built on is still the tip, and no number of days changes that (XE-14215)
+    from datetime import datetime, timedelta, timezone
+    late.updated_at = datetime.now(timezone.utc) - timedelta(days=400)
+    await db.flush()
+    assert await sessions.ended_holding_a_block(db) == ["e9"]
+    assert not await sessions.reconcile_ended(ctx, db, late) and not late.block_displaced
+    await db.flush()
+    assert await sessions.ended_holding_a_block(db) == ["e9"]
+    # a block at that index that does not stand where this one was built is another chain's (a fork, a
+    # node on another network), and a block served without its place says nothing: neither ends the watch
+    for other in ({"index": 9, "hash": "9" * 64, "prev_hash": "8" * 64}, {"index": 9, "hash": "9" * 64},
+                  {"index": 8, "hash": "9" * 64, "prev_hash": "0" * 64}, {"index": 9, "hash": "", "prev_hash": "0" * 64}):
+        ctx.chain.state_blocks[9] = other
+        assert not await sessions.reconcile_ended(ctx, db, late) and not late.block_displaced, other
+    # another block where this one would have gone, on the block this one was built on: it is not this
+    # session's block, it never can be, and that is what ends the watch
+    ctx.chain.state_blocks[9] = {"index": 9, "hash": "9" * 64, "prev_hash": "0" * 64}
+    assert not await sessions.reconcile_ended(ctx, db, late) and late.status == "failed" and late.block_displaced
+    await db.flush()
+    assert await sessions.ended_holding_a_block(db) == []
+    assert not hasattr(sessions, "ENDED_WATCH_DAYS")
 
 
 async def test_the_worker_reconciles_ended_sessions_even_while_paused(db, monkeypatch):

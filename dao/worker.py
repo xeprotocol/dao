@@ -267,7 +267,8 @@ class Worker:
                     await db.rollback()
                     log.warning("session %s: %s", sid, e.detail if isinstance(e, HTTPException) else e)
             # One page of the ended sessions a pass, the next page on the next pass, and from the top again
-            # after a short one: every one of them is looked at in turn (XE-14215).
+            # after a short one: every one of them is looked at in turn, until its block is on the chain
+            # or another is where it would have gone (XE-14215).
             offset = getattr(self, "_ended_offset", 0)
             ended = await sessions.ended_holding_a_block(db, offset)
             self._ended_offset = offset + len(ended) if len(ended) == sessions.ENDED_WATCH_MAX else 0

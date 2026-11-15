@@ -3056,8 +3056,11 @@ def test_a_downgrade_refuses_while_it_would_discard_what_the_upgrade_cannot_rest
             assert down.index("raise RuntimeError(") < min(down.index(w) for w in ("op.drop_", "op.alter_column") if w in down), path.name
             continue
         loses = "drop_table" in down or "drop_column" in down or "type_=" in down
-        assert not loses or path.name == "0006_inbox_published.py", f"{path.name} drops data: say why its upgrade restores it"
-    assert guarded < seen and len(seen) == 7
+        # 0006: the flag is read back from the log. 0008: the mark says the chain has been asked for the
+        # last time, and every ended session starts unmarked and is asked once more.
+        restored = {"0006_inbox_published.py", "0008_block_displaced_no_redact_flag.py"}
+        assert not loses or path.name in restored, f"{path.name} drops data: say why its upgrade restores it"
+    assert guarded < seen and len(seen) == 8
 
 
 # ---- XE-11273: nothing a client puts in a header raises out of a middleware --------------------------------

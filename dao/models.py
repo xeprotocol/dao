@@ -113,6 +113,8 @@ class SigningSession(Base):
     rebuilds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     submitted_index: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     submitted_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    # the chain holds another block at the index this session's block was built for: it can never land
+    block_displaced: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     error: Mapped[str] = mapped_column(Text, nullable=False, default="")
     resolution_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     not_before: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # timelock (ns)

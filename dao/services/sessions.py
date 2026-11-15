@@ -18,7 +18,6 @@ import re
 import secrets
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 from sqlalchemy import delete, func, select
@@ -481,21 +480,38 @@ async def is_stale(ctx: Context, s: SigningSession) -> bool:
     return tip.get("hash") != s.block["prev_hash"]
 
 
+async def at_its_index(ctx: Context, s: SigningSession) -> str:
+    """What the chain holds at the index the session's block was built for: `this` block, `another`, or
+    `nothing` that settles it. `another` is said only of a block the node serves for that index, standing
+    on the block this one was built on: the two were built for the same place on the same chain, the
+    other one has it, and this one can never land. That answer ends the watch on an ended session for
+    good, so it is not given on less. A block at the index on a different parent is a chain other than
+    the one this block was built on (a fork, a node on another network), and what that chain holds
+    settles nothing: it is `nothing`, and the chain is asked again. Raises if the chain cannot be read."""
+    if not s.block:
+        return "nothing"
+    index = int(s.block["index"])
+    try:
+        got = await ctx.chain.statechain_block(index)
+    except XeError as e:
+        if e.status == 404:
+            return "nothing"
+        raise
+    if not got or not got.get("hash"):
+        return "nothing"
+    if got["hash"] == s.block_hash:
+        return "this"
+    same_place = got.get("index") == index and bool(got.get("prev_hash")) and got.get("prev_hash") == s.block.get("prev_hash")
+    return "another" if same_place else "nothing"
+
+
 async def landed(ctx: Context, s: SigningSession) -> bool:
     """Whether the session's block is on the chain at its index. The chain is the record of what happened;
     the node's answer to a submit is not: it can refuse after it has applied the block (a gossip publish
     failing after AddBlock), and a session marked failed on that answer would say a rotation, a parameter
     change or an anchor did not happen when it did, with `failed` terminal and the anchor row gone
     (XE-1511). Raises if the chain cannot be read; the caller leaves the session as it is."""
-    if not s.block:
-        return False
-    try:
-        got = await ctx.chain.statechain_block(int(s.block["index"]))
-    except XeError as e:
-        if e.status == 404:
-            return False
-        raise
-    return bool(got) and got.get("hash") == s.block_hash
+    return await at_its_index(ctx, s) == "this"
 
 
 async def _submitted(ctx: Context, db: AsyncSession, s: SigningSession) -> SigningSession:
@@ -556,21 +572,25 @@ async def _anchor_written(db: AsyncSession, s: SigningSession) -> None:
     a.statechain_hash = s.submitted_hash
 
 
-ENDED_WATCH_DAYS = 7
 ENDED_WATCH_MAX = 50
 
 
 async def ended_holding_a_block(db: AsyncSession, offset: int = 0) -> list[str]:
-    """Sessions that ended `failed` or `cancelled` with a block built, recently enough that the block could
-    still land: those of the last `ENDED_WATCH_DAYS` days, newest first, `ENDED_WATCH_MAX` at a time from
-    `offset`. A pass looks at one such page, and the worker moves the offset on each pass and starts over
-    after a short page, so every session in the window is looked at within a few rounds (one that ends or
-    is recorded shifts the pages under the offset by a place, and the next round has it). Without the offset a pass
-    took the newest fifty every time: an ended session's `updated_at` does not change, so the fifty-first
-    was looked at by no pass, and its block landing was never recorded (XE-14215)."""
-    since = datetime.now(timezone.utc) - timedelta(days=ENDED_WATCH_DAYS)
+    """Sessions that ended `failed` or `cancelled` with a block that could still land: every one whose
+    index the chain has not been seen to give to another block, newest first, `ENDED_WATCH_MAX` at a time
+    from `offset`. A pass looks at one such page, and the worker moves the offset on each pass and starts
+    over after a short page, so every one of them is looked at within a few rounds (one that leaves the
+    list shifts the pages under the offset by a place, and the next round has what that passed by).
+
+    What ends the watch on a session is the chain and not the calendar. A state block is built on a tip
+    and stays landable for as long as that tip is the tip, which no number of days bounds; the watch once
+    ended after seven, and a block that landed on the eighth stayed recorded as never written
+    (XE-14215). `reconcile_ended` takes a session off the list in the two ways the chain can settle it:
+    its block is there, or another is where it would have gone. The list is then the ended sessions
+    built on the tip as it stands, which is few however many have ended before. Before the offset a pass
+    took the newest fifty every time, and the fifty-first was looked at by no pass."""
     q = (select(SigningSession.id).where(SigningSession.status.in_(("failed", "cancelled")),
-                                         SigningSession.block_hash != "", SigningSession.updated_at >= since)
+                                         SigningSession.block_hash != "", SigningSession.block_displaced.is_(False))
          .order_by(SigningSession.updated_at.desc(), SigningSession.id.desc()).offset(offset).limit(ENDED_WATCH_MAX))
     return list((await db.execute(q)).scalars().all())
 
@@ -590,8 +610,18 @@ async def reconcile_signing(ctx: Context, db: AsyncSession, s: SigningSession) -
 async def reconcile_ended(ctx: Context, db: AsyncSession, s: SigningSession) -> bool:
     """A session's recorded outcome follows the chain, whatever state it was left in. One that ended
     without its block on the chain, and whose block is there now (the node applied it after refusing it,
-    or the signed block was sent by another route), is recorded submitted (XE-4148). True if it was."""
-    if s.status not in ("failed", "cancelled") or not await landed(ctx, s):
+    or the signed block was sent by another route), is recorded submitted (XE-4148). True if it was.
+
+    One whose index the chain has given to another block is marked so, and is not looked up again: that
+    is the only thing that ends the watch on an ended session short of its block landing (XE-14215).
+    Nothing is logged for it. The session's end is on the log already, and the mark says only that the
+    chain has been asked for the last time."""
+    if s.status not in ("failed", "cancelled"):
+        return False
+    held = await at_its_index(ctx, s)
+    if held == "another":
+        s.block_displaced = True
+    if held != "this":
         return False
     await _submitted(ctx, db, s)
     return True
