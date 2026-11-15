@@ -228,16 +228,6 @@ async def receive_pending(ctx: Context, key_name: str, paused: Callable[[], Awai
     return taken
 
 
-async def chain_index(chain: XeClient, account: str) -> list[dict]:
-    """Every block on an account, oldest first; [] for an account the node does not know."""
-    try:
-        return await chain.full_chain(account)
-    except XeError as e:
-        if e.status == 404:
-            return []
-        raise
-
-
 async def build_send(ctx: Context, key_name: str, scope: str, destination: str, amount: int, memo: str = "",
                      asset: str = "XE") -> dict | None:
     """A signed send from the account under `key_name`; not submitted. See `_build_out`."""

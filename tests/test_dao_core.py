@@ -4184,6 +4184,131 @@ async def test_a_reply_is_not_queued_to_a_message_that_names_no_sender():
     assert e.value.status_code == 409 and "no sender" in e.value.detail
 
 
+# ---- XE-14723: a fee pass reads a bounded part of the fee account's chain, whatever its length -------------
+
+async def test_a_fees_receive_is_sought_from_the_end_of_the_chain_a_bounded_number_of_pages_a_pass(monkeypatch):
+    """The fee account's chain is as long as anyone cares to make it. A pass reads a fixed number of its
+    pages: from the end, where a receive made a pass ago is, down to the receive or to the first block
+    older than its send could be. A search that runs out of reads is no answer and goes on from where it
+    stopped; what it has read is not read for that send again."""
+    import inspect
+
+    from dao import chainops
+    from dao.services import fees
+    from xe.client import XeError
+    monkeypatch.setattr(fees, "PAGE", 4)
+    now = 1000 * H
+
+    class Node:
+        def __init__(self, blocks, sends=None, pending=(), short=0):
+            self.blocks, self.sends, self.pending, self.short = blocks, sends or {}, list(pending), short
+            self.pages, self.asked = [], []
+
+        async def chain_end(self, address):
+            return (len(self.blocks), self.blocks[-1]) if self.blocks else (0, None)
+
+        async def chain(self, address, offset=0, limit=1000):
+            self.pages.append((offset, limit))
+            return {"blocks": self.blocks[offset:offset + limit - self.short], "total": len(self.blocks)}
+
+        async def block(self, h):
+            self.asked.append(h)
+            if h not in self.sends:
+                raise XeError(404, "not found")
+            return self.sends[h]
+
+        async def pending_for(self, address):
+            return [{"send_hash": h} for h in self.pending]
+
+    def receive(source, h, ts, final=True):
+        return {"type": "receive", "source": source, "hash": h, "timestamp": ts, "finalized": final}
+
+    def reader(node, pages):
+        """A pass: its own reader, and the node's record of what earlier passes read."""
+        node.pages = []
+        return fees._FeeChain(SimpleNamespace(chain=node, signer=SimpleNamespace(address=lambda name: "fee")), pages=pages)
+    # thirty receives of dust an hour apart, the last an hour ago (one of them, long ago, of a fee paid
+    # before all the rest), then two fees' receives, the second not final yet
+    dust = [receive(f"dust{i}", f"d{i}", now - (30 - i) * H) for i in range(30)]
+    dust[3] = receive("old", "ro", now - 27 * H)
+    recent = {"timestamp": now - 2 * H, "finalized": True}
+    node = Node(dust + [receive("a", "ra", now), receive("b", "rb", now, final=False)],
+                sends={"c": recent, "e": recent, "old": {"timestamp": now - 27 * H, "finalized": True}}, pending=["c"])
+    r = reader(node, 3)
+    # near the end, where a receive made a pass ago is: one page, and nothing else asked of the node
+    assert (await r.receive_of("a"))["hash"] == "ra" and node.pages == [(28, 4)] and node.asked == []
+    assert await r.receive_of("b") is None and await r.arriving("b"), "on the chain and not final: arriving, not received"
+    assert node.pages == [(28, 4)]
+    # no receive anywhere: the search goes down to the first block older than the send could be, and that is an answer
+    assert await r.receive_of("c") is None and await r.read_through("c")
+    assert node.pages == [(28, 4), (24, 4)] and node.asked == ["c"]
+    assert await r.arriving("c"), "the node holds it pending"
+    assert not await r.arriving("e") and await r.read_through("e") and node.pages == [(28, 4), (24, 4)]
+    assert node.asked == ["c", "e"], "each send is asked for its date once a pass"
+    # a send the node does not hold gives no date to stop at. The pass spends the reads it has left, and
+    # that it found nothing in them is not an answer
+    assert await r.receive_of("z") is None and not await r.read_through("z") and not await r.arriving("z")
+    assert node.pages == [(28, 4), (24, 4), (20, 4)] and r.reads == 3
+    assert (await r.receive_of("a"))["hash"] == "ra", "and the rows whose receives are nearer are still answered"
+    # the next pass goes on below where that one stopped: what was read is not read for this send again,
+    # save the place at the end that held a block not final yet
+    r = reader(node, 3)
+    assert not await r.read_through("z") and node.pages == [(28, 4), (16, 4), (12, 4)]
+    r = reader(node, 5)
+    assert await r.read_through("z") and await r.receive_of("z") is None, "read to the chain's first block: an answer"
+    assert node.pages == [(28, 4), (8, 4), (4, 4), (0, 4)]
+    # and from then on a send with no receive anywhere costs a pass the blocks added since, and no more
+    r = reader(node, 1)
+    assert await r.read_through("z") and node.pages == [(28, 4)]
+    node.blocks.append(receive("z", "rz", now))
+    r = reader(node, 1)
+    assert (await r.receive_of("z"))["hash"] == "rz" and node.pages == [(32, 1)], "its receive, when it comes, comes at the end"
+    # a receive that lies deep is reached, in as many passes as its depth takes
+    r = reader(node, 4)
+    assert await r.receive_of("old") is None and not await r.read_through("old") and r.reads == 4
+    assert node.pages == [(32, 1), (28, 4), (24, 4), (20, 4)]
+    r = reader(node, 7)
+    assert (await r.receive_of("old"))["hash"] == "ro"
+    assert node.pages == [(32, 1), (28, 4), (16, 4), (12, 4), (8, 4), (4, 4), (0, 4)]
+    # the round a pass begins with reads the newest page and the one before it and no other, whichever row
+    # asks and whatever was read for it before: a search that is deep down takes no read from a receive
+    # at the end
+    node = Node(dust + [receive("a", "ra", now)])
+    r = reader(node, 3)
+    assert await r.receive_of("z") is None and node.pages == [(28, 3), (24, 4), (20, 4)]
+    r = reader(node, 3)
+    r.near = True
+    assert await r.receive_of("z") is None and node.pages == [], "its search is below the end: nothing is read for it in this round"
+    assert (await r.receive_of("a"))["hash"] == "ra" and node.pages == [(28, 3)]
+    assert await r.receive_of("q") is None and not await r.read_through("q") and node.pages == [(28, 3), (24, 4)], \
+        "two pages for a row that is new, and no answer from them"
+    r.near = False
+    assert await r.receive_of("z") is None and node.pages == [(28, 3), (24, 4), (16, 4)] and r.reads == 3
+    # what was added above an earlier search, when it is more than a pass can read, is not read from its
+    # top on every pass: the search goes on below what was just read
+    node = Node(list(dust[:8]))
+    r = reader(node, 5)
+    assert await r.read_through("z") and node.pages == [(4, 4), (0, 4)]
+    node.blocks.extend(dust[8:30])
+    r = reader(node, 2)
+    assert not await r.read_through("z") and node.pages == [(28, 2), (24, 4)]
+    r = reader(node, 2)
+    assert not await r.read_through("z") and node.pages == [(20, 4), (16, 4)], "below, not from the top again"
+    r = reader(node, 9)
+    assert await r.read_through("z") and node.pages == [(12, 4), (8, 4), (4, 4), (0, 4)]
+    # a chain shorter than a page is read to its first block, and the send is not asked about
+    node = Node(dust[:3])
+    r = reader(node, 3)
+    assert await r.receive_of("q") is None and await r.read_through("q") and node.pages == [(0, 3)] and node.asked == []
+    node = Node([])
+    r = reader(node, 3)
+    assert await r.receive_of("q") is None and await r.read_through("q") and not await r.arriving("q") and node.pages == []
+    # a page with fewer blocks than the places asked for is not the chain
+    with pytest.raises(XeError) as e:
+        await reader(Node(dust, short=1), 3).receive_of("q")
+    assert e.value.status == 0 and "malformed" in str(e.value)
+    # nothing in a fee pass reads the fee account's chain whole
+    assert not hasattr(chainops, "chain_index") and "full_chain" not in inspect.getsource(fees)
 # ---- XE-3894: nothing offers a sender what the log cannot do ----------------------------------------------
 
 def test_nothing_offers_a_sender_a_redaction_the_log_cannot_make():

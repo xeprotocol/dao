@@ -3580,15 +3580,15 @@ async def test_one_items_database_fault_costs_that_item_and_no_other(db, monkeyp
     fault["on"] = None
     assert await fees.record_receives(ctx, db) == 1 and await fees.record_receives(ctx, db) == 0
     # the node not answering is not one row's failure: the pass ends, and the step says so
-    read = ctx.chain.full_chain
+    read = ctx.chain.chain_end
 
     async def down(account):
         raise XeError(0, "ReadTimeout")
-    ctx.chain.full_chain = down
+    ctx.chain.chain_end = down
     with pytest.raises(XeError):
         await fees.record_receives(ctx, db)
     await db.rollback()
-    ctx.chain.full_chain = read
+    ctx.chain.chain_end = read
 
     # 3. replies whose envelope the node's store holds: recorded sent, each in its own step
     store = []
@@ -4254,3 +4254,52 @@ async def test_the_node_is_asked_nothing_while_the_log_head_is_held(db, monkeypa
         # the health check, which reads the node leg by leg and records what it found
         EventLog._verify_cache = None
         await step("a health check", lambda: records.health_pass(ctx, db))
+
+
+# ---- XE-14723: a fee pass reads a bounded part of the fee account's chain, whatever its length -------------
+
+async def test_a_fee_whose_receive_is_far_down_the_chain_takes_nothing_from_the_ones_near_its_end(db, monkeypatch):
+    """Anyone can lengthen the fee account's chain, and the whole of it was read for every fee: past the
+    bound on a whole read no receive was recorded again. A pass reads a few pages of it. The receive of
+    a fee paid in the ordinary way is on the newest, and is recorded whatever else is waiting; a row
+    whose search is not over is not called unreceived, which nothing has shown yet, and is when it is."""
+    monkeypatch.setattr(fees, "PAGE", 4)
+    monkeypatch.setattr(fees, "PASS_PAGES", 3)
+    ctx, chain, fee = _fee_ctx()
+    for i in range(40):
+        chain.fund(fee, 1, source=f"{i:064x}")       # dust, which anyone can send
+    chain.fund(fee, 1000, source="2" * 64)
+    # fees 1 and 3 name sends the node does not hold and have no receive: nothing says how far down to stop
+    db.add(FeeLedger(fee_block_hash="1" * 64, proposal_hash="1" * 64, payer=AUTHOR, amount=1000, state="seen", tx_hashes={}))
+    db.add(FeeLedger(fee_block_hash="2" * 64, proposal_hash="2" * 64, payer=AUTHOR, amount=1000, state="seen", tx_hashes={}))
+    db.add(FeeLedger(fee_block_hash="3" * 64, proposal_hash="3" * 64, payer=AUTHOR, amount=1000, state="due_refund", tx_hashes={}))
+    await db.commit()
+    asked = []
+    read = chain.chain
+
+    async def counted(account, offset=0, limit=1000):
+        asked.append((offset, limit))
+        return await read(account, offset, limit)
+    chain.chain = counted
+    assert await fees.record_receives(ctx, db) == 1, "the row before it in the table has a search that is not over"
+    assert asked == [(40, 1), (36, 4), (32, 4)], "the newest page for every row first, then what the pass has left"
+    rows = {r.fee_block_hash[0]: r for r in (await db.execute(select(FeeLedger).execution_options(populate_existing=True))).scalars().all()}
+    assert rows["2"].tx_hashes["receive"] == chain.of(fee, "receive")[-1]["hash"] and not rows["1"].tx_hashes
+
+    async def unreceived():
+        return (await db.execute(select(Event.kind))).scalars().all().count("fee.unreceived")
+    # the settle pass goes on from where that one stopped, and until the chain has been read through the
+    # due row is not paid and not called unreceived
+    for expected in ([(28, 4), (24, 4), (20, 4)], [(16, 4), (12, 4), (8, 4)]):
+        del asked[:]
+        assert await fees.settle_due(ctx, db) == 0 and chain.submits == []
+        assert asked == expected and (await _fee(db, "3")).error == fees.SEEKING_NOTE and await unreceived() == 0
+    del asked[:]
+    assert await fees.settle_due(ctx, db) == 0 and asked == [(4, 4), (0, 4)] and chain.submits == []
+    due = await _fee(db, "3")
+    assert due.state == "due_refund" and due.error == fees.UNRECEIVED_ERROR and await unreceived() == 1
+    # read through, it costs a pass only what has been added to the chain since, and is announced once
+    del asked[:]
+    assert await fees.settle_due(ctx, db) == 0 and asked == [] and await unreceived() == 1
+    chain.fund(fee, 1, source="d" * 64)
+    assert await fees.settle_due(ctx, db) == 0 and asked == [(40, 2)] and await unreceived() == 1

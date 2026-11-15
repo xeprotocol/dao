@@ -41,11 +41,12 @@ from __future__ import annotations
 
 import logging
 import time
+import weakref
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from xe.client import XeError
+from xe.client import PAGE, XeError, malformed
 
 from .. import chainops
 from ..context import Context
@@ -61,6 +62,20 @@ DUE = ("due_refund", "due_burn")
 # the hour a node allows a block's timestamp either way, and a margin for its clock: waited out in full,
 # since a block a node could still take is exactly the one another must not be built beside
 STANDING_NS = chainops.TIMESTAMP_WINDOW_NS + 5 * 60 * 1_000_000_000
+# How much earlier than its send a receive can be dated. A receive is made after its send was taken, and
+# a node takes a block dated within the hour of its clock either way: the send up to an hour ahead, the
+# receive up to an hour behind. Two hours, then, by the node's rule alone, and a margin for the clocks of
+# two nodes. The same rule keeps an account's blocks in date order (none is dated before the one it
+# stands on), which is what lets a search down a chain stop at the first block older than this.
+RECEIVE_LEAD_NS = 2 * chainops.TIMESTAMP_WINDOW_NS + 5 * 60 * 1_000_000_000
+# the pages of the fee account's chain one pass reads, whatever its rows ask of it (`_FeeChain`)
+PASS_PAGES = 20
+SOUGHT_MAX = 4096
+SEEKING_NOTE = "the fee account's chain is still being read for this fee's receive; settlement waits for it"
+# What earlier passes read of each node's fee chain, by the send they were looking for: (low, high), the
+# places low <= p < high, every one of which held a final block that was not that send's receive. Kept
+# with the node client, so for the life of the process; a restart reads again, a pass at a time.
+_sought: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 UNRECEIVED_ERROR = "fee send was never received into the fee account; nothing to settle"
 ARRIVING_NOTE = "the fee's receive is not final on the fee account's chain yet; settlement waits for it"
 
@@ -79,61 +94,189 @@ async def receive_all(ctx: Context, db: AsyncSession) -> int:
 
 async def record_receives(ctx: Context, db: AsyncSession) -> int:
     """Record the receive of every fee that has none on record and whose receive the chain now holds.
-    Returns how many were recorded. The fee account's chain is read only when a row is waiting."""
+    Returns how many were recorded. The fee account's chain is read only when a row is waiting, and
+    then a bounded part of it, from its end (`_FeeChain`)."""
     if not ctx.signer.has("fee"):
         return 0
     keys = list((await db.execute(select(FeeLedger.fee_block_hash).where(FeeLedger.state.in_(("seen",) + DUE))
                                   .order_by(FeeLedger.fee_block_hash))).scalars().all())
     chain = _FeeChain(ctx)
     n = 0
-    for key in keys:
-        # Each row is a step of its own, named by a hash read before it (XE-3724): what the database refuses
-        # for one is rolled back and logged, and the rows behind it are still recorded. The node not
-        # answering is not a row's failure but every row's, and ends the pass.
-        try:
-            f = await db.get(FeeLedger, key)
-            if f is not None and not (f.tx_hashes or {}).get("receive") and await _record_receive(ctx, db, f, chain):
-                n += 1
-        except XeError:
-            raise
-        except Exception as e:
-            await db.rollback()
-            log.warning("fee %s: recording its receive failed: %s: %s", key[:12], type(e).__name__, e)
+    # Two rounds over the rows. The first reads the end of the chain and nothing else, whichever row asks
+    # and whatever earlier passes read for it, and answers every row it can from that: the receive of a
+    # fee paid in the ordinary way is there. The second spends the rest of the pass's reads, in order, on
+    # the rows that need more. A row whose receive lies deep, or is nowhere, then takes nothing from the
+    # rows behind it, and a read that fails far down the chain fails after they have been answered.
+    for near in (True, False):
+        chain.near = near
+        for key in keys:
+            # Each row is a step of its own, named by a hash read before it (XE-3724): what the database
+            # refuses for one is rolled back and logged, and the rows behind it are still recorded. The
+            # node not answering is not a row's failure but every row's, and ends the pass.
+            try:
+                f = await db.get(FeeLedger, key)
+                if f is not None and not (f.tx_hashes or {}).get("receive") and await _record_receive(ctx, db, f, chain):
+                    n += 1
+            except XeError:
+                raise
+            except Exception as e:
+                await db.rollback()
+                log.warning("fee %s: recording its receive failed: %s: %s", key[:12], type(e).__name__, e)
     return n
 
 
+def _memo(chain) -> dict[str, tuple[int, int]]:
+    try:
+        return _sought.setdefault(chain, {})
+    except TypeError:   # a client that cannot be weakly referenced keeps nothing between passes
+        return {}
+
+
 class _FeeChain:
-    """The fee account's chain, read once per pass and only when something needs it."""
+    """The fee account's chain for one pass: a bounded number of its pages, read where a row needs them.
 
-    def __init__(self, ctx: Context):
-        self.ctx, self._blocks, self._pending = ctx, None, None
+    Anyone can lengthen this chain: the worker receives every send to the fee account, dust included.
+    It was read whole for every pass that had a row waiting, under the bound every whole read has, and
+    past that bound the read failed on every pass: no fee's receive could be put on record again, and
+    none was refunded or burned, for as long as the chain stayed that long, which is for good
+    (XE-14723). What a row asks is where the receive of one send is. The harness made that receive
+    itself, after the send existed, so it is near the end when it is first looked for and never older
+    than the send. The search starts at the end and goes down, to the receive, to the first block older
+    than the send could be, or to the first block of the chain.
 
-    async def blocks(self) -> list[dict]:
-        if self._blocks is None:
-            self._blocks = await chainops.chain_index(self.ctx.chain, self.ctx.signer.address("fee"))
-        return self._blocks
+    A pass makes `PASS_PAGES` page reads and no more, whatever the rows ask and however long the chain
+    is. A search that runs out of them is not an answer (`read_through` says so) and goes on from where
+    it stopped on the next pass: `_sought` keeps, for each send, the places already read and found to
+    hold final blocks that are not its receive. A final block does not change, so those are never read
+    for that send again, and a row with no receive anywhere costs a pass only the blocks added since
+    the last one."""
+
+    def __init__(self, ctx: Context, pages: int | None = None):
+        self.ctx, self.limit, self.reads = ctx, PASS_PAGES if pages is None else pages, 0
+        self.near = False                        # read the newest page and the one before it, and no other
+        self._end: int | None = None            # how many blocks the chain held when this pass first asked
+        self._pages: dict[int, list[dict]] = {}
+        self._pending: set[str] | None = None
+        self._floors: dict[str, int] = {}
+        self._sought = _memo(ctx.chain)
+
+    async def _at(self, place: int) -> dict | None:
+        """The block at a place on the chain, below `_end`; None when it is on a page this pass has not
+        read and has no reads left for, or is not reading yet (`near`)."""
+        n = place // PAGE
+        if n not in self._pages:
+            if self.reads >= self.limit or (self.near and n < (self._end - 1) // PAGE - 1):
+                return None
+            self.reads += 1
+            start = n * PAGE
+            want = min(PAGE, self._end - start)
+            blocks = (await self.ctx.chain.chain(self.ctx.signer.address("fee"), offset=start, limit=want))["blocks"]
+            if len(blocks) != want:
+                # a chain only grows, so every place below its end holds a block: a short page is not the chain
+                raise malformed(f"chain page at {start} holds {len(blocks)} blocks of {want}")
+            self._pages[n] = blocks
+        return self._pages[n][place - n * PAGE]
+
+    async def _floor(self, send_hash: str) -> int:
+        """The time no receive of this send can be older than: the send's own date, less
+        `RECEIVE_LEAD_NS`. 0, which no block is older than, for a send the node does not hold or one with
+        no date. Asked once a pass."""
+        if send_hash not in self._floors:
+            try:
+                ts = (await self.ctx.chain.block(send_hash)).get("timestamp")
+            except XeError as e:
+                if e.status != 404:
+                    raise
+                ts = None
+            self._floors[send_hash] = max(ts - RECEIVE_LEAD_NS, 0) if type(ts) is int else 0
+        return self._floors[send_hash]
+
+    async def _seek(self, send_hash: str) -> tuple[dict | None, bool]:
+        """The receive of a send on the fee account's chain, final or not, or None; and whether every
+        place it could be at has been read, by this pass or an earlier one. (None, False) is no answer."""
+        if self._end is None:
+            self._end, _ = await self.ctx.chain.chain_end(self.ctx.signer.address("fee"))
+        end = self._end
+        low, high = self._sought.get(send_hash, (end, end))
+        low, high = min(low, end), min(high, end)
+        firm = end   # the lowest place seen to hold a block that is not final: it, and all above it, may yet change
+        # first what has been added since an earlier pass looked: from the end down to where that one began
+        for place in range(end - 1, high - 1, -1):
+            b = await self._at(place)
+            if b is None:
+                # What the earlier passes read stands, and this stretch is read again. Unless the pass's
+                # reads all went on it: then it is longer than a pass can read, and reading it again
+                # would end here again, every pass. What was just read is kept in place of what the
+                # earlier passes read, where every block of it is final, and the search goes on below it.
+                if self.reads >= self.limit and firm == end:
+                    self._keep(send_hash, place + 1, end)
+                return None, False
+            if b.get("type") == "receive" and b.get("source") == send_hash:
+                return b, True
+            if b.get("finalized") is not True:
+                firm = place
+        # then what lies below everything read so far
+        floor = None
+        for place in range(low - 1, -1, -1):
+            b = await self._at(place)
+            if b is None:
+                break
+            if b.get("type") == "receive" and b.get("source") == send_hash:
+                return b, True
+            if b.get("finalized") is not True:
+                firm = place
+            low = place
+            # The newest page's worth is read whatever the send's date: that is where a receive made a
+            # pass or two ago is, and it costs the send no lookup. Below it, the first block older than
+            # the send could be ends the search: nothing under that block is this send's receive.
+            if place < end - PAGE:
+                if floor is None:
+                    floor = await self._floor(send_hash)
+                ts = b.get("timestamp")
+                if type(ts) is int and 0 < ts < floor:
+                    low = 0
+                    break
+        self._keep(send_hash, low, min(end, firm))
+        return None, low == 0
+
+    def _keep(self, send_hash: str, low: int, high: int) -> None:
+        if high > low:
+            if len(self._sought) >= SOUGHT_MAX and send_hash not in self._sought:
+                self._sought.clear()   # every search starts over, a pass at a time; nothing is answered wrongly
+            self._sought[send_hash] = (low, high)
+        else:
+            self._sought.pop(send_hash, None)
+
+    def forget(self, send_hash: str) -> None:
+        self._sought.pop(send_hash, None)
 
     async def receive_of(self, send_hash: str) -> dict | None:
         """The final receive of a send. One that is not final yet can still be dropped; it is found on a
         later pass, when it is."""
-        return next((b for b in await self.blocks() if b.get("type") == "receive" and b.get("source") == send_hash
-                     and b.get("finalized") is True and b.get("hash")), None)   # the hash is what gets recorded
+        b, _ = await self._seek(send_hash)
+        return b if b is not None and b.get("finalized") is True and b.get("hash") else None   # the hash is what gets recorded
 
     async def arriving(self, send_hash: str) -> bool:
         """Whether a send with no final receive is still on its way in: its receive is on the chain and
         not final yet, or the node holds the send pending for the fee account, where a pass offers a
         receive for it. Neither is "never received"."""
-        if any(b.get("type") == "receive" and b.get("source") == send_hash for b in await self.blocks()):
+        if (await self._seek(send_hash))[0] is not None:
             return True
         if self._pending is None:
             self._pending = {p["send_hash"] for p in await self.ctx.chain.pending_for(self.ctx.signer.address("fee"))}
         return send_hash in self._pending
+
+    async def read_through(self, send_hash: str) -> bool:
+        """Whether the chain has been read everywhere this send's receive could be. Until it has, that no
+        receive was found says nothing."""
+        return (await self._seek(send_hash))[1]
 
 
 async def _record_receive(ctx: Context, db: AsyncSession, f: FeeLedger, chain: _FeeChain) -> bool:
     got = await chain.receive_of(f.fee_block_hash)
     if not got:
         return False
+    chain.forget(f.fee_block_hash)
     f.tx_hashes = {**(f.tx_hashes or {}), "receive": got["hash"]}
     f.error = ""
     await ctx.events.append(db, "fee.received", "harness", {
@@ -207,6 +350,10 @@ async def _received(ctx: Context, db: AsyncSession, f: FeeLedger, chain: _FeeCha
         return True
     if await chain.arriving(f.fee_block_hash):
         await _note(db, f, ARRIVING_NOTE)
+        return False
+    if not await chain.read_through(f.fee_block_hash):
+        # the pass ran out of reads before the search was over: no receive found so far is not "never received"
+        await _note(db, f, SEEKING_NOTE)
         return False
     await _note(db, f, UNRECEIVED_ERROR)
     ref = f"proposal:{f.proposal_hash}"
