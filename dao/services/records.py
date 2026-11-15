@@ -18,7 +18,7 @@ from xe.client import XeError
 from ..context import Context
 from ..db import serialize
 from ..faults import reason, worded
-from ..log import EventLog
+from ..log import EventLog, log_key
 from ..models import Anchor, Event, HealthCheck, SigningSession, TreasurySnapshot
 from . import sessions
 
@@ -307,16 +307,14 @@ async def health(ctx: Context, db: AsyncSession, record: bool = False) -> dict:
     try:   # log consistent
         async with db.begin_nested():
             head = await EventLog.head(db)
-            ver = await EventLog.verify_cached(db, ctx.signer.public_key("harness") if ctx.signer.has("harness") else "")
+            ver = await EventLog.verify_cached(db, log_key(ctx.signer))
         detail["log_head"] = {"index": head.index, "hash": head.hash}
+        # The replay's own answer and nothing beside it: v1 events with no seal over them fail it there
+        # (XE-4017, XE-14510). The worker writes the seal before this check, so that is a seal that could
+        # not be written.
         detail["log_verified"] = bool(ver.get("ok"))
         if not ver.get("ok"):
             detail["log_first_error"] = ver.get("first_error")
-            ok = False
-        elif (ver.get("legacy") or {}).get("sealed") is False:
-            # v1 events with no seal over them: their `public` and `ref` are checked by nothing (XE-4017).
-            # The worker writes the seal before this check, so this is a seal that could not be written.
-            detail["log_first_error"] = "the v1 events are not sealed"
             ok = False
     except Exception as e:
         detail["log_error"] = _fault("log", e)

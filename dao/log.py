@@ -55,6 +55,7 @@ def event_hash(index: int, ts: int, kind: str, actor: str, payload: dict, prev_h
 
 
 SEAL_KIND = "log.v1_sealed"
+UNSEALED = "the v1 events are not sealed"
 
 
 class Seal:
@@ -237,10 +238,13 @@ class EventLog:
 
         A v1 row's `public` and `ref` are in no hash, so they are checked against the seal (XE-4017): the
         digest over the v1 rows is rebuilt on the way and compared with what a `log.v1_sealed` entry
-        recorded, and a v1 row after the seal is refused. While there are v1 rows and no seal yet, the
-        answer says so under `legacy` and is not failed for it: that is the log as it was before the seal
-        existed. The worker writes the seal before its next health check, and that check is not ok while
-        the rows are unsealed (`records.health`), so a seal that is missing does not stay unnoticed."""
+        recorded, and a v1 row after the seal is refused. While there are v1 rows and no seal, the log
+        does not verify: those rows' `public` and `ref` are checked by nothing, and "ok" said of them is
+        said of nothing. The answer is decided here, once, for everything that asks whether the log
+        verifies (the public route, `dao verify-log`, the health check). It was left to each of them, and
+        the three gave three answers: the route said ok with a flag beside it, the command exited 0, and
+        the health check noted the error and stayed ok (XE-14510). The worker writes the seal before its
+        next health check, so the answer is no for longer than that only where a seal cannot be written."""
         at = await EventLog.head(db)
         prev = ZERO
         expected_index = 0
@@ -293,7 +297,17 @@ class EventLog:
         out = {"ok": True, "count": count, "head": last_hash, "first_error": None}
         if seal.rows:
             out["legacy"] = {"rows": seal.rows, "sealed": sealed}
+            if not sealed:
+                out.update(ok=False, first_error=UNSEALED)
         return out
+
+
+def log_key(signer) -> str:
+    """The key a replay holds every entry to: the harness key where the signer has one, and otherwise
+    none, which checks each signature against the key its entry names. Asked here by everything that
+    replays the log, so that a signer with no harness key is one answer and not an error at one of them
+    (XE-14510)."""
+    return signer.public_key("harness") if signer.has("harness") else ""
 
 
 def event_to_dict(ev: Event) -> dict:

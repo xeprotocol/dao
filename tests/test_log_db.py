@@ -205,7 +205,8 @@ async def test_a_v1_events_public_and_ref_are_as_they_were_sealed(db):
     await log.append(db, "test", "harness", {"i": 2})
     await db.commit()
     res = await EventLog.verify(db, key)
-    assert res["ok"] and res["legacy"] == {"rows": 2, "sealed": False}, "the log as it was before there was a seal"
+    assert not res["ok"] and res["first_error"] == "the v1 events are not sealed"    # XE-14510: said by the replay itself
+    assert res["legacy"] == {"rows": 2, "sealed": False}, "the log as it was before there was a seal"
 
     seal = await log.seal_legacy(db)
     await db.commit()

@@ -3454,7 +3454,7 @@ async def test_a_replay_fails_a_v1_event_that_is_not_as_it_was_sealed(monkeypatc
     import inspect
 
     from dao import worker as worker_mod
-    from dao.log import SEAL_KIND, EventLog, Head, Seal
+    from dao.log import SEAL_KIND, UNSEALED, EventLog, Head, Seal, log_key
     from dao.services import records
 
     kp = KeyPair.generate()
@@ -3491,9 +3491,12 @@ async def test_a_replay_fails_a_v1_event_that_is_not_as_it_was_sealed(monkeypatc
     seal.add(1, True, "")
     new = ("test", {}, True, "", 2)
 
+    # XE-14510: v1 events with no seal over them are checked by nothing, and the replay says so itself
     res = await replay(chain([*old, new]))
-    assert res["ok"] and res["legacy"] == {"rows": 2, "sealed": False}, "the log as it was before there was a seal"
-    assert "legacy" not in await replay(chain([new, new])), "and a log with no v1 event answers as it always did"
+    assert not res["ok"] and res["first_error"] == UNSEALED and res["count"] == 3
+    assert res["legacy"] == {"rows": 2, "sealed": False}, "the log as it was before there was a seal"
+    res = await replay(chain([new, new]))
+    assert res["ok"] and "legacy" not in res, "and a log with no v1 event answers as it always did"
 
     evs = chain([*old, new, (SEAL_KIND, seal.payload(), True, "", 2)])
     res = await replay(evs)
@@ -3525,7 +3528,17 @@ async def test_a_replay_fails_a_v1_event_that_is_not_as_it_was_sealed(monkeypatc
     assert "seal_legacy" in inspect.getsource(worker_mod.Worker._seal_legacy_log)
     job = inspect.getsource(worker_mod.Worker.job_health)
     assert job.index("_seal_legacy_log()") < job.index("health_pass(")
-    assert '.get("sealed") is False' in inspect.getsource(records.health)
+    # XE-14510: the three that ask whether the log verifies take the replay's answer and decide nothing of
+    # their own. None reads `legacy`, and each asks under the same key (`log_key`).
+    from dao import cli
+    from dao.api import public as public_api
+    askers = {"health": inspect.getsource(records.health), "route": inspect.getsource(public_api.log_verify),
+              "command": inspect.getsource(cli.verify_log)}
+    for who, src in askers.items():
+        assert "log_key(ctx.signer)" in src and '"legacy"' not in src and ".get(\"sealed\")" not in src, who
+    assert 'detail["log_verified"] = bool(ver.get("ok"))' in askers["health"]
+    assert 'typer.Exit(0 if res["ok"] else 1)' in askers["command"]
+    assert log_key(Signer({}, {})) == "" and log_key(Signer({"harness": kp}, {"harness": {"event.sign"}})) == kp.pub_key_hex
 
 
 # ---- XE-3020: an integer field is encoded as the integer it is, or the encoder refuses ----------------------

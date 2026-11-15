@@ -147,15 +147,15 @@ def verify_log():
     """Replay the event log and check every hash and signature against the harness key."""
     from .context import build_context
     from .db import session
-    from .log import EventLog
+    from .log import EventLog, log_key
 
     async def go():
         ctx = build_context()
         async with session() as db:
-            return await EventLog.verify(db, ctx.signer.public_key("harness"))
+            return await EventLog.verify(db, log_key(ctx.signer))
     res = asyncio.run(go())
     typer.echo(json.dumps(res, indent=1))
-    raise typer.Exit(0 if res["ok"] else 1)
+    raise typer.Exit(0 if res["ok"] else 1)   # the replay's answer, unsealed v1 events included (XE-14510)
 
 
 @app.command("copy-lint")
